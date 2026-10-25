@@ -2,7 +2,7 @@ import { ArrowLeft, ChevronRight, Pause, Play, Plus, Square, Trash2 } from 'luci
 import { useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router'
 
-import { AreaChart } from '../components/charts'
+import { AreaChart, BarChart, DrawdownChart } from '../components/charts'
 import { Badge, Button, Card, ConfirmDialog, EmptyState, Live, PageHeader, Skeleton, useToast } from '../components/ui'
 import { controlBot, deleteBot, patchBot, useApiMutation, useBot } from '../lib/api'
 import { cx } from '../lib/cx'
@@ -62,6 +62,9 @@ export function BotDetail() {
     label: new Date(point.t).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit' }),
     value: point.value,
   }))
+  // Closed round trips in chronological (oldest → newest) order for the P&L bars.
+  const closedTrades = [...trades].filter((trade) => trade.pnl !== null).reverse()
+  const realizedGross = closedTrades.reduce((sum, trade) => sum + (trade.pnl ?? 0), 0)
 
   const kpis = [
     { label: 'Equity', value: money(bot.equity), hint: `of ${money(bot.initialEquity)} seeded` },
@@ -172,6 +175,45 @@ export function BotDetail() {
             ))}
             {events.length === 0 && <li className="py-6 text-center text-[13px] text-muted">No events yet</li>}
           </ul>
+        </Card>
+      </div>
+
+      <div className="mt-3 grid gap-3 lg:grid-cols-2">
+        <Card className="p-5">
+          <div className="flex items-center justify-between">
+            <h2 className="text-[14px] font-semibold">Drawdown under running peak</h2>
+            <span className="text-[12.5px] text-faint">% below highest equity</span>
+          </div>
+          <div className="mt-4">
+            {curve.length > 1 ? (
+              <DrawdownChart data={curve} height={150} />
+            ) : (
+              <p className="py-6 text-center text-[13px] text-muted">Not enough history yet</p>
+            )}
+          </div>
+        </Card>
+
+        <Card className="p-5">
+          <div className="flex items-center justify-between">
+            <h2 className="text-[14px] font-semibold">Realised P&amp;L per closed trade</h2>
+            <span className={cx('text-[12.5px] tabular-nums', realizedGross >= 0 ? 'text-success' : 'text-danger')}>
+              {realizedGross >= 0 ? '+' : ''}${realizedGross.toFixed(2)} across {closedTrades.length}
+            </span>
+          </div>
+          <div className="mt-4">
+            {closedTrades.length > 0 ? (
+              <BarChart
+                data={closedTrades.map((trade) => ({
+                  label: shortDate(trade.at),
+                  value: trade.pnl ?? 0,
+                  note: trade.symbol,
+                }))}
+                height={150}
+              />
+            ) : (
+              <p className="py-6 text-center text-[13px] text-muted">No closed round trips yet</p>
+            )}
+          </div>
         </Card>
       </div>
 

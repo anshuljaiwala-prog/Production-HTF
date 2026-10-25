@@ -1,12 +1,14 @@
 import { Bot as BotIcon, Plus } from 'lucide-react'
 import { useMemo, useState } from 'react'
-import { useNavigate } from 'react-router'
+import { useNavigate, useSearchParams } from 'react-router'
 
-import { Badge, Button, EmptyState, PageHeader, Skeleton } from '../components/ui'
+import { BoardPanel } from './Board'
+import { CompareBars } from '../components/charts'
+import { Badge, Button, Card, EmptyState, PageHeader, Skeleton } from '../components/ui'
 import { useBots } from '../lib/api'
 import { cx } from '../lib/cx'
 import { money, relativeTime } from '../lib/format'
-import { BOT_STAGES, type BotStatus } from '../../shared/types'
+import { BOT_STAGES, type Bot, type BotStatus } from '../../shared/types'
 
 const statusTone: Record<BotStatus, 'success' | 'warning' | 'neutral'> = { running: 'success', paused: 'warning', stopped: 'neutral' }
 const FILTERS: { key: BotStatus | 'all'; label: string }[] = [
@@ -15,20 +17,33 @@ const FILTERS: { key: BotStatus | 'all'; label: string }[] = [
   { key: 'paused', label: 'Paused' },
   { key: 'stopped', label: 'Stopped' },
 ]
+const TABS: { key: 'list' | 'board'; label: string }[] = [
+  { key: 'list', label: 'Bot list' },
+  { key: 'board', label: 'Lifecycle board' },
+]
 
 export function Bots() {
   const { data, isLoading } = useBots()
   const navigate = useNavigate()
+  const [params, setParams] = useSearchParams()
   const [filter, setFilter] = useState<BotStatus | 'all'>('all')
+  const view = params.get('tab') === 'board' ? 'board' : 'list'
 
-  const bots = useMemo(() => (data?.items ?? []).filter((bot) => filter === 'all' || bot.status === filter), [data, filter])
-  const running = (data?.items ?? []).filter((bot) => bot.status === 'running').length
+  const items = useMemo(() => data?.items ?? [], [data])
+  const bots = useMemo(() => items.filter((bot) => filter === 'all' || bot.status === filter), [items, filter])
+  const running = items.filter((bot) => bot.status === 'running').length
 
   return (
     <div className="mx-auto max-w-[1200px] p-5 sm:p-8">
       <PageHeader
         title="Bots"
-        subtitle={data ? `${data.items.length} launched · ${running} running — each read fast-forwards the fleet` : undefined}
+        subtitle={
+          data
+            ? view === 'board'
+              ? 'Drag bots across their lifecycle: draft → backtest → paper → live.'
+              : `${items.length} launched · ${running} running — each read fast-forwards the fleet`
+            : undefined
+        }
         actions={
           <Button variant="primary" onClick={() => navigate('/strategies')}>
             <Plus />
@@ -37,24 +52,50 @@ export function Bots() {
         }
       />
 
-      <div className="mt-5 flex items-center gap-1 rounded-control bg-bg p-1">
-        {FILTERS.map((option) => (
+      <div className="mt-5 flex w-fit items-center gap-1 rounded-control bg-bg p-1" role="tablist">
+        {TABS.map((tab) => (
           <button
-            key={option.key}
+            key={tab.key}
             type="button"
-            aria-pressed={filter === option.key}
-            onClick={() => setFilter(option.key)}
+            role="tab"
+            aria-selected={view === tab.key}
+            onClick={() => setParams(tab.key === 'board' ? { tab: 'board' } : {})}
             className={cx(
-              'h-8 rounded-[9px] px-3 text-[12.5px] font-medium transition-colors',
-              filter === option.key ? 'bg-surface text-fg shadow-card' : 'text-muted hover:text-fg',
+              'h-8 rounded-[9px] px-3.5 text-[12.5px] font-medium transition-colors',
+              view === tab.key ? 'bg-surface text-fg shadow-card' : 'text-muted hover:text-fg',
             )}
           >
-            {option.label}
+            {tab.label}
           </button>
         ))}
       </div>
 
-      <div className="mt-4 overflow-hidden rounded-card border border-line">
+      {view === 'board' ? (
+        <div className="mt-4">
+          <BoardPanel />
+        </div>
+      ) : (
+        <>
+          <BotCharts items={items} isLoading={isLoading} />
+
+          <div className="mt-3 flex items-center gap-1 rounded-control bg-bg p-1">
+            {FILTERS.map((option) => (
+              <button
+                key={option.key}
+                type="button"
+                aria-pressed={filter === option.key}
+                onClick={() => setFilter(option.key)}
+                className={cx(
+                  'h-8 rounded-[9px] px-3 text-[12.5px] font-medium transition-colors',
+                  filter === option.key ? 'bg-surface text-fg shadow-card' : 'text-muted hover:text-fg',
+                )}
+              >
+                {option.label}
+              </button>
+            ))}
+          </div>
+
+          <div className="mt-4 overflow-hidden rounded-card border border-line">
         <table className="w-full table-fixed text-left text-[13.5px]">
           <thead>
             <tr className="h-10 border-b border-line bg-bg/60 text-[12.5px] text-muted">
@@ -127,7 +168,45 @@ export function Bots() {
             }
           />
         )}
-      </div>
+          </div>
+        </>
+      )}
+    </div>
+  )
+}
+
+/** Fleet comparison charts above the list: where capital sits and how each
+ * bot is performing. Plotted directly from the list data — no extra request. */
+function BotCharts({ items, isLoading }: { items: Bot[]; isLoading: boolean }) {
+  if (isLoading || items.length === 0) return null
+  return (
+    <div className="mt-3 grid gap-3 lg:grid-cols-2">
+      <Card className="p-5">
+        <div className="flex items-center justify-between">
+          <h2 className="text-[14px] font-semibold">Capital allocation by bot</h2>
+          <span className="text-[12.5px] text-faint">equity split</span>
+        </div>
+        <div className="mt-4">
+          <CompareBars items={items.map((bot) => ({ label: bot.name, caption: bot.strategyName, value: bot.equity }))} />
+        </div>
+      </Card>
+      <Card className="p-5">
+        <div className="flex items-center justify-between">
+          <h2 className="text-[14px] font-semibold">Net P&L by bot</h2>
+          <span className="text-[12.5px] text-faint">% of initial capital</span>
+        </div>
+        <div className="mt-4">
+          <CompareBars
+            signed
+            format={(v) => `${v.toFixed(1)}%`}
+            items={items.map((bot) => ({
+              label: bot.name,
+              caption: `${bot.status} · ${bot.symbols[0]}`,
+              value: bot.initialEquity > 0 ? ((bot.equity - bot.initialEquity) / bot.initialEquity) * 100 : 0,
+            }))}
+          />
+        </div>
+      </Card>
     </div>
   )
 }

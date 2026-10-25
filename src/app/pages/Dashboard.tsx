@@ -103,7 +103,7 @@ export function Dashboard() {
         <Card className="p-5">
           <div className="flex items-center justify-between">
             <h2 className="text-[14px] font-semibold">Lifecycle</h2>
-            <Link to="/board" className="text-[12.5px] text-muted hover:text-fg">
+            <Link to="/bots?tab=board" className="text-[12.5px] text-muted hover:text-fg">
               Open board
             </Link>
           </div>
@@ -169,7 +169,7 @@ export function Dashboard() {
         <Card className="p-5">
           <div className="flex items-center justify-between">
             <h2 className="text-[14px] font-semibold">Recent events</h2>
-            <Link to="/board" className="text-[12.5px] text-muted hover:text-fg">
+            <Link to="/bots?tab=board" className="text-[12.5px] text-muted hover:text-fg">
               Board
             </Link>
           </div>

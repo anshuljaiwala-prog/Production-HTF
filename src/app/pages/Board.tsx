@@ -16,7 +16,7 @@ import { Layers, Plus, Rocket } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 import { useNavigate } from 'react-router'
 
-import { Badge, Button, EmptyState, PageHeader, Skeleton } from '../components/ui'
+import { Badge, Button, EmptyState, Skeleton } from '../components/ui'
 import { patchBot, useApiMutation, useBots } from '../lib/api'
 import { cx } from '../lib/cx'
 import { money, moneyCompact } from '../lib/format'
@@ -29,7 +29,9 @@ const stageDot: Record<BotStage, string> = {
   live: 'bg-success',
 }
 
-export function Board() {
+/** The bot lifecycle kanban (draft → backtest → paper → live). Rendered as a
+ * tab inside the Bots page; no own page chrome. */
+export function BoardPanel() {
   const { data, isLoading } = useBots()
   const navigate = useNavigate()
   const [local, setLocal] = useState<Bot[]>([])
@@ -109,50 +111,32 @@ export function Board() {
 
   if (isLoading) {
     return (
-      <div className="mx-auto max-w-[1400px] p-5 sm:p-8">
-        <Skeleton className="h-16 w-full" />
-        <div className="mt-6 grid grid-cols-4 gap-3">
-          {Array.from({ length: 4 }).map((_, i) => (
-            <Skeleton key={i} className="h-[300px] rounded-card" />
-          ))}
-        </div>
+      <div className="grid gap-3 lg:grid-cols-4">
+        {Array.from({ length: 4 }).map((_, i) => (
+          <Skeleton key={i} className="h-[300px] rounded-card" />
+        ))}
       </div>
     )
   }
 
   return (
-    <div className="flex h-full flex-col">
-      <div className="mx-auto w-full max-w-[1400px] px-5 pt-5 sm:px-8 sm:pt-8">
-        <PageHeader
-          title="Board"
-          subtitle="Drag bots across their lifecycle: draft → backtest → paper → live."
-          actions={
+    <div className="min-h-[480px]">
+      {local.length === 0 ? (
+        <EmptyState
+          icon={<Layers />}
+          title="The board is empty"
+          description="Launch a strategy and its bot lands here, ready to move through the lifecycle."
+          action={
             <Button variant="primary" onClick={() => navigate('/strategies')}>
               <Rocket />
-              Launch bot
+              Launch a bot
             </Button>
           }
         />
-      </div>
-
-      {local.length === 0 ? (
-        <div className="mx-auto mt-6 w-full max-w-[600px] px-5">
-          <EmptyState
-            icon={<Layers />}
-            title="The board is empty"
-            description="Launch a strategy and its bot lands here, ready to move through the lifecycle."
-            action={
-              <Button variant="primary" onClick={() => navigate('/strategies')}>
-                <Rocket />
-                Launch a bot
-              </Button>
-            }
-          />
-        </div>
       ) : (
         <DndContext sensors={sensors} collisionDetection={closestCorners} onDragStart={onDragStart} onDragOver={onDragOver} onDragEnd={onDragEnd} onDragCancel={() => (setActiveId(null), setLocal(data?.items ?? []))}>
-          <div className="scrollbar-thin mt-6 flex-1 overflow-x-auto px-5 pb-6 sm:px-8">
-            <div className="mx-auto grid h-full min-w-[980px] max-w-[1400px] grid-cols-4 gap-3">
+          <div className="scrollbar-thin flex-1 overflow-x-auto pb-6">
+            <div className="grid min-w-[880px] gap-3 lg:grid-cols-4">
               {columns.map((column) => (
                 <Column
                   key={column.key}

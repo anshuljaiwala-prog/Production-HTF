@@ -2,7 +2,7 @@ import { ArrowDownRight, ArrowUpRight, FileSearch, Wallet, X } from 'lucide-reac
 import { useState } from 'react'
 import { Link } from 'react-router'
 
-import { AreaChart } from '../components/charts'
+import { AreaChart, CompareBars, DrawdownChart } from '../components/charts'
 import { Badge, Card, EmptyState, Live, PageHeader, Skeleton } from '../components/ui'
 import { useBot, usePortfolio } from '../lib/api'
 import { cx } from '../lib/cx'
@@ -119,19 +119,39 @@ function FleetAudit({ data, live }: { data: Portfolio; live: boolean }) {
       </div>
 
       <div className="mt-3 grid gap-3 lg:grid-cols-3">
-        <Card className="p-5 lg:col-span-2">
-          <div className="flex items-center justify-between">
-            <h2 className="text-[14px] font-semibold">Fleet equity</h2>
-            {live ? <Live active label="live · 4s updates" /> : <span className="text-[12.5px] text-faint">Last 30 days</span>}
-          </div>
-          <div className="mt-4">
-            {data.equity.length > 0 ? (
-              <AreaChart data={data.equity} />
-            ) : (
-              <EmptyState icon={<Wallet />} title="No curve yet" description="Launch a bot to build the fleet curve." />
-            )}
-          </div>
-        </Card>
+        <div className="grid gap-3 lg:col-span-2">
+          <Card className="p-5">
+            <div className="flex items-center justify-between">
+              <h2 className="text-[14px] font-semibold">Fleet equity</h2>
+              {live ? <Live active label="live · 4s updates" /> : <span className="text-[12.5px] text-faint">Last 30 days</span>}
+            </div>
+            <div className="mt-4">
+              {data.equity.length > 0 ? (
+                <AreaChart data={data.equity} />
+              ) : (
+                <EmptyState icon={<Wallet />} title="No curve yet" description="Launch a bot to build the fleet curve." />
+              )}
+            </div>
+          </Card>
+
+          <Card className="p-5">
+            <div className="flex items-center justify-between">
+              <h2 className="text-[14px] font-semibold">Net P&amp;L by bot</h2>
+              <span className="text-[12.5px] text-faint">% of that bot's capital · green wins, red loses</span>
+            </div>
+            <div className="mt-4">
+              <CompareBars
+                signed
+                format={(v) => `${v.toFixed(1)}%`}
+                items={data.bots.map((bot) => ({
+                  label: bot.name,
+                  caption: `${bot.strategyName} · ${bot.status}`,
+                  value: bot.capital > 0 ? ((bot.equity - bot.capital) / bot.capital) * 100 : 0,
+                }))}
+              />
+            </div>
+          </Card>
+        </div>
 
         <Card className="p-5">
           <div className="flex items-center justify-between">
@@ -327,6 +347,14 @@ function BotPerformance({ audit, onBack }: { audit: PortfolioBotAudit; onBack: (
               !isLoading && <EmptyState icon={<ArrowUpRight />} title="Nothing yet" description="Equity is recorded as closed bars come in." />
             )}
           </div>
+          {!isLoading && curve.length > 1 && (
+            <>
+              <p className="mt-5 text-[12.5px] font-medium text-muted">Same run, percent below the running peak</p>
+              <div className="mt-3">
+                <DrawdownChart data={curve} height={120} />
+              </div>
+            </>
+          )}
         </Card>
 
         <Card className="p-5">

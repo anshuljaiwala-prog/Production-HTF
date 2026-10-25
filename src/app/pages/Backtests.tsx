@@ -2,7 +2,7 @@ import { CandlestickChart, Play, Trash2 } from 'lucide-react'
 import { useState } from 'react'
 import { useSearchParams } from 'react-router'
 
-import { AreaChart } from '../components/charts'
+import { AreaChart, BarChart, DrawdownChart } from '../components/charts'
 import { BacktestDialog } from '../components/forms'
 import { Badge, Button, Card, ConfirmDialog, Drawer, EmptyState, Live, PageHeader, Skeleton, useToast } from '../components/ui'
 import { deleteBacktest, useApiMutation, useBacktests } from '../lib/api'
@@ -196,6 +196,48 @@ function BacktestDrawer({ id, onClose }: { id: string | null; onClose: () => voi
                 )}
               </div>
             </Card>
+
+            <div className="grid gap-3 lg:grid-cols-2">
+              <Card className="p-4">
+                <div className="flex items-center justify-between">
+                  <h3 className="text-[13.5px] font-semibold">Drawdown under peak</h3>
+                  <span className="text-[12px] text-faint">max −{metrics ? metrics.maxDrawdown.toFixed(1) : '—'}%</span>
+                </div>
+                <div className="mt-3">
+                  {backtest.curve.length > 1 ? (
+                    <DrawdownChart data={backtest.curve.map((point) => ({ label: shortDate(point.t), value: point.value }))} height={130} />
+                  ) : (
+                    <p className="py-6 text-center text-[13px] text-muted">No curve recorded</p>
+                  )}
+                </div>
+              </Card>
+
+              <Card className="p-4">
+                <div className="flex items-center justify-between">
+                  <h3 className="text-[13.5px] font-semibold">P&amp;L per closed trade</h3>
+                  <span className="text-[12px] text-faint">
+                    {metrics ? `${metrics.winRate.toFixed(0)}% won` : '—'}
+                  </span>
+                </div>
+                <div className="mt-3">
+                  {(() => {
+                    const closed = [...backtest.trades].filter((trade) => trade.pnl !== null).reverse()
+                    return closed.length > 0 ? (
+                      <BarChart
+                        data={closed.map((trade) => ({
+                          label: shortDate(trade.at),
+                          value: trade.pnl ?? 0,
+                          note: trade.side,
+                        }))}
+                        height={130}
+                      />
+                    ) : (
+                      <p className="py-6 text-center text-[13px] text-muted">The strategy never closed a trade</p>
+                    )
+                  })()}
+                </div>
+              </Card>
+            </div>
 
             <div>
               <div className="flex items-center justify-between">

@@ -5,7 +5,6 @@ import { Shell } from './components/Shell'
 import { Spinner, ToastProvider } from './components/ui'
 import { ApiError, useMe } from './lib/api'
 import { Backtests } from './pages/Backtests'
-import { Board } from './pages/Board'
 import { BotDetail } from './pages/BotDetail'
 import { Bots } from './pages/Bots'
 import { Connections } from './pages/Connections'
@@ -39,8 +38,8 @@ function Gate() {
         <Route index element={<Dashboard />} />
         <Route path="bots" element={<Bots />} />
         <Route path="bots/:id" element={<BotDetail />} />
+        <Route path="board" element={<Navigate to="/bots?tab=board" replace />} />
         <Route path="strategies" element={<Strategies />} />
-        <Route path="board" element={<Board />} />
         <Route path="backtests" element={<Backtests />} />
         <Route path="connections" element={<Connections />} />
         <Route path="portfolio" element={<Portfolio />} />
