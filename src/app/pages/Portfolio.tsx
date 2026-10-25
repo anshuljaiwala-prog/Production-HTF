@@ -3,7 +3,7 @@ import { ArrowDownRight, ArrowUpRight, FileSearch, Plus, Minus, Wallet, X } from
 import { useState } from 'react'
 import { Link } from 'react-router'
 
-import { AreaChart, CompareBars, DrawdownChart } from '../components/charts'
+import { AreaChart, BarChart, CompareBars, DrawdownChart } from '../components/charts'
 import { Badge, Button, Card, EmptyState, Input, Live, PageHeader, Skeleton, useToast } from '../components/ui'
 import { adjustFunding, ApiError, useBot, usePortfolio } from '../lib/api'
 import { cx } from '../lib/cx'
@@ -248,6 +248,17 @@ export function FundingCard({ data, flows, title = 'Funding & reconciliation' }:
   const expect = data.summary.launchCapital + data.summary.netFunding + tradingPnl
   const balanced = Math.abs(expect - data.summary.currentEquity) < 0.05
 
+  // Net funding per calendar day, oldest → newest, signed: deposits minus
+  // withdrawals. One bar per day the fleet moved money.
+  const dailySeries = (() => {
+    const byDay = new Map<string, number>()
+    for (const flow of [...flows].sort((a, b) => a.at - b.at)) {
+      const key = shortDate(flow.at)
+      byDay.set(key, (byDay.get(key) ?? 0) + flow.amount)
+    }
+    return [...byDay.entries()].map(([label, value]) => ({ label, value }))
+  })()
+
   return (
     <Card className="mt-3 overflow-hidden">
       <div className="flex flex-wrap items-center justify-between gap-2 px-5 pt-5">
@@ -286,6 +297,20 @@ export function FundingCard({ data, flows, title = 'Funding & reconciliation' }:
           </div>
         </div>
       </div>
+
+      {dailySeries.length > 0 && (
+        <div className="mt-4 px-5">
+          <div className="flex items-center justify-between">
+            <p className="text-[12.5px] font-medium text-muted">Net funding per day</p>
+            <span className="text-[11.5px] text-faint">
+              deposits − withdrawals · {dailySeries.length} {dailySeries.length === 1 ? 'day' : 'days'} active · most recent 50 flows
+            </span>
+          </div>
+          <div className="mt-3">
+            <BarChart data={dailySeries} height={140} format={(v) => moneyExact(v)} />
+          </div>
+        </div>
+      )}
 
       <div className="mt-4 px-5 pb-5">
         <p className="text-[12.5px] font-medium text-muted">Daily funding log</p>
