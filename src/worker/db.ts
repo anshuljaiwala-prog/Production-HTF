@@ -56,6 +56,7 @@ const SCHEMA = [
     cash REAL NOT NULL DEFAULT 0,
     equity REAL NOT NULL DEFAULT 0,
     initial_equity REAL NOT NULL DEFAULT 0,
+    net_deposits REAL NOT NULL DEFAULT 0,
     realized_pnl REAL NOT NULL DEFAULT 0,
     round_trips INTEGER NOT NULL DEFAULT 0,
     wins INTEGER NOT NULL DEFAULT 0,
@@ -65,6 +66,17 @@ const SCHEMA = [
     updated_at INTEGER NOT NULL
   )`,
   `CREATE INDEX IF NOT EXISTS bots_owner ON bots(owner_sub, stage, position)`,
+  // Operator cash flows: funding adjustments that move capital without being
+  // P&L, so equity reconciles against real-world cash movement.
+  `CREATE TABLE IF NOT EXISTS cashflows (
+    id TEXT PRIMARY KEY,
+    owner_sub TEXT NOT NULL,
+    bot_id TEXT NOT NULL,
+    amount REAL NOT NULL,
+    note TEXT,
+    created_at INTEGER NOT NULL
+  )`,
+  `CREATE INDEX IF NOT EXISTS cashflows_owner ON cashflows(owner_sub, created_at DESC)`,
   `CREATE TABLE IF NOT EXISTS positions (
     id TEXT PRIMARY KEY,
     owner_sub TEXT NOT NULL,
@@ -137,7 +149,16 @@ const SCHEMA = [
 let ready: Promise<void> | undefined
 
 export function ensureSchema(db: D1Database): Promise<void> {
-  ready ??= db.batch(SCHEMA.map((sql) => db.prepare(sql))).then(
+  ready ??= (async () => {
+    await db.batch(SCHEMA.map((sql) => db.prepare(sql)))
+    // Databases created before this column existed (local dev state) miss it;
+    // ADD COLUMN on a fresh copy fails harmlessly as a duplicate column.
+    try {
+      await db.prepare(`ALTER TABLE bots ADD COLUMN net_deposits REAL NOT NULL DEFAULT 0`).run()
+    } catch {
+      /* already present */
+    }
+  })().then(
     () => undefined,
     (error) => {
       ready = undefined
@@ -207,6 +228,7 @@ export function mapBot(r: Row): Bot {
     cash: Number(r.cash ?? 0),
     equity: Number(r.equity ?? 0),
     initialEquity: Number(r.initial_equity ?? 0),
+    netDeposits: Number(r.net_deposits ?? 0),
     realizedPnl: Number(r.realized_pnl ?? 0),
     roundTrips: Number(r.round_trips ?? 0),
     wins: Number(r.wins ?? 0),

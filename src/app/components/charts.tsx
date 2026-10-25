@@ -117,7 +117,7 @@ export function AreaChart({
       </svg>
       {hover !== null && (
         <div
-          className="pointer-events-none absolute -top-1 -translate-x-1/2 rounded-tile bg-fg px-2.5 py-1.5 text-[12px] font-medium text-white shadow-pop"
+          className="pointer-events-none absolute -top-1 -translate-x-1/2 rounded-tile bg-fg px-2.5 py-1.5 text-[12px] font-medium text-bg shadow-pop"
           style={{ left: `${((points[hover].x) / w) * 100}%` }}
         >
           {data[hover].label} · {format(data[hover].value)}
@@ -213,7 +213,7 @@ export function DrawdownChart({
       </svg>
       {hover !== null && (
         <div
-          className="pointer-events-none absolute -top-1 -translate-x-1/2 rounded-tile bg-fg px-2.5 py-1.5 text-[12px] font-medium text-white shadow-pop"
+          className="pointer-events-none absolute -top-1 -translate-x-1/2 rounded-tile bg-fg px-2.5 py-1.5 text-[12px] font-medium text-bg shadow-pop"
           style={{ left: `${(points[hover].x / w) * 100}%` }}
         >
           {data[hover].label} · −{Math.abs(dd[hover]).toFixed(1)}% below peak
@@ -288,7 +288,7 @@ export function BarChart({
       </svg>
       {hover !== null && (
         <div
-          className="pointer-events-none absolute -top-1 z-10 -translate-x-1/2 rounded-tile bg-fg px-2.5 py-1.5 text-[12px] font-medium text-white shadow-pop"
+          className="pointer-events-none absolute -top-1 z-10 -translate-x-1/2 rounded-tile bg-fg px-2.5 py-1.5 text-[12px] font-medium text-bg shadow-pop"
           style={{ left: `${((padLeft + hover * slot + slot / 2) / w) * 100}%` }}
         >
           trade {hover + 1}{data[hover].label ? ` · ${data[hover].label}` : ''} · {format(data[hover].value)}

@@ -256,6 +256,53 @@ bots.post('/:id/control', async (c) => {
   return privateJson(c, { bot: withStrategy(updated) })
 })
 
+interface FundingBody {
+  amount?: number
+  note?: string
+}
+
+/** Operator cash flow: deposit (positive) or withdrawal (negative). Funding
+ * moves cash, equity and capital together, so recorded trading P&L —
+ * equity − capital — never changes; net_deposits carries the signed total so
+ * the portfolio can reconcile equity against real-world cash movement. */
+bots.post('/:id/cashflow', async (c) => {
+  const db = c.get('db')
+  const owner = c.get('user').sub
+  const botId = c.req.param('id')
+  const body = await c.req.json<FundingBody>()
+  const amount = Math.round(Number(body.amount) * 100) / 100
+  if (!Number.isFinite(amount) || amount === 0 || Math.abs(amount) > 10_000_000) {
+    return c.json({ error: 'invalid_amount', message: 'Enter a non-zero amount below $10,000,000.' }, 400)
+  }
+
+  const bot = await loadBot(db, owner, botId)
+  if (!bot) return c.json({ error: 'not_found', message: 'Bot not found.' }, 404)
+  if (amount < 0 && -amount > bot.cash + 1e-6) {
+    return c.json(
+      { error: 'insufficient_cash', message: `Withdrawal exceeds the bot's idle cash ($${bot.cash.toFixed(2)}) — close positions first.` },
+      400,
+    )
+  }
+
+  const t = now()
+  await db.batch([
+    db
+      .prepare(
+        `UPDATE bots SET cash = cash + ?, equity = equity + ?, capital = capital + ?, net_deposits = net_deposits + ?, updated_at = ?
+         WHERE id = ? AND owner_sub = ?`,
+      )
+      .bind(amount, amount, amount, amount, t, botId, owner),
+    db
+      .prepare(`INSERT INTO cashflows (id, owner_sub, bot_id, amount, note, created_at) VALUES (?, ?, ?, ?, ?, ?)`)
+      .bind(id(), owner, botId, amount, body.note?.trim().slice(0, 120) || null, t),
+  ])
+  const abs = Math.abs(amount).toLocaleString('en-US', { style: 'currency', currency: 'USD' })
+  await logEvent(db, owner, botId, 'info', amount > 0 ? `Operator deposited ${abs}.` : `Operator withdrew ${abs}.`)
+
+  const updated = await loadBot(db, owner, botId)
+  return privateJson(c, { bot: updated ? withStrategy(updated) : null })
+})
+
 bots.delete('/:id', async (c) => {
   const db = c.get('db')
   const owner = c.get('user').sub
@@ -268,6 +315,7 @@ bots.delete('/:id', async (c) => {
     db.prepare(`DELETE FROM trades WHERE bot_id = ?`).bind(botId),
     db.prepare(`DELETE FROM bot_events WHERE bot_id = ?`).bind(botId),
     db.prepare(`DELETE FROM equity_points WHERE bot_id = ?`).bind(botId),
+    db.prepare(`DELETE FROM cashflows WHERE bot_id = ?`).bind(botId),
   ])
   return privateJson(c, { ok: true })
 })

@@ -1,5 +1,6 @@
 import { CandlestickChart, Play, Trash2 } from 'lucide-react'
-import { useState } from 'react'
+import { motion } from 'motion/react'
+import { useEffect, useRef, useState } from 'react'
 import { useSearchParams } from 'react-router'
 
 import { AreaChart, BarChart, DrawdownChart } from '../components/charts'
@@ -14,7 +15,44 @@ export function Backtests() {
   const { data, isLoading } = useBacktests()
   const [params, setParams] = useSearchParams()
   const [composing, setComposing] = useState(false)
+  const toast = useToast()
   const selected = params.get('id')
+
+  // The list auto-polls while a run is pending; when we see a run flip from
+  // running to a terminal state, announce it and open its results if the user
+  // isn't already reading one. The flip id also drives a pulse on the drawer
+  // badge for a few seconds.
+  const seenStatuses = useRef<Map<string, Backtest['status']>>(new Map())
+  const [flipped, setFlipped] = useState<string | null>(null)
+
+  useEffect(() => {
+    if (!data) return
+    let finished: Backtest | undefined
+    for (const item of data.items) {
+      const before = seenStatuses.current.get(item.id)
+      seenStatuses.current.set(item.id, item.status)
+      if (before === 'running' && item.status !== 'running') finished = item
+    }
+    if (!finished) return
+    if (finished.status === 'done' && finished.metrics) {
+      toast(`${finished.name} finished · ${finished.metrics.totalReturn >= 0 ? '+' : ''}${finished.metrics.totalReturn.toFixed(1)}%`)
+    } else if (finished.status === 'failed') {
+      toast(`${finished.name} failed: ${finished.error ?? 'unknown error'}`, 'danger')
+    } else {
+      toast(`${finished.name} finished`)
+    }
+    setFlipped(finished.id)
+    if (!selected) setParams({ id: finished.id })
+    // selected/params intentionally read but not re-run on: a flip announces
+    // once, not on every poll.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [data])
+
+  useEffect(() => {
+    if (!flipped) return
+    const timer = window.setTimeout(() => setFlipped(null), 2_800)
+    return () => window.clearTimeout(timer)
+  }, [flipped])
 
   return (
     <div className="mx-auto max-w-[1200px] p-5 sm:p-8">
@@ -106,12 +144,20 @@ export function Backtests() {
       </div>
 
       <BacktestDialog open={composing} onClose={() => setComposing(false)} strategyKey={null} />
-      <BacktestDrawer id={selected} onClose={() => setParams({})} />
+      <BacktestDrawer id={selected} flashId={flipped} onClose={() => setParams({})} />
     </div>
   )
 }
 
-function BacktestDrawer({ id, onClose }: { id: string | null; onClose: () => void }) {
+function BacktestDrawer({
+  id,
+  flashId,
+  onClose,
+}: {
+  id: string | null
+  flashId: string | null
+  onClose: () => void
+}) {
   const { data, isLoading } = useBacktests()
   const toast = useToast()
   const [deleting, setDeleting] = useState(false)
@@ -146,7 +192,16 @@ function BacktestDrawer({ id, onClose }: { id: string | null; onClose: () => voi
         header={
           backtest && (
             <div className="flex items-center gap-2">
-              <Badge tone={backtest.status === 'done' ? 'success' : backtest.status === 'failed' ? 'danger' : 'neutral'}>{backtest.status}</Badge>
+              <motion.span
+                key={flashId === id ? `flash-${backtest.status}` : 'idle'}
+                animate={flashId === id ? { scale: [1, 1.22, 1] } : { scale: 1 }}
+                transition={{ duration: 0.55, ease: 'easeOut' }}
+                className="inline-flex origin-left"
+              >
+                <Badge tone={backtest.status === 'done' ? 'success' : backtest.status === 'failed' ? 'danger' : 'neutral'} dot>
+                  {backtest.status}
+                </Badge>
+              </motion.span>
               {backtest.status === 'running' && <Live active label="1s poll" />}
               <span className="truncate text-[13px] text-muted">
                 {backtest.strategyName} · {backtest.symbol} · {backtest.timeframe}

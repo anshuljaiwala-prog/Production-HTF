@@ -80,6 +80,8 @@ export interface Bot {
   cash: number
   equity: number
   initialEquity: number
+  /** Signed sum of operator cash flows: deposits positive, withdrawals negative. */
+  netDeposits: number
   realizedPnl: number
   roundTrips: number
   wins: number
@@ -174,6 +176,16 @@ export interface SearchResults {
   strategies: { key: string; name: string; risk: RiskLevel }[]
 }
 
+export interface CashFlow {
+  id: string
+  botId: string
+  botName: string | null
+  /** Deposit positive, withdrawal negative. */
+  amount: number
+  note: string | null
+  at: number
+}
+
 /** Financial audit, aggregate across the fleet and per bot. */
 export interface PortfolioBotAudit {
   id: string
@@ -185,6 +197,7 @@ export interface PortfolioBotAudit {
   capital: number
   cash: number
   equity: number
+  netDeposits: number
   realizedPnl: number
   unrealizedPnl: number
   /** Fees paid across every fill this bot made. */
@@ -225,10 +238,15 @@ export interface Portfolio {
   summary: {
     startingCapital: number
     currentEquity: number
+    /** Launch funding across the fleet: Σ (capital − net Deposits). */
+    launchCapital: number
     netPnl: number
     netPnlPct: number
     realizedPnl: number
     unrealizedPnl: number
+    deposits: number
+    withdrawals: number
+    netFunding: number
     fees: number
     grossProfit: number
     grossLoss: number
@@ -245,6 +263,7 @@ export interface Portfolio {
   bots: PortfolioBotAudit[]
   positions: PortfolioPosition[]
   transactions: PortfolioTransaction[]
+  funding: CashFlow[]
 }
 
 export interface Me {

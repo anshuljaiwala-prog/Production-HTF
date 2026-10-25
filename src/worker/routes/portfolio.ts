@@ -6,7 +6,13 @@ import type { AppContext } from '../env'
 import { advanceBot } from '../engine'
 import { quote } from '../market'
 import { strategyBy } from '../strategies'
-import type { Portfolio, PortfolioBotAudit, PortfolioPosition, PortfolioTransaction } from '../../shared/types'
+import type {
+  CashFlow,
+  Portfolio,
+  PortfolioBotAudit,
+  PortfolioPosition,
+  PortfolioTransaction,
+} from '../../shared/types'
 import { buildEquitySeries, loadBots } from './workspace'
 
 type Row = Record<string, unknown>
@@ -30,7 +36,7 @@ portfolio.get('/', async (c) => {
   for (const bot of running) await advanceBot(db, owner, bot)
   if (running.length) bots = await loadBots(db, owner)
 
-  const [perBotTrades, positions, ledger, points] = await db.batch([
+  const [perBotTrades, positions, ledger, points, fundingTotals, fundingRows] = await db.batch([
     db
       .prepare(
         `SELECT bot_id,
@@ -51,6 +57,20 @@ portfolio.get('/', async (c) => {
       )
       .bind(owner),
     db.prepare(`SELECT bot_id, at, value FROM equity_points WHERE owner_sub = ? AND at >= ? ORDER BY at ASC LIMIT 4000`).bind(owner, windowStart),
+    db
+      .prepare(
+        `SELECT
+           COALESCE(SUM(CASE WHEN amount > 0 THEN amount ELSE 0 END), 0) AS deposits,
+           COALESCE(SUM(CASE WHEN amount < 0 THEN -amount ELSE 0 END), 0) AS withdrawals
+         FROM cashflows WHERE owner_sub = ?`,
+      )
+      .bind(owner),
+    db
+      .prepare(
+        `SELECT cf.*, b.name AS bot_name FROM cashflows cf LEFT JOIN bots b ON b.id = cf.bot_id
+         WHERE cf.owner_sub = ? ORDER BY cf.created_at DESC, cf.id DESC LIMIT 50`,
+      )
+      .bind(owner),
   ])
 
   const botIds = new Set(bots.map((b) => b.id))
@@ -99,6 +119,7 @@ portfolio.get('/', async (c) => {
       capital: bot.capital,
       cash: bot.cash,
       equity: bot.cash + (open?.mark ?? 0),
+      netDeposits: bot.netDeposits,
       realizedPnl: realized,
       unrealizedPnl: unrealized,
       fees,
@@ -111,9 +132,21 @@ portfolio.get('/', async (c) => {
     }
   })
 
+  const funding: CashFlow[] = ((fundingRows.results ?? []) as Row[]).map((row) => ({
+    id: String(row.id),
+    botId: String(row.bot_id),
+    botName: (row.bot_name as string | null) ?? null,
+    amount: Number(row.amount ?? 0),
+    note: (row.note as string | null) ?? null,
+    at: Number(row.created_at),
+  }))
+  const deposits = Number((fundingTotals.results[0] as Row | undefined)?.deposits ?? 0)
+  const withdrawals = Number((fundingTotals.results[0] as Row | undefined)?.withdrawals ?? 0)
+
   const totals = auditBots.reduce(
     (acc, bot) => {
       acc.startingCapital += bot.capital
+      acc.launchCapital += bot.capital - bot.netDeposits
       acc.currentEquity += bot.equity
       acc.realizedPnl += bot.realizedPnl
       acc.unrealizedPnl += bot.unrealizedPnl
@@ -127,6 +160,7 @@ portfolio.get('/', async (c) => {
     },
     {
       startingCapital: 0,
+      launchCapital: 0,
       currentEquity: 0,
       realizedPnl: 0,
       unrealizedPnl: 0,
@@ -144,15 +178,21 @@ portfolio.get('/', async (c) => {
     return { ...trade, botName: (row.bot_name as string | null) ?? null }
   })
 
+  // Trading P&L: funding moves equity and capital together, so the difference
+  // isolates what the bots actually earned — the reconcilable quantity.
   const netPnl = totals.currentEquity - totals.startingCapital
   const body: Portfolio = {
     summary: {
       startingCapital: totals.startingCapital,
       currentEquity: totals.currentEquity,
+      launchCapital: totals.launchCapital,
       netPnl,
       netPnlPct: totals.startingCapital > 0 ? (netPnl / totals.startingCapital) * 100 : 0,
       realizedPnl: totals.realizedPnl,
       unrealizedPnl: totals.unrealizedPnl,
+      deposits,
+      withdrawals,
+      netFunding: deposits - withdrawals,
       fees: totals.fees,
       grossProfit: totals.grossProfit,
       grossLoss: totals.grossLoss,
@@ -169,6 +209,7 @@ portfolio.get('/', async (c) => {
     bots: auditBots,
     positions: auditPositions,
     transactions,
+    funding,
   }
   return privateJson(c, body)
 })

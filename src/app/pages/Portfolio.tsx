@@ -1,22 +1,18 @@
-import { ArrowDownRight, ArrowUpRight, FileSearch, Wallet, X } from 'lucide-react'
+import { useMutation, useQueryClient } from '@tanstack/react-query'
+import { ArrowDownRight, ArrowUpRight, FileSearch, Plus, Minus, Wallet, X } from 'lucide-react'
 import { useState } from 'react'
 import { Link } from 'react-router'
 
 import { AreaChart, CompareBars, DrawdownChart } from '../components/charts'
-import { Badge, Card, EmptyState, Live, PageHeader, Skeleton } from '../components/ui'
-import { useBot, usePortfolio } from '../lib/api'
+import { Badge, Button, Card, EmptyState, Input, Live, PageHeader, Skeleton, useToast } from '../components/ui'
+import { adjustFunding, ApiError, useBot, usePortfolio } from '../lib/api'
 import { cx } from '../lib/cx'
-import { money, relativeTime, shortDate } from '../lib/format'
-import type { EquityPoint, Portfolio, PortfolioBotAudit, PortfolioPosition, PortfolioTransaction } from '../../shared/types'
+import { money, moneyExact, moneyExactPlain, relativeTime, shortDate } from '../lib/format'
+import type { CashFlow, EquityPoint, Portfolio, PortfolioBotAudit, PortfolioPosition, PortfolioTransaction } from '../../shared/types'
 
 const pnlText = (value: number) => `${value >= 0 ? '+' : ''}${money(value)}`
 const mark = (value: number) => (value >= 0 ? 'text-success' : 'text-danger')
 const pct = (value: number) => `${value >= 0 ? '+' : ''}${value.toFixed(2)}%`
-
-/** Money with cents for audit rows where small numbers matter. */
-const exact = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 2 })
-const exactMoney = (value: number) => exact.format(value)
-
 const statusDot: Record<PortfolioBotAudit['status'], string> = {
   running: 'bg-success',
   paused: 'bg-warning',
@@ -58,6 +54,7 @@ export function Portfolio() {
       {data && selectedBot && (
         <BotPerformance
           audit={data.bots.find((bot) => bot.id === selectedBot.id)!}
+          flows={data.funding.filter((flow) => flow.botId === selectedBot.id)}
           onBack={() => setSelected('fleet')}
         />
       )}
@@ -80,7 +77,7 @@ function TabButton({
       onMouseDown={onMouseDown}
       className={cx(
         'flex h-8 items-center gap-1 rounded-[9px] px-3 text-[12.5px] font-medium transition-colors',
-        active ? 'bg-fg text-white' : 'border border-line bg-surface text-muted hover:text-fg',
+        active ? 'bg-fg text-bg' : 'border border-line bg-surface text-muted hover:text-fg',
       )}
     >
       {children}
@@ -101,7 +98,7 @@ function FleetAudit({ data, live }: { data: Portfolio; live: boolean }) {
     },
     { label: 'Realized P&L', value: pnlText(data.summary.realizedPnl), hint: `${data.summary.roundTrips} closed round trips`, tone: mark(data.summary.realizedPnl) },
     { label: 'Unrealized P&L', value: pnlText(data.summary.unrealizedPnl), hint: `${data.summary.openPositions} open positions`, tone: mark(data.summary.unrealizedPnl) },
-    { label: 'Fees paid', value: exactMoney(data.summary.fees), hint: `${data.summary.fills} fills`, tone: 'text-muted' },
+    { label: 'Fees paid', value: moneyExact(data.summary.fees), hint: `${data.summary.fills} fills`, tone: 'text-muted' },
   ]
 
   return (
@@ -166,8 +163,8 @@ function FleetAudit({ data, live }: { data: Portfolio; live: boolean }) {
                 detail: `${data.summary.wins}/${data.summary.roundTrips} round trips`,
               },
               { label: 'Profit factor', value: data.summary.profitFactor !== null ? data.summary.profitFactor.toFixed(2) : '—', detail: 'gross profit ÷ gross loss' },
-              { label: 'Gross profit', value: exactMoney(data.summary.grossProfit), detail: '', tone: 'text-success' },
-              { label: 'Gross loss', value: exactMoney(data.summary.grossLoss), detail: '', tone: 'text-danger' },
+              { label: 'Gross profit', value: moneyExact(data.summary.grossProfit), detail: '', tone: 'text-success' },
+              { label: 'Gross loss', value: moneyExact(data.summary.grossLoss), detail: '', tone: 'text-danger' },
             ].map((row) => (
               <div key={row.label} className="flex items-center justify-between py-2.5">
                 <dt>
@@ -210,12 +207,12 @@ function FleetAudit({ data, live }: { data: Portfolio; live: boolean }) {
             <tfoot>
               <tr className="h-11 border-t border-line bg-bg/40 text-[13px] font-semibold">
                 <td className="px-5">Total</td>
-                <td className="px-2 text-right tabular-nums">{exactMoney(data.summary.startingCapital)}</td>
-                <td className="px-2 text-right tabular-nums">{exactMoney(data.summary.currentEquity)}</td>
-                <td className={cx('px-2 text-right tabular-nums', mark(data.summary.netPnl))}>{exactMoney(data.summary.netPnl).replace('$', '')}</td>
-                <td className={cx('px-2 text-right tabular-nums', mark(data.summary.realizedPnl))}>{exactMoney(data.summary.realizedPnl).replace('$', '')}</td>
-                <td className={cx('px-2 text-right tabular-nums', mark(data.summary.unrealizedPnl))}>{exactMoney(data.summary.unrealizedPnl).replace('$', '')}</td>
-                <td className="px-2 text-right tabular-nums">{exactMoney(data.summary.fees).replace('$', '')}</td>
+                <td className="px-2 text-right tabular-nums">{moneyExactPlain(data.summary.startingCapital)}</td>
+                <td className="px-2 text-right tabular-nums">{moneyExactPlain(data.summary.currentEquity)}</td>
+                <td className={cx('px-2 text-right tabular-nums', mark(data.summary.netPnl))}>{moneyExactPlain(data.summary.netPnl)}</td>
+                <td className={cx('px-2 text-right tabular-nums', mark(data.summary.realizedPnl))}>{moneyExactPlain(data.summary.realizedPnl)}</td>
+                <td className={cx('px-2 text-right tabular-nums', mark(data.summary.unrealizedPnl))}>{moneyExactPlain(data.summary.unrealizedPnl)}</td>
+                <td className="px-2 text-right tabular-nums">{moneyExactPlain(data.summary.fees)}</td>
                 <td className="px-2 text-right tabular-nums">{data.summary.fills}</td>
                 <td className="px-2 text-right tabular-nums">{data.summary.expectedWinRate === null ? '—' : `${data.summary.expectedWinRate.toFixed(0)}%`}</td>
                 <td />
@@ -228,11 +225,100 @@ function FleetAudit({ data, live }: { data: Portfolio; live: boolean }) {
         </div>
       </Card>
 
+      <FundingCard data={data} flows={data.funding} />
+
       <div className="mt-3 grid gap-3 lg:grid-cols-2">
         <PositionsCard positions={data.positions} title="Open positions" countLabel={data.positions.length} />
         <LedgerCard transactions={data.transactions} countLabel={`${data.transactions.length} most recent`} />
       </div>
     </>
+  )
+}
+
+/** Cash-flow reconciliation: funding is capital movement, never P&L, so
+ * launch funding + net funding + trading P&L must equal current equity. */
+export function FundingCard({ data, flows, title = 'Funding & reconciliation' }: { data: Portfolio; flows: CashFlow[]; title?: string }) {
+  const funding = [
+    { label: 'Launch funding', value: moneyExact(data.summary.launchCapital), detail: 'capital the bots started with' },
+    { label: 'Deposits in', value: moneyExact(data.summary.deposits), detail: '', tone: 'text-success' },
+    { label: 'Withdrawals out', value: moneyExact(data.summary.withdrawals), detail: '', tone: 'text-danger' },
+    { label: 'Net funding', value: moneyExact(data.summary.netFunding), detail: 'deposits − withdrawals', tone: undefined },
+  ]
+  const tradingPnl = data.summary.netPnl
+  const expect = data.summary.launchCapital + data.summary.netFunding + tradingPnl
+  const balanced = Math.abs(expect - data.summary.currentEquity) < 0.05
+
+  return (
+    <Card className="mt-3 overflow-hidden">
+      <div className="flex flex-wrap items-center justify-between gap-2 px-5 pt-5">
+        <div>
+          <h2 className="text-[14px] font-semibold">{title}</h2>
+          <p className="mt-0.5 text-[12px] text-faint">Deposits and withdrawals move capital, never P&L — equity reconciles against real cash flows.</p>
+        </div>
+        <span className={cx('text-[12.5px] font-medium', balanced ? 'text-success' : 'text-warning')}>
+          {balanced ? 'Reconciled ✓' : 'Desynced — engine rebalances on next bar'}
+        </span>
+      </div>
+
+      <div className="mt-4 grid gap-3 px-5 sm:grid-cols-2">
+        <dl className="divide-y divide-line">
+          {funding.map((row) => (
+            <div key={row.label} className="flex items-center justify-between py-2">
+              <dt>
+                <span className="block text-[13px] text-muted">{row.label}</span>
+                {row.detail && <span className="block text-[11.5px] text-faint">{row.detail}</span>}
+              </dt>
+              <dd className={cx('text-[14px] font-semibold tabular-nums', row.tone)}>{row.value}</dd>
+            </div>
+          ))}
+        </dl>
+
+        <div className="rounded-card border border-line p-4">
+          <p className="text-[12.5px] font-medium text-muted">Reconciliation identity</p>
+          <div className="mt-3 flex flex-col gap-1.5 text-[13px] tabular-nums">
+            <Row left="Launch funding" right={moneyExactPlain(data.summary.launchCapital)} />
+            <Row left="+ Net funding (deposits − withdrawals)" right={moneyExactPlain(data.summary.netFunding)} signed />
+            <Row left="+ Trading P&amp;L (realized + unrealized)" right={moneyExactPlain(tradingPnl)} signed />
+            <div className="mt-1 flex items-center justify-between border-t border-line pt-2 text-[13.5px] font-semibold">
+              <span>= Current equity</span>
+              <span>{moneyExactPlain(data.summary.currentEquity)}</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div className="mt-4 px-5 pb-5">
+        <p className="text-[12.5px] font-medium text-muted">Daily funding log</p>
+        {flows.length === 0 ? (
+          <p className="py-4 text-center text-[13px] text-muted">No deposits or withdrawals yet — adjust funding on a bot's performance tab.</p>
+        ) : (
+          <ul className="scrollbar-thin mt-2 max-h-[220px] divide-y divide-line overflow-y-auto">
+            {flows.map((flow) => (
+              <li key={flow.id} className="flex items-center gap-3 py-2">
+                <span className={cx('inline-block size-1.5 shrink-0 rounded-full', flow.amount > 0 ? 'bg-success' : 'bg-danger')} />
+                <span className="w-[86px] shrink-0 text-[12.5px] text-faint">{shortDate(flow.at)}</span>
+                <span className="min-w-0 flex-1 truncate text-[13px]">
+                  {flow.botName ?? 'Removed bot'}
+                  {flow.note && <span className="text-faint"> · {flow.note}</span>}
+                </span>
+                <span className={cx('text-[13px] font-medium tabular-nums', flow.amount > 0 ? 'text-success' : 'text-danger')}>
+                  {flow.amount > 0 ? '+' : '−'}{moneyExactPlain(Math.abs(flow.amount))}
+                </span>
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+    </Card>
+  )
+}
+
+function Row({ left, right, signed }: { left: string; right: string; signed?: boolean }) {
+  return (
+    <div className="flex items-center justify-between">
+      <span className="text-muted">{left}</span>
+      <span className={signed ? (right.startsWith('-') || right.startsWith('−') ? 'text-danger' : 'text-success') : undefined}>{signed && !right.startsWith('-') && !right.startsWith('−') ? `+${right}` : right}</span>
+    </div>
   )
 }
 
@@ -249,15 +335,15 @@ function BotAuditRow({ bot }: { bot: PortfolioBotAudit }) {
           {bot.strategyName} · {bot.mode} · {relativeTime(bot.lastActivityAt)}
         </span>
       </td>
-      <td className="px-2 text-right tabular-nums text-muted">{exactMoney(bot.capital)}</td>
-      <td className="px-2 text-right tabular-nums">{exactMoney(bot.equity)}</td>
+      <td className="px-2 text-right tabular-nums text-muted">{moneyExactPlain(bot.capital)}</td>
+      <td className="px-2 text-right tabular-nums">{moneyExactPlain(bot.equity)}</td>
       <td className={cx('px-2 text-right tabular-nums font-medium', mark(net))}>
         {net >= 0 ? <ArrowUpRight className="mr-0.5 inline size-3.5" /> : <ArrowDownRight className="mr-0.5 inline size-3.5" />}
-        {exactMoney(net).replace('$', '')}
+        {moneyExactPlain(net)}
       </td>
-      <td className={cx('px-2 text-right tabular-nums text-muted', mark(bot.realizedPnl))}>{exactMoney(bot.realizedPnl).replace('$', '')}</td>
-      <td className={cx('px-2 text-right tabular-nums text-muted', mark(bot.unrealizedPnl))}>{exactMoney(bot.unrealizedPnl).replace('$', '')}</td>
-      <td className="px-2 text-right tabular-nums text-faint">{exactMoney(bot.fees).replace('$', '')}</td>
+      <td className={cx('px-2 text-right tabular-nums text-muted', mark(bot.realizedPnl))}>{moneyExactPlain(bot.realizedPnl)}</td>
+      <td className={cx('px-2 text-right tabular-nums text-muted', mark(bot.unrealizedPnl))}>{moneyExactPlain(bot.unrealizedPnl)}</td>
+      <td className="px-2 text-right tabular-nums text-faint">{moneyExactPlain(bot.fees)}</td>
       <td className="px-2 text-right tabular-nums text-muted">{bot.fills}</td>
       <td className="px-2 text-right tabular-nums text-muted">{bot.winRate === null ? '—' : `${bot.winRate.toFixed(0)}%`}</td>
       <td className="px-5 text-right">
@@ -270,7 +356,7 @@ function BotAuditRow({ bot }: { bot: PortfolioBotAudit }) {
 }
 
 /** Per-bot performance: live curve, accounting KPIs, its positions and its fills. */
-function BotPerformance({ audit, onBack }: { audit: PortfolioBotAudit; onBack: () => void }) {
+function BotPerformance({ audit, flows, onBack }: { audit: PortfolioBotAudit; flows: CashFlow[]; onBack: () => void }) {
   const { data, isLoading } = useBot(audit.id)
   const detail = data
 
@@ -289,12 +375,12 @@ function BotPerformance({ audit, onBack }: { audit: PortfolioBotAudit; onBack: (
   const net = audit.equity - audit.capital
 
   const kpis = [
-    { label: 'Capital', value: exactMoney(audit.capital), hint: `deployed on ${audit.timeframe} bars` },
-    { label: 'Current equity', value: exactMoney(audit.equity), hint: `${audit.roundTrips} round trips`, tone: undefined },
-    { label: 'Net P&L', value: exactMoney(net).replace('$', ''), hint: pct(net / (audit.capital || 1) * 100), tone: mark(net) },
-    { label: 'Realized', value: exactMoney(audit.realizedPnl).replace('$', ''), hint: `${audit.wins} wins`, tone: mark(audit.realizedPnl) },
-    { label: 'Unrealized', value: exactMoney(audit.unrealizedPnl).replace('$', ''), hint: `${positions.length} open`, tone: mark(audit.unrealizedPnl) },
-    { label: 'Fees / Fills', value: exactMoney(audit.fees).replace('$', ''), hint: `${audit.fills} fills at the venue`, tone: 'text-muted' },
+    { label: 'Capital', value: moneyExact(audit.capital), hint: `deployed on ${audit.timeframe} bars` },
+    { label: 'Current equity', value: moneyExact(audit.equity), hint: `${audit.roundTrips} round trips`, tone: undefined },
+    { label: 'Net P&L', value: moneyExactPlain(net), hint: pct(net / (audit.capital || 1) * 100), tone: mark(net) },
+    { label: 'Realized', value: moneyExactPlain(audit.realizedPnl), hint: `${audit.wins} wins`, tone: mark(audit.realizedPnl) },
+    { label: 'Unrealized', value: moneyExactPlain(audit.unrealizedPnl), hint: `${positions.length} open`, tone: mark(audit.unrealizedPnl) },
+    { label: 'Fees / Fills', value: moneyExact(audit.fees), hint: `${audit.fills} fills at the venue`, tone: 'text-muted' },
   ]
 
   return (
@@ -379,11 +465,103 @@ function BotPerformance({ audit, onBack }: { audit: PortfolioBotAudit; onBack: (
         </Card>
       </div>
 
+      <FundingPanel audit={audit} flows={flows} />
+
       <div className="mt-3 grid gap-3 lg:grid-cols-2">
         <PositionsCard positions={positions} title="Open positions" countLabel={positions.length} />
         <LedgerCard transactions={transactions} countLabel={`${transactions.length} fills`} />
       </div>
     </div>
+  )
+}
+
+/** Deposit/withdraw funding for one bot. Moves capital; never the P&L. */
+function FundingPanel({ audit, flows }: { audit: PortfolioBotAudit; flows: CashFlow[] }) {
+  const toast = useToast()
+  const client = useQueryClient()
+  const [amount, setAmount] = useState('')
+
+  const transfer = useMutation({
+    mutationFn: (delta: number) => adjustFunding(audit.id, { amount: delta }),
+    onSuccess: (_result, delta) => {
+      toast(`${delta > 0 ? 'Deposited' : 'Withdrew'} ${moneyExact(Math.abs(delta))} · ${audit.name}`)
+      setAmount('')
+      void Promise.all([
+        client.invalidateQueries({ queryKey: ['portfolio'] }),
+        client.invalidateQueries({ queryKey: ['bots'] }),
+        client.invalidateQueries({ queryKey: ['bot'] }),
+      ])
+    },
+    onError: (error) => toast(error instanceof ApiError ? error.message : 'Funding adjustment failed', 'danger'),
+  })
+
+  const value = Number(amount)
+  const valid = Number.isFinite(value) && value > 0 && value <= 10_000_000
+  const tooMuchOut = value > audit.cash + 1e-6
+
+  return (
+    <Card className="mt-3 p-5">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div>
+          <h3 className="text-[14px] font-semibold">Funding adjustments</h3>
+          <p className="mt-0.5 text-[12px] text-faint">Move money in or out of this bot — capital shifts, P&amp;L stays put.</p>
+        </div>
+        <div className="text-right text-[12.5px]">
+          <span className="text-faint">Net funding </span>
+          <span className={cx('font-medium tabular-nums', audit.netDeposits >= 0 ? 'text-success' : 'text-danger')}>
+            {audit.netDeposits >= 0 ? '+' : '−'}{moneyExactPlain(Math.abs(audit.netDeposits))}
+          </span>
+          <span className="text-faint"> · idle cash {moneyExactPlain(audit.cash)}</span>
+        </div>
+      </div>
+
+      <div className="mt-4 flex max-w-md flex-wrap items-center gap-2">
+        <Input
+          type="number"
+          min="0"
+          step="0.01"
+          placeholder="Amount"
+          value={amount}
+          onChange={(e) => setAmount(e.target.value)}
+          className="w-32"
+          aria-label="Funding amount"
+        />
+        <Button
+          variant="primary"
+          disabled={!valid || transfer.isPending}
+          loading={transfer.isPending}
+          onClick={() => valid && transfer.mutate(value)}
+        >
+          <Plus />
+          Deposit
+        </Button>
+        <Button
+          disabled={!valid || tooMuchOut || transfer.isPending}
+          onClick={() => valid && !tooMuchOut && transfer.mutate(-value)}
+          title={tooMuchOut ? 'Withdrawal exceeds idle cash — close positions first.' : undefined}
+        >
+          <Minus />
+          Withdraw
+        </Button>
+        {valid && tooMuchOut && <span className="text-[12px] text-warning">Only {moneyExactPlain(audit.cash)} is idle cash right now.</span>}
+      </div>
+
+      {flows.length > 0 && (
+        <ul className="mt-4 divide-y divide-line">
+          {flows.slice(0, 6).map((flow) => (
+            <li key={flow.id} className="flex items-center gap-3 py-2">
+              <span className={cx('inline-block size-1.5 shrink-0 rounded-full', flow.amount > 0 ? 'bg-success' : 'bg-danger')} />
+              <span className="w-[86px] shrink-0 text-[12.5px] text-faint">{shortDate(flow.at)}</span>
+              <span className="min-w-0 flex-1 truncate text-[13px] text-muted">{flow.note ?? (flow.amount > 0 ? 'Deposit' : 'Withdrawal')}</span>
+              <span className={cx('text-[13px] font-medium tabular-nums', flow.amount > 0 ? 'text-success' : 'text-danger')}>
+                {flow.amount > 0 ? '+' : '−'}{moneyExactPlain(Math.abs(flow.amount))}
+              </span>
+            </li>
+          ))
+          }
+        </ul>
+      )}
+    </Card>
   )
 }
 
@@ -415,7 +593,7 @@ function PositionsCard({ positions, title, countLabel }: { positions: PortfolioP
                 <td className="px-2 text-right tabular-nums text-muted">{position.qty.toFixed(4)}</td>
                 <td className="px-2 text-right tabular-nums text-muted">{position.avgPrice.toFixed(2)}</td>
                 <td className="px-2 text-right tabular-nums text-muted">{position.markPrice.toFixed(2)}</td>
-                <td className={cx('px-5 text-right tabular-nums', mark(position.unrealizedPnl))}>{exactMoney(position.unrealizedPnl)}</td>
+                <td className={cx('px-5 text-right tabular-nums', mark(position.unrealizedPnl))}>{moneyExactPlain(position.unrealizedPnl)}</td>
               </tr>
             ))}
           </tbody>

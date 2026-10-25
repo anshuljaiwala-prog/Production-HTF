@@ -1,8 +1,33 @@
-const currency = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 })
-const compact = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', notation: 'compact', maximumFractionDigits: 1 })
+// All account, ledger and engine values are USD paper dollars; the currency
+// preference (see prefs.ts) is a display toggle that re-formats them.
 
-export const money = (value: number) => currency.format(value)
-export const moneyCompact = (value: number) => compact.format(value)
+import { convert, getCurrency, type Currency } from './prefs'
+
+const cache = new Map<Currency, { whole: Intl.NumberFormat; cents: Intl.NumberFormat; compact: Intl.NumberFormat }>()
+
+function formatters(currency: Currency) {
+  let made = cache.get(currency)
+  if (!made) {
+    made = {
+      whole: new Intl.NumberFormat('en-US', { style: 'currency', currency, maximumFractionDigits: 0 }),
+      cents: new Intl.NumberFormat('en-US', { style: 'currency', currency, maximumFractionDigits: 2 }),
+      compact: new Intl.NumberFormat('en-US', { style: 'currency', currency, notation: 'compact', maximumFractionDigits: 1 }),
+    }
+    cache.set(currency, made)
+  }
+  return made
+}
+
+export const money = (value: number) => formatters(getCurrency()).whole.format(convert(value, getCurrency()))
+export const moneyCompact = (value: number) => formatters(getCurrency()).compact.format(convert(value, getCurrency()))
+/** Two-decimal money for audit rows where small numbers matter. */
+export const moneyExact = (value: number) => formatters(getCurrency()).cents.format(convert(value, getCurrency()))
+/** Same, with the symbol and grouping stripped for dense table cells. */
+export function moneyExactPlain(value: number): string {
+  const formatted = moneyExact(value)
+  const firstDigit = formatted.match(/[0-9]/)
+  return firstDigit ? formatted.slice(formatted.indexOf(firstDigit[0])) : formatted
+}
 
 export function relativeTime(ts: number, now = Date.now()): string {
   const diff = now - ts

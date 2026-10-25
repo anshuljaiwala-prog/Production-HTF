@@ -92,7 +92,7 @@ function SymbolPicker({ symbols, value, onChange }: { symbols: string[]; value: 
               onClick={() => onChange(active ? value.filter((s) => s !== symbol) : [...value, symbol])}
               className={
                 active
-                  ? 'h-8 rounded-tile bg-fg px-3 text-[12.5px] font-medium text-white'
+                  ? 'h-8 rounded-tile bg-fg px-3 text-[12.5px] font-medium text-bg'
                   : 'h-8 rounded-tile border border-line-strong bg-surface px-3 text-[12.5px] text-muted transition-colors hover:text-fg'
               }
             >

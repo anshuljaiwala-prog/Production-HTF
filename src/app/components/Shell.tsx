@@ -1,9 +1,10 @@
-import { Bot, CandlestickChart, FlaskConical, LayoutGrid, Menu as MenuIcon, Plug, Search, Settings, Wallet, X } from 'lucide-react'
+import { Bot, CandlestickChart, Check, FlaskConical, LayoutGrid, Menu as MenuIcon, Moon, Plug, Search, Settings, Sun, Wallet, X } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { NavLink, Outlet, useLocation } from 'react-router'
 
 import { useMe } from '../lib/api'
 import { cx } from '../lib/cx'
+import { CURRENCIES, setCurrency, setTheme, useCurrency, useTheme } from '../lib/prefs'
 import { CommandPalette } from './CommandPalette'
 import { Avatar } from './ui'
 
@@ -18,6 +19,8 @@ const links = [
 
 export function Shell() {
   const { data: me } = useMe()
+  const currency = useCurrency()
+  const theme = useTheme()
   const [paletteOpen, setPaletteOpen] = useState(false)
   const [mobileOpen, setMobileOpen] = useState(false)
   const location = useLocation()
@@ -40,7 +43,7 @@ export function Shell() {
   const sidebar = (
     <div className="flex h-full flex-col px-3 py-3">
       <div className="flex h-10 items-center gap-2.5 px-2">
-        <span className="grid size-7 place-items-center rounded-[9px] bg-fg text-white">
+        <span className="grid size-7 place-items-center rounded-[9px] bg-fg text-bg">
           <svg viewBox="0 0 24 24" className="size-4" fill="currentColor" aria-hidden>
             <rect x="3.5" y="8" width="3" height="11" rx="1.2" />
             <rect x="5" y="5" width="0.5" height="17" rx="0.25" />
@@ -86,6 +89,37 @@ export function Shell() {
       </nav>
 
       <div className="mt-auto flex flex-col gap-0.5">
+        {/* Display preferences: currency + theme. Both persist to localStorage;
+            the currency is a display conversion, the ledger stays in USD. */}
+        <div className="mb-1 flex items-center justify-between gap-2 px-1">
+          <div role="radiogroup" aria-label="Display currency" className="flex items-center gap-0.5 rounded-control bg-bg p-0.5 shadow-card">
+            {CURRENCIES.map((option) => (
+              <button
+                key={option.key}
+                type="button"
+                role="radio"
+                aria-checked={currency === option.key}
+                onClick={() => setCurrency(option.key)}
+                className={cx(
+                  'flex h-7 items-center gap-1 rounded-[8px] px-2 text-[11.5px] font-semibold transition-colors',
+                  currency === option.key ? 'bg-surface text-fg shadow-card' : 'text-muted hover:text-fg',
+                )}
+              >
+                {option.label}
+                {currency === option.key && <Check className="size-3 text-accent" />}
+              </button>
+            ))}
+          </div>
+          <button
+            type="button"
+            aria-label={theme === 'dark' ? 'Switch to light theme' : 'Switch to dark theme'}
+            title={theme === 'dark' ? 'Switch to light theme' : 'Switch to dark theme'}
+            onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}
+            className="flex h-8 w-8 shrink-0 items-center justify-center rounded-control border border-line bg-surface text-muted transition-colors hover:text-fg"
+          >
+            {theme === 'dark' ? <Sun className="size-4" /> : <Moon className="size-4" />}
+          </button>
+        </div>
         <NavLink
           to="/settings"
           className={({ isActive }) =>

@@ -27,7 +27,7 @@ export function SignIn() {
           <p className="mt-3 text-[15px] leading-relaxed text-muted">Contacts, companies, deals and the notes that connect them. Sign in to open your workspace.</p>
           <a
             href={`/auth/freebuff/signin?returnTo=${returnTo}`}
-            className="mt-8 inline-flex h-11 items-center gap-2 rounded-control bg-fg px-5 text-[14px] font-medium text-white transition-colors hover:bg-[#26262c]"
+            className="mt-8 inline-flex h-11 items-center gap-2 rounded-control bg-fg px-5 text-[14px] font-medium text-bg transition-colors hover:opacity-90"
           >
             <span className="grid size-5 place-items-center rounded-[6px] bg-white text-[11px] font-bold text-fg">F</span>
             Sign in with Freebuff
