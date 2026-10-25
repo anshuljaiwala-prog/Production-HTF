@@ -347,3 +347,129 @@ export function CompareBars({
     </ul>
   )
 }
+
+const priceFormat = (v: number) => (v >= 1000 ? v.toLocaleString('en-US', { maximumFractionDigits: 1 }) : v.toFixed(2))
+
+/** OHLC candlestick chart of the bars a run traded on. Renders aggregated
+ * candles with a price axis, time axis and optional fill markers (buy/sell
+ * placed at the bar they executed in). Hover reads the full OHLC cell. */
+export function CandleChart({
+  candles,
+  markers = [],
+  height = 220,
+  className,
+  format = priceFormat,
+}: {
+  candles: { t: number; o: number; h: number; l: number; c: number }[]
+  /** Fill markers placed by timestamp on the chart's time scale. */
+  markers?: { t: number; side: 'buy' | 'sell'; price: number }[]
+  height?: number
+  className?: string
+  format?: ChartFormatter
+}) {
+  const [hover, setHover] = useState<number | null>(null)
+  const w = 600
+  const h = height
+  const padLeft = 60
+  const padRight = 10
+  const padTop = 12
+  const padBottom = 20
+  const innerW = w - padLeft - padRight
+  const lo = Math.min(...candles.map((k) => k.l))
+  const hi = Math.max(...candles.map((k) => k.h))
+  const pad = (hi - lo) * 0.08
+  const min = lo - pad
+  const max = hi + pad
+  const y = (v: number) => padTop + (h - padTop - padBottom) * (1 - (v - min) / (max - min))
+  const slot = candles.length > 0 ? innerW / candles.length : innerW
+  const bodyW = Math.max(1.5, Math.min(10, slot * 0.62))
+  const ticks = [0, 0.25, 0.5, 0.75, 1].map((t) => min + t * (max - min))
+  const labelEvery = Math.max(1, Math.ceil(candles.length / 6))
+  // Bucket duration: uniform apart from a possibly shorter final bucket.
+  const bucketMs = candles.length > 1 ? candles[1].t - candles[0].t : 0
+  const span = candles.length > 1 ? (candles[candles.length - 1].t + bucketMs - candles[0].t) : 1
+  const markerX = (t: number) => padLeft + Math.min(1, Math.max(0, (t - candles[0].t) / span)) * innerW
+
+  return (
+    <div className={cx('relative', className)}>
+      <svg viewBox={`0 0 ${w} ${h}`} className="h-auto w-full" preserveAspectRatio="none" onMouseLeave={() => setHover(null)}>
+        {ticks.map((t) => (
+          <g key={t}>
+            <line x1={padLeft} x2={w - padRight} y1={y(t)} y2={y(t)} stroke="var(--color-line)" strokeDasharray="2 4" />
+            <text x={padLeft - 6} y={y(t)} textAnchor="end" dominantBaseline="central" fontSize="10.5" fill="var(--color-faint)">
+              {format(t)}
+            </text>
+          </g>
+        ))}
+        {candles.map((k, i) => {
+          const x = padLeft + i * slot + slot / 2
+          const up = k.c >= k.o
+          const color = up ? 'var(--color-success)' : 'var(--color-danger)'
+          const bodyTop = y(Math.max(k.o, k.c))
+          const bodyH = Math.max(1, y(Math.min(k.o, k.c)) - bodyTop)
+          return (
+            <g key={k.t} onMouseEnter={() => setHover(i)}>
+              <rect x={padLeft + i * slot} y={padTop} width={slot} height={h - padTop - padBottom} fill="transparent" />
+              <line x1={x} x2={x} y1={y(k.h)} y2={y(k.l)} stroke={color} strokeWidth="1" vectorEffect="non-scaling-stroke" opacity={hover === null || hover === i ? 0.75 : 0.4} />
+              <motion.rect
+                x={x - bodyW / 2}
+                y={bodyTop}
+                width={bodyW}
+                height={bodyH}
+                fill={color}
+                initial={{ opacity: 0 }}
+                animate={{ opacity: hover === null || hover === i ? 0.9 : 0.4 }}
+                transition={{ duration: 0.35, delay: Math.min(0.4, i * 0.004) }}
+              />
+            </g>
+          )
+        })}
+        {markers.map((m, i) => {
+          if (candles.length < 2) return null
+          const x = markerX(m.t)
+          const buy = m.side === 'buy'
+          const triY = buy ? h - padBottom : padTop
+          const dir = buy ? 1 : -1
+          return (
+            <motion.polygon
+              key={`${m.t}-${m.side}-${i}`}
+              points={`${x},${triY + dir * -7} ${x - 4.5},${triY + dir * -1.5} ${x + 4.5},${triY + dir * -1.5}`}
+              fill={buy ? 'var(--color-success)' : 'var(--color-warning)'}
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              transition={{ duration: 0.4, delay: 0.5 }}
+            >
+              <title>{`${buy ? 'Buy' : 'Sell'} fill @ ${format(m.price)}`}</title>
+            </motion.polygon>
+          )
+        })}
+        {candles.map((k, i) => {
+          const isEdge = i === 0 || i === candles.length - 1
+          if (!isEdge && i % labelEvery !== 0) return null
+          return (
+            <text key={`${i}-label`} x={padLeft + i * slot + slot / 2} y={h - 6} textAnchor={i === 0 ? 'start' : i === candles.length - 1 ? 'end' : 'middle'} fontSize="11" fill="var(--color-faint)">
+              {shortLabel(k.t)}
+            </text>
+          )
+        })}
+      </svg>
+      {hover !== null && candles[hover] && (
+        <div
+          className="pointer-events-none absolute -top-1 z-10 -translate-x-1/2 whitespace-nowrap rounded-tile bg-fg px-2.5 py-1.5 text-[12px] font-medium text-bg shadow-pop"
+          style={{ left: `${((padLeft + hover * slot + slot / 2) / w) * 100}%` }}
+        >
+          {shortLabel(candles[hover].t)} · O {format(candles[hover].o)} · H {format(candles[hover].h)} · L {format(candles[hover].l)} · C {format(candles[hover].c)}
+        </div>
+      )}
+    </div>
+  )
+}
+
+/** Compact date for a bar timestamp: month/day, with the time appended when
+ * the bars are intraday so consecutive labels stay distinguishable. */
+function shortLabel(t: number): string {
+  const date = new Date(t)
+  const day = date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })
+  if (date.getHours() === 0 && date.getMinutes() === 0) return day
+  return `${day} ${date.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' })}`
+}

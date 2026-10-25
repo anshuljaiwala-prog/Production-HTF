@@ -6,6 +6,7 @@ import type {
   BotEvent,
   BotStage,
   BotStatus,
+  Candle,
   Connection,
   Dashboard,
   EquityPoint,
@@ -120,6 +121,38 @@ export const useBacktests = () =>
     // Runs execute lazily on read; poll while anything is pending so the
     // status flips to done/failed (and the results appear) automatically.
     refetchInterval: liveInterval<{ items: Backtest[] }>(1_000, false, (d) => d.items.some((b) => b.status === 'running')),
+    placeholderData: (p) => p,
+  })
+
+export interface BacktestMarket {
+  backtestId: string
+  symbol: string
+  timeframe: Timeframe
+  status: Backtest['status']
+  bars: number
+  windowFrom: number
+  windowTo: number
+  candles: Candle[]
+}
+
+/** Full payload of one backtest. The list endpoint strips trades for size;
+ * the drawer (charts, trade table) reads this instead. */
+export const useBacktestDetail = (backtestId: string | undefined) =>
+  useQuery({
+    queryKey: ['backtest', backtestId],
+    queryFn: () => api<{ backtest: Backtest }>(`/backtests/${backtestId}`),
+    enabled: Boolean(backtestId),
+    placeholderData: (p) => p,
+  })
+
+/** The simulated-feed bars a backtest replayed, bucketed into display
+ * candles. Deterministic — the same run always charts the same bars. */
+export const useBacktestMarket = (backtestId: string | undefined) =>
+  useQuery({
+    queryKey: ['backtest-market', backtestId],
+    queryFn: () => api<BacktestMarket>(`/backtests/${backtestId}/market`),
+    enabled: Boolean(backtestId),
+    staleTime: 60_000,
     placeholderData: (p) => p,
   })
 

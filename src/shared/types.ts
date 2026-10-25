@@ -129,6 +129,16 @@ export interface EquityPoint {
   value: number
 }
 
+/** One (possibly bucketed) OHLC candle from the simulated feed. */
+export interface Candle {
+  t: number
+  o: number
+  h: number
+  l: number
+  c: number
+  v: number
+}
+
 export interface RunMetrics {
   totalReturn: number
   maxDrawdown: number

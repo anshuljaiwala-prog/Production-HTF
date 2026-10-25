@@ -3,10 +3,10 @@ import { motion } from 'motion/react'
 import { useEffect, useRef, useState } from 'react'
 import { useSearchParams } from 'react-router'
 
-import { AreaChart, BarChart, DrawdownChart } from '../components/charts'
+import { AreaChart, BarChart, CandleChart, DrawdownChart } from '../components/charts'
 import { BacktestDialog } from '../components/forms'
 import { Badge, Button, Card, ConfirmDialog, Drawer, EmptyState, Live, PageHeader, Skeleton, useToast } from '../components/ui'
-import { deleteBacktest, useApiMutation, useBacktests } from '../lib/api'
+import { deleteBacktest, useApiMutation, useBacktestDetail, useBacktestMarket, useBacktests } from '../lib/api'
 import { cx } from '../lib/cx'
 import { money, shortDate } from '../lib/format'
 import type { Backtest } from '../../shared/types'
@@ -159,9 +159,16 @@ function BacktestDrawer({
   onClose: () => void
 }) {
   const { data, isLoading } = useBacktests()
+  // The list endpoint strips the trade payload, so the drawer reads the
+  // detail query — which also resolves a pending run on read.
+  const detail = useBacktestDetail(id ?? undefined)
+  const market = useBacktestMarket(id ?? undefined)
   const toast = useToast()
   const [deleting, setDeleting] = useState(false)
-  const backtest: Backtest | undefined = data?.items.find((item) => item.id === id)
+  // Detail first (it carries trades); fall back to the list row while it
+  // loads so the drawer opens instantly.
+  const backtest: Backtest | undefined =
+    detail.data?.backtest ?? (data?.items.find((item) => item.id === id) as Backtest | undefined)
 
   const remove = useApiMutation(() => deleteBacktest(id!), ['backtests'], {
     onSuccess: () => {
@@ -235,6 +242,55 @@ function BacktestDrawer({
                 </div>
               ))}
             </div>
+
+            <Card className="p-4">
+              <div className="flex items-center justify-between">
+                <h3 className="text-[13.5px] font-semibold">Market data</h3>
+                {backtest.status === 'running' ? <Live active label="1s poll" /> : null}
+              </div>
+              {(() => {
+                const candles = market.data?.candles ?? []
+                const bars = market.data?.bars ?? 0
+                const bucketed = market.data && candles.length < bars
+                return (
+                  <>
+                    <p className="mt-1 text-[12.5px] text-muted">
+                      The simulated feed this run replayed — {backtest.symbol} · {backtest.timeframe} · {bars} bars
+                      {bucketed ? `, bucketed into ${candles.length} candles for display` : ''}. Markers are the run's fills.
+                    </p>
+                    <div className="mt-1 flex flex-wrap items-center gap-3 text-[11.5px] text-faint">
+                      <span className="inline-flex items-center gap-1">
+                        <span className="inline-block h-2 w-2 rotate-45 bg-success" /> buy fills
+                      </span>
+                      <span className="inline-flex items-center gap-1">
+                        <span className="inline-block h-2 w-2 rotate-45 bg-warning" /> sell fills
+                      </span>
+                      <span className="inline-flex items-center gap-1">
+                        <span className="inline-block h-2 w-2 rounded-[2px] bg-success/80" /> up candle
+                      </span>
+                      <span className="inline-flex items-center gap-1">
+                        <span className="inline-block h-2 w-2 rounded-[2px] bg-danger/80" /> down candle
+                      </span>
+                    </div>
+                    <div className="mt-3">
+                      {market.isLoading ? (
+                        <Skeleton className="h-[220px]" />
+                      ) : candles.length > 1 ? (
+                        <CandleChart
+                          candles={candles}
+                          markers={backtest.trades.map((trade) => ({ t: trade.at, side: trade.side, price: trade.price }))}
+                          height={230}
+                        />
+                      ) : (
+                        <p className="py-6 text-center text-[13px] text-muted">
+                          {market.isError ? (market.error instanceof Error ? market.error.message : 'Could not load market data') : 'No bars recorded for this run'}
+                        </p>
+                      )}
+                    </div>
+                  </>
+                )
+              })()}
+            </Card>
 
             <Card className="p-4">
               <div className="flex items-center justify-between">

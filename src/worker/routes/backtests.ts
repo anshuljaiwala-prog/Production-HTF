@@ -1,12 +1,12 @@
 import { Hono } from 'hono'
 
 import { privateJson } from '../auth'
-import { runBacktest } from '../backtest'
+import { backtestWindow, runBacktest } from '../backtest'
 import { id, mapBacktest, now } from '../db'
 import type { AppContext } from '../env'
-import { TIMEFRAME_MS } from '../market'
+import { TIMEFRAME_MS, barsBetween } from '../market'
 import { sanitizeParams, strategyBy } from '../strategies'
-import type { Backtest, Timeframe } from '../../shared/types'
+import type { Backtest, Candle, Timeframe } from '../../shared/types'
 
 type Row = Record<string, unknown>
 
@@ -83,6 +83,54 @@ backtests.get('/:id', async (c) => {
     .first<Row>()
   if (!row) return c.json({ error: 'not_found', message: 'Backtest not found.' }, 404)
   return privateJson(c, { backtest: withName(mapBacktest(await resolveBacktest(c.get('db'), row))) })
+})
+
+/** Bounded candle count for the market chart: raw bars are bucketed into
+ * display candles so a 5,000-bar replay still draws legibly. */
+const MAX_CANDLES = 160
+
+function toCandles(bars: { t: number; o: number; h: number; l: number; c: number; v: number }[]): Candle[] {
+  if (bars.length <= MAX_CANDLES) return bars
+  const per = Math.ceil(bars.length / MAX_CANDLES)
+  const candles: Candle[] = []
+  for (let start = 0; start < bars.length; start += per) {
+    const slice = bars.slice(start, start + per)
+    candles.push({
+      t: slice[0].t,
+      o: slice[0].o,
+      h: Math.max(...slice.map((b) => b.h)),
+      l: Math.min(...slice.map((b) => b.l)),
+      c: slice[slice.length - 1].c,
+      v: slice.reduce((sum, b) => sum + b.v, 0),
+    })
+  }
+  return candles
+}
+
+/** The market data a backtest replayed: the same deterministic feed, the same
+ * window the engine used. Works before a run resolves too, so the chart is
+ * available while a run is pending. */
+backtests.get('/:id/market', async (c) => {
+  const row = await c
+    .get('db')
+    .prepare(`SELECT * FROM backtests WHERE id = ? AND owner_sub = ?`)
+    .bind(c.req.param('id'), c.get('user').sub)
+    .first<Row>()
+  if (!row) return c.json({ error: 'not_found', message: 'Backtest not found.' }, 404)
+  const backtest = mapBacktest(await resolveBacktest(c.get('db'), row))
+  const { from, to } = backtestWindow(backtest.timeframe, backtest.from, backtest.to)
+  if (to <= from) return privateJson(c, { backtestId: backtest.id, bars: 0, candles: [] })
+  const bars = barsBetween(backtest.symbol, backtest.timeframe, from, to + 1)
+  return privateJson(c, {
+    backtestId: backtest.id,
+    symbol: backtest.symbol,
+    timeframe: backtest.timeframe,
+    status: backtest.status,
+    bars: bars.length,
+    windowFrom: from,
+    windowTo: to,
+    candles: toCandles(bars),
+  })
 })
 
 backtests.post('/', async (c) => {

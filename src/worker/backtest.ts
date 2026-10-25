@@ -34,13 +34,23 @@ export interface BacktestResult {
   bars: number
 }
 
+/** The exact bar window a run replayed: `to` floored to the bar grid and
+ * `from` capped so the run stays within MAX_BARS bars. Shared with the
+ * market-data route so charts show precisely the bars that were traded. */
+export function backtestWindow(timeframe: Timeframe, from: number, to: number): { from: number; to: number } {
+  const tfMs = TIMEFRAME_MS[timeframe]
+  const toFloored = Math.floor(to / tfMs) * tfMs
+  return {
+    from: Math.max(Math.floor(from / tfMs) * tfMs, toFloored - MAX_BARS * tfMs),
+    to: toFloored,
+  }
+}
+
 export function runBacktest(input: BacktestInput): BacktestResult {
   const strategy = strategyBy(input.strategyKey)
   if (!strategy) throw new Error(`Unknown strategy "${input.strategyKey}".`)
   const tfMs = TIMEFRAME_MS[input.timeframe]
-  const to = Math.floor(input.to / tfMs) * tfMs
-  // Never simulate more than MAX_BARS bars, whatever range was requested.
-  const from = Math.max(Math.floor(input.from / tfMs) * tfMs, to - MAX_BARS * tfMs)
+  const { from, to } = backtestWindow(input.timeframe, input.from, input.to)
   if (to <= from) throw new Error('The backtest period must end after it starts.')
 
   const bars = barsBetween(input.symbol, input.timeframe, from, to + 1)

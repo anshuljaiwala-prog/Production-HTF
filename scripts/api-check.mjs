@@ -158,6 +158,15 @@ let backtestId
   const detail = await call('GET', `/backtests/${backtestId}`)
   check('GET /backtests/:id', detail.status === 200 && detail.payload.backtest?.trades?.length >= 0 && detail.payload.backtest.strategyName === 'EMA Momentum')
 
+  const market = await call('GET', `/backtests/${backtestId}/market`)
+  const candles = market.payload?.candles ?? []
+  const ohlcSane = candles.length > 0 && candles.every((k) => k.h >= Math.max(k.o, k.c) && k.l <= Math.min(k.o, k.c) && k.h >= k.l)
+  check(
+    'GET /backtests/:id/market',
+    market.status === 200 && market.payload.symbol === 'ETH-USD' && market.payload.bars > 0 && ohlcSane,
+    `bars=${market.payload?.bars} candles=${candles.length}`,
+  )
+
   const removed = await call('DELETE', `/backtests/${backtestId}`)
   check('DELETE /backtests/:id', removed.status === 200, `got ${removed.status}`)
 }
