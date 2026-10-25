@@ -6,6 +6,7 @@ import type { AppContext, Env } from './env'
 import { backtests } from './routes/backtests'
 import { bots } from './routes/bots'
 import { connections } from './routes/connections'
+import { portfolio } from './routes/portfolio'
 import { strategies } from './routes/strategies'
 import { workspace } from './routes/workspace'
 
@@ -27,6 +28,7 @@ api.route('/bots', bots)
 api.route('/strategies', strategies)
 api.route('/backtests', backtests)
 api.route('/connections', connections)
+api.route('/portfolio', portfolio)
 app.route('/api', api)
 
 app.onError((error, c) => {

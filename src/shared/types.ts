@@ -174,6 +174,79 @@ export interface SearchResults {
   strategies: { key: string; name: string; risk: RiskLevel }[]
 }
 
+/** Financial audit, aggregate across the fleet and per bot. */
+export interface PortfolioBotAudit {
+  id: string
+  name: string
+  strategyName: string
+  status: BotStatus
+  mode: BotMode
+  timeframe: Timeframe
+  capital: number
+  cash: number
+  equity: number
+  realizedPnl: number
+  unrealizedPnl: number
+  /** Fees paid across every fill this bot made. */
+  fees: number
+  fills: number
+  roundTrips: number
+  wins: number
+  winRate: number | null
+  openPositions: number
+  lastActivityAt: number
+}
+
+export interface PortfolioPosition {
+  botId: string
+  botName: string
+  symbol: string
+  qty: number
+  avgPrice: number
+  markPrice: number
+  costBasis: number
+  unrealizedPnl: number
+}
+
+export interface PortfolioTransaction {
+  id: string
+  botId: string | null
+  botName: string | null
+  symbol: string
+  side: 'buy' | 'sell'
+  qty: number
+  price: number
+  fee: number
+  pnl: number | null
+  at: number
+}
+
+export interface Portfolio {
+  summary: {
+    startingCapital: number
+    currentEquity: number
+    netPnl: number
+    netPnlPct: number
+    realizedPnl: number
+    unrealizedPnl: number
+    fees: number
+    grossProfit: number
+    grossLoss: number
+    profitFactor: number | null
+    expectedWinRate: number | null
+    roundTrips: number
+    wins: number
+    fills: number
+    bots: number
+    activeBots: number
+    openPositions: number
+  }
+  equity: { label: string; value: number }[]
+  bots: PortfolioBotAudit[]
+  positions: PortfolioPosition[]
+  transactions: PortfolioTransaction[]
+}
+
 export interface Me {
   user: { sub: string; name?: string; email?: string; picture?: string }
   workspace: { name: string; seededAt: number | null }

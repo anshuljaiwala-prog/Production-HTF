@@ -11,6 +11,7 @@ import type {
   EquityPoint,
   Me,
   ParamValue,
+  Portfolio,
   Position,
   SearchResults,
   Strategy,
@@ -124,6 +125,14 @@ export const useBacktests = () =>
 
 export const useConnections = () =>
   useQuery({ queryKey: ['connections'], queryFn: () => api<{ items: Connection[]; exchanges: string[] }>('/connections') })
+
+export const usePortfolio = () =>
+  useQuery({
+    queryKey: ['portfolio'],
+    queryFn: () => api<Portfolio>('/portfolio'),
+    refetchInterval: liveInterval<Portfolio>(4_000, 20_000, (d) => d.summary.activeBots > 0),
+    placeholderData: (p) => p,
+  })
 
 export const useSearch = (q: string) =>
   useQuery({

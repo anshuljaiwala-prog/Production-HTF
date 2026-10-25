@@ -10,6 +10,7 @@ import { BotDetail } from './pages/BotDetail'
 import { Bots } from './pages/Bots'
 import { Connections } from './pages/Connections'
 import { Dashboard } from './pages/Dashboard'
+import { Portfolio } from './pages/Portfolio'
 import { Settings } from './pages/Settings'
 import { SetupNeeded, SignIn } from './pages/SignIn'
 import { Strategies } from './pages/Strategies'
@@ -42,6 +43,7 @@ function Gate() {
         <Route path="board" element={<Board />} />
         <Route path="backtests" element={<Backtests />} />
         <Route path="connections" element={<Connections />} />
+        <Route path="portfolio" element={<Portfolio />} />
         <Route path="settings" element={<Settings />} />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Route>

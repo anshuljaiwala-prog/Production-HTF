@@ -62,7 +62,7 @@ workspace.delete('/workspace/data', async (c) => {
   return privateJson(c, { ok: true })
 })
 
-async function loadBots(db: D1Database, owner: string): Promise<Bot[]> {
+export async function loadBots(db: D1Database, owner: string): Promise<Bot[]> {
   const result = await db
     .prepare(`${BOT_SELECT} WHERE b.owner_sub = ? ORDER BY b.position DESC, b.created_at DESC`)
     .bind(owner)
@@ -132,7 +132,7 @@ workspace.get('/overview', async (c) => {
 })
 
 /** Daily closing equity per bot, carried forward, summed across the fleet. */
-function buildEquitySeries(bots: Bot[], rows: Row[], windowStart: number, t: number): { label: string; value: number }[] {
+export function buildEquitySeries(bots: Bot[], rows: Row[], windowStart: number, t: number): { label: string; value: number }[] {
   const days = Math.max(1, Math.floor((t - windowStart) / DAY) + 1)
   const byBot = new Map<string, { at: number; value: number }[]>()
   for (const row of rows) {

@@ -45,6 +45,26 @@ function check(label, ok, detail = '') {
   )
 }
 
+// 2b. Portfolio audit
+{
+  const { status, payload } = await call('GET', '/portfolio')
+  const s = payload?.summary
+  check(
+    'GET /portfolio',
+    status === 200 && typeof s?.startingCapital === 'number' && typeof s?.currentEquity === 'number' && Array.isArray(payload.bots) && s.bots === payload.bots.length,
+    JSON.stringify(s).slice(0, 200),
+  )
+  check(
+    'GET /portfolio per-bot audit is consistent',
+    payload.bots.every((b) => b.fills === 0 || b.lastActivityAt > 0) && typeof payload.summary.fees === 'number' && payload.summary.fees >= 0,
+    JSON.stringify(payload.summary.fees),
+  )
+  const wellFormed = (bot) => bot.capital > 0 && bot.equity > 0 && (bot.winRate === null || typeof bot.winRate === 'number')
+  check('GET /portfolio bot rows well-formed', payload.bots.every(wellFormed), 'rows malformed')
+  const ledger = payload.transactions
+  check('GET /portfolio ledger includes fees', status === 200 && ledger.length > 0 && ledger.every((tx) => typeof tx.fee === 'number' && tx.fee >= 0), `ledger=${ledger.length}`)
+}
+
 // 3. Launch a bot
 let botId
 {
