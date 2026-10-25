@@ -214,6 +214,14 @@ export interface LaunchInput {
 export const launchBot = (input: LaunchInput) => api<{ bot: Bot }>('/bots', { method: 'POST', json: input })
 export const controlBot = (botId: string, action: 'start' | 'pause' | 'stop') =>
   api<{ bot: Bot }>(`/bots/${botId}/control`, { method: 'POST', json: { action } })
+
+/** Bulk bot config import (uploaded file). Good rows launch (paused); bad
+ * rows come back with the reason so the dialog can show them. */
+export interface BotImportResult {
+  launched: Bot[]
+  failed: { name: string; error: string }[]
+}
+export const importBots = (items: LaunchInput[]) => api<BotImportResult>('/bots/import', { method: 'POST', json: { items } })
 export const adjustFunding = (botId: string, input: { amount: number; note?: string }) =>
   api<{ bot: Bot }>(`/bots/${botId}/cashflow`, { method: 'POST', json: input })
 export const patchBot = (botId: string, patch: { name?: string; stage?: BotStage; position?: number }) =>
@@ -242,3 +250,4 @@ export const deleteBacktest = (backtestId: string) => api<{ ok: true }>(`/backte
 export const createConnection = (input: { name: string; exchange: string; apiKey: string; apiSecret: string; mode: 'paper' | 'live' }) =>
   api<{ connection: Connection }>('/connections', { method: 'POST', json: input })
 export const deleteConnection = (connectionId: string) => api<{ ok: true }>(`/connections/${connectionId}`, { method: 'DELETE' })
+export const addDemoConnections = () => api<{ added: number }>('/connections/demo', { method: 'POST' })

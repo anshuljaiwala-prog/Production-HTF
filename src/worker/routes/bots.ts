@@ -68,28 +68,26 @@ interface CreateBody {
   status?: BotStatus
 }
 
-bots.post('/', async (c) => {
-  const db = c.get('db')
-  const owner = c.get('user').sub
-  const body = await c.req.json<CreateBody>()
-
+/** One bot creation, shared by single launch and bulk import: validates and
+ * inserts, returning either the bot or a rejection reason. */
+async function createBot(db: D1Database, owner: string, body: CreateBody): Promise<{ bot?: Bot; error?: string; message?: string }> {
   const strategy = strategyBy(String(body.strategyKey ?? ''))
-  if (!strategy) return c.json({ error: 'unknown_strategy', message: 'Pick a strategy from the catalog.' }, 400)
+  if (!strategy) return { error: 'unknown_strategy', message: 'Pick a strategy from the catalog.' }
 
   const symbols = [...new Set((body.symbols ?? []).map((s) => String(s).trim().toUpperCase()).filter(Boolean))].slice(
     0,
     MAX_SYMBOLS,
   )
-  if (symbols.length === 0) return c.json({ error: 'symbols_required', message: 'Choose at least one symbol.' }, 400)
+  if (symbols.length === 0) return { error: 'symbols_required', message: 'Choose at least one symbol.' }
 
   const timeframe = (body.timeframe ?? strategy.timeframes[Math.floor(strategy.timeframes.length / 2)]) as Timeframe
   if (!strategy.timeframes.includes(timeframe)) {
-    return c.json({ error: 'timeframe_unsupported', message: `${strategy.name} does not run on the ${timeframe} timeframe.` }, 400)
+    return { error: 'timeframe_unsupported', message: `${strategy.name} does not run on the ${timeframe} timeframe.` }
   }
 
   const capital = Number(body.capital)
   if (!Number.isFinite(capital) || capital < 100) {
-    return c.json({ error: 'invalid_capital', message: 'Starting capital must be at least $100.' }, 400)
+    return { error: 'invalid_capital', message: 'Starting capital must be at least $100.' }
   }
   const riskPct = Math.min(100, Math.max(1, Number(body.riskPct) || 25))
   const mode: 'paper' | 'live' = body.mode === 'live' ? 'live' : 'paper'
@@ -100,10 +98,10 @@ bots.post('/', async (c) => {
       .prepare(`SELECT id FROM connections WHERE id = ? AND owner_sub = ?`)
       .bind(String(body.connectionId), owner)
       .first<{ id: string }>()
-    if (!connection) return c.json({ error: 'connection_not_found', message: 'That connection no longer exists.' }, 400)
+    if (!connection) return { error: 'connection_not_found', message: 'That connection no longer exists.' }
     connectionId = connection.id
   } else if (mode === 'live') {
-    return c.json({ error: 'connection_required', message: 'A live bot needs an exchange connection.' }, 400)
+    return { error: 'connection_required', message: 'A live bot needs an exchange connection.' }
   }
 
   const status: BotStatus = body.status === 'stopped' || body.status === 'paused' ? body.status : 'running'
@@ -151,7 +149,41 @@ bots.post('/', async (c) => {
   )
 
   const bot = await loadBot(db, owner, botId)
-  return privateJson(c, { bot: bot ? withStrategy(bot) : null }, 201)
+  return bot ? { bot } : { error: 'create_failed', message: 'Bot could not be created.' }
+}
+
+bots.post('/', async (c) => {
+  const db = c.get('db')
+  const owner = c.get('user').sub
+  const body = await c.req.json<CreateBody>()
+  const result = await createBot(db, owner, body)
+  if (result.error) return c.json({ error: result.error, message: result.message }, 400)
+  return privateJson(c, { bot: withStrategy(result.bot!) }, 201)
+})
+
+/** Bulk bot config import: an uploaded file becomes many paper bots at once.
+ * Everything is validated per row — good configs launch, bad ones report why.
+ * Imported bots start paused so the operator can review before running. */
+const MAX_IMPORT = 25
+
+bots.post('/import', async (c) => {
+  const db = c.get('db')
+  const owner = c.get('user').sub
+  const body = await c.req.json<{ items?: CreateBody[] }>()
+  const items = Array.isArray(body.items) ? body.items.slice(0, MAX_IMPORT) : []
+  if (items.length === 0) {
+    return c.json({ error: 'nothing_to_import', message: 'No bot configs found in the upload — expected an array under "items".' }, 400)
+  }
+
+  const launched: Bot[] = []
+  const failed: { name: string; error: string }[] = []
+  for (const [index, item] of items.entries()) {
+    const label = item.name?.trim() || item.symbols?.filter(Boolean).join(', ') || `Import ${index + 1}`
+    const result = await createBot(db, owner, { ...item, status: 'paused' })
+    if (result.bot) launched.push(withStrategy(result.bot))
+    else failed.push({ name: label, error: result.message ?? 'Invalid config.' })
+  }
+  return privateJson(c, { launched, failed })
 })
 
 bots.get('/:id', async (c) => {

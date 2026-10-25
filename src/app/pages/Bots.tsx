@@ -1,8 +1,9 @@
-import { Bot as BotIcon, Plus } from 'lucide-react'
+import { Bot as BotIcon, Plus, Upload } from 'lucide-react'
 import { useMemo, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router'
 
 import { BoardPanel } from './Board'
+import { BotImportDialog } from '../components/forms'
 import { CompareBars } from '../components/charts'
 import { Badge, Button, Card, EmptyState, PageHeader, Skeleton } from '../components/ui'
 import { useBots } from '../lib/api'
@@ -27,6 +28,7 @@ export function Bots() {
   const navigate = useNavigate()
   const [params, setParams] = useSearchParams()
   const [filter, setFilter] = useState<BotStatus | 'all'>('all')
+  const [importing, setImporting] = useState(false)
   const view = params.get('tab') === 'board' ? 'board' : 'list'
 
   const items = useMemo(() => data?.items ?? [], [data])
@@ -45,10 +47,16 @@ export function Bots() {
             : undefined
         }
         actions={
-          <Button variant="primary" onClick={() => navigate('/strategies')}>
-            <Plus />
-            New bot
-          </Button>
+          <>
+            <Button onClick={() => setImporting(true)}>
+              <Upload />
+              Import bots
+            </Button>
+            <Button variant="primary" onClick={() => navigate('/strategies')}>
+              <Plus />
+              New bot
+            </Button>
+          </>
         }
       />
 
@@ -69,6 +77,8 @@ export function Bots() {
           </button>
         ))}
       </div>
+
+      <BotImportDialog open={importing} onClose={() => setImporting(false)} />
 
       {view === 'board' ? (
         <div className="mt-4">

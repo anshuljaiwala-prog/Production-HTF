@@ -225,6 +225,8 @@ function FleetAudit({ data, live }: { data: Portfolio; live: boolean }) {
         </div>
       </Card>
 
+      <AllocationCard data={data} />
+
       <FundingCard data={data} flows={data.funding} />
 
       <div className="mt-3 grid gap-3 lg:grid-cols-2">
@@ -617,6 +619,122 @@ function FundingPanel({ audit, flows }: { audit: PortfolioBotAudit; flows: CashF
           ))
           }
         </ul>
+      )}
+    </Card>
+  )
+}
+
+/** Capital structure: how much equity sits in open stock and crypto
+ * positions and how much is idle liquidity, with a stacked bar, a per-symbol
+ * invested chart and the reconciliation style rows. */
+function AllocationCard({ data }: { data: Portfolio }) {
+  const bySymbol = new Map<string, { invested: number; positions: number }>()
+  for (const position of data.positions) {
+    const entry = bySymbol.get(position.symbol) ?? { invested: 0, positions: 0 }
+    entry.invested += position.costBasis
+    entry.positions += 1
+    bySymbol.set(position.symbol, entry)
+  }
+  const symbols = [...bySymbol.entries()].sort((a, b) => b[1].invested - a[1].invested)
+
+  // Stock symbols on the venue carry no USD suffix; BTC/ETH/SOL are quoted as
+  // `X-USD`, so that suffix splits the venue into asset classes.
+  const isCrypto = (symbol: string) => symbol.endsWith('-USD')
+  const stocksInvested = symbols.filter(([symbol]) => !isCrypto(symbol)).reduce((sum, [, e]) => sum + e.invested, 0)
+  const cryptoInvested = symbols.filter(([symbol]) => isCrypto(symbol)).reduce((sum, [, e]) => sum + e.invested, 0)
+  const invested = stocksInvested + cryptoInvested
+  const cash = data.bots.reduce((sum, bot) => sum + bot.cash, 0)
+  const deployed = invested + cash
+  const share = (value: number) => (deployed > 0 ? `${((value / deployed) * 100).toFixed(1)}%` : '—')
+
+  const segments = [
+    { key: 'stocks', label: 'Stocks', value: stocksInvested, color: 'var(--color-accent)' },
+    { key: 'crypto', label: 'Crypto', value: cryptoInvested, color: 'var(--color-info)' },
+    { key: 'cash', label: 'Cash reserve', value: cash, color: 'var(--color-line-strong)' },
+  ].filter((seg) => seg.value > 0.01)
+
+  return (
+    <Card className="mt-3 p-5">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <h2 className="text-[14px] font-semibold">Allocation &amp; liquidity</h2>
+        <span className="text-[12.5px] text-faint">
+          cost basis of open positions · {data.positions.length} position{data.positions.length === 1 ? '' : 's'} · {money(cash)} idle
+        </span>
+      </div>
+
+      {deployed > 0.01 ? (
+        <>
+          {/* Stacked invested-vs-cash bar, labelled segments. */}
+          <div className="mt-4 flex h-3.5 overflow-hidden rounded-card" role="img" aria-label="Allocation bar: invested vs cash">
+            {segments.map((segment, i) => (
+              <div
+                key={segment.key}
+                className="h-full transition-all"
+                style={{ width: `${(segment.value / deployed) * 100}%`, background: segment.color, borderRight: i < segments.length - 1 ? '2px solid var(--color-surface)' : undefined }}
+                title={`${segment.label}: ${moneyExact(segment.value)} (${share(segment.value)})`}
+              />
+            ))}
+          </div>
+          <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-[12px]">
+            {segments.map((segment) => (
+              <span key={segment.key} className="inline-flex items-center gap-1.5">
+                <span className="inline-block size-2 rounded-[3px]" style={{ background: segment.color }} />
+                <span className="text-muted">{segment.label}</span>
+                <span className="font-medium tabular-nums">{moneyExact(segment.value)}</span>
+                <span className="text-faint">{share(segment.value)}</span>
+              </span>
+            ))}
+          </div>
+
+          <div className="mt-4 grid gap-5 lg:grid-cols-2">
+            <dl className="divide-y divide-line">
+              {[
+                { label: 'Invested — stocks', value: moneyExact(stocksInvested), detail: 'open stock positions at cost', tone: 'text-fg' },
+                { label: 'Invested — crypto', value: moneyExact(cryptoInvested), detail: 'open crypto positions at cost', tone: 'text-fg' },
+                { label: 'Total invested', value: moneyExact(invested), detail: `of ${moneyExact(data.summary.currentEquity)} fleet equity`, tone: 'text-fg' },
+              ].map((row) => (
+                <div key={row.label} className="flex items-center justify-between py-2">
+                  <dt>
+                    <span className="block text-[13px] text-muted">{row.label}</span>
+                    {row.detail && <span className="block text-[11.5px] text-faint">{row.detail}</span>}
+                  </dt>
+                  <dd className={cx('text-[14px] font-semibold tabular-nums', row.tone)}>{row.value}</dd>
+                </div>
+              ))}
+              <div className="flex items-center justify-between py-2">
+                <dt>
+                  <span className="block text-[13px] text-muted">Liquidity (idle cash)</span>
+                  <span className="block text-[11.5px] text-faint">not yet committed to positions</span>
+                </dt>
+                <dd className="text-[14px] font-semibold tabular-nums">{moneyExact(cash)}</dd>
+              </div>
+              <div className="flex items-center justify-between py-2">
+                <dt>
+                  <span className="block text-[13px] text-muted">Deployed</span>
+                  <span className="block text-[11.5px] text-faint">invested share of cost basis + idle cash</span>
+                </dt>
+                <dd className="text-[14px] font-semibold tabular-nums">{invested > 0 ? `${((invested / deployed) * 100).toFixed(1)}%` : '—'}</dd>
+              </div>
+            </dl>
+
+            <div>
+              <p className="text-[12.5px] font-medium text-muted">Invested by symbol</p>
+              <div className="mt-3">
+                <p className="mb-3 text-[12px] text-faint">Amount committed per symbol at cost basis · share of {moneyExact(invested)} invested</p>
+                <CompareBars
+                  format={(v) => moneyExact(v)}
+                  items={symbols.map(([symbol, entry]) => ({
+                    label: symbol,
+                    caption: `${entry.positions} position${entry.positions === 1 ? '' : 's'} · ${invested > 0 ? pct((entry.invested / invested) * 100) : '—'} of invested`,
+                    value: entry.invested,
+                  }))}
+                />
+              </div>
+            </div>
+          </div>
+        </>
+      ) : (
+        <EmptyState icon={<Wallet />} title="No allocation yet" description="Open a position and it appears here with its cost basis; idle cash shows as liquidity." />
       )}
     </Card>
   )

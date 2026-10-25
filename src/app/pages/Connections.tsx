@@ -3,7 +3,7 @@ import { useState } from 'react'
 
 import { ConnectionForm } from '../components/forms'
 import { Badge, Button, Card, ConfirmDialog, EmptyState, PageHeader, Skeleton, useToast } from '../components/ui'
-import { deleteConnection, useApiMutation, useConnections } from '../lib/api'
+import { addDemoConnections, deleteConnection, useApiMutation, useConnections } from '../lib/api'
 import { shortDate } from '../lib/format'
 import type { Connection } from '../../shared/types'
 
@@ -20,16 +20,28 @@ export function Connections() {
     },
   })
 
+  // Demo credentials the simulated venue accepts — for testing the picker
+  // and live mode without real exchange keys.
+  const addDemo = useApiMutation(() => addDemoConnections(), ['connections'], {
+    onSuccess: (result) => toast(result.added > 0 ? `Added ${result.added} demo connection${result.added === 1 ? '' : 's'}` : 'Demo connections already present'),
+  })
+
   return (
     <div className="mx-auto max-w-[900px] p-5 sm:p-8">
       <PageHeader
         title="Connections"
         subtitle="Exchange credentials for when a bot moves beyond paper."
         actions={
-          <Button variant="primary" onClick={() => setComposing(true)}>
-            <Plus />
-            Add connection
-          </Button>
+          <>
+            <Button loading={addDemo.isPending} onClick={() => addDemo.mutate(undefined)}>
+              <Plus />
+              Add demo connections
+            </Button>
+            <Button variant="primary" onClick={() => setComposing(true)}>
+              <Plus />
+              Add connection
+            </Button>
+          </>
         }
       />
 
@@ -77,10 +89,16 @@ export function Connections() {
             title="No connections yet"
             description="Add an exchange account so bots have somewhere to route orders once a live adapter ships."
             action={
-              <Button variant="primary" onClick={() => setComposing(true)}>
-                <Plus />
-                Add connection
-              </Button>
+              <>
+                <Button variant="primary" onClick={() => setComposing(true)}>
+                  <Plus />
+                  Add connection
+                </Button>
+                <Button loading={addDemo.isPending} onClick={() => addDemo.mutate(undefined)}>
+                  <Plus />
+                  Add demo connections
+                </Button>
+              </>
             }
           />
         )}

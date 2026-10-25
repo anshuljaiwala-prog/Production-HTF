@@ -10,13 +10,52 @@ export const connections = new Hono<AppContext>()
 
 const EXCHANGES = ['Paper (simulated)', 'Alpaca', 'Binance', 'Coinbase', 'Kraken']
 
+/** Throwaway credentials the demo venue recognises — never real market
+ * access. Reused by the seeder and the POST /demo endpoint. */
+export function demoConnectionRows(): { name: string; exchange: string; apiKey: string; apiSecret: string; mode: 'paper' }[] {
+  return [
+    { name: 'Demo · Alpaca paper', exchange: 'Alpaca', apiKey: 'HTFDEMOALPACA0001', apiSecret: 'demo-secret-not-real', mode: 'paper' },
+    { name: 'Demo · Binance paper', exchange: 'Binance', apiKey: 'HTFDEMOBINANCE001', apiSecret: 'demo-secret-not-real', mode: 'paper' },
+  ]
+}
+
+export async function insertConnection(db: D1Database, owner: string, spec: { name: string; exchange: string; apiKey: string; apiSecret: string; mode: string }) {
+  await db
+    .prepare(
+      `INSERT INTO connections (id, owner_sub, name, exchange, api_key, api_secret, mode, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .bind(id(), owner, spec.name, spec.exchange, spec.apiKey, spec.apiSecret, spec.mode, now())
+    .run()
+}
+
 connections.get('/', async (c) => {
-  const result = await c
-    .get('db')
+  const db = c.get('db')
+  const result = await db
     .prepare(`SELECT * FROM connections WHERE owner_sub = ? ORDER BY created_at DESC`)
     .bind(c.get('user').sub)
     .all<Row>()
+  // A fresh workspace starts with the two demo connections so bots have
+  // something to route through for testing. Only fires on an empty book.
+  if ((result.results ?? []).length === 0) {
+    for (const demo of demoConnectionRows()) await insertConnection(db, c.get('user').sub, demo)
+    const seeded = await db
+      .prepare(`SELECT * FROM connections WHERE owner_sub = ? ORDER BY created_at DESC`)
+      .bind(c.get('user').sub)
+      .all<Row>()
+    result.results = seeded.results
+  }
   return privateJson(c, { items: (result.results ?? []).map(mapConnection), exchanges: EXCHANGES })
+})
+
+/** Re-add the two demo connections, skipping names that already exist. */
+connections.post('/demo', async (c) => {
+  const db = c.get('db')
+  const owner = c.get('user').sub
+  const existing = await db.prepare(`SELECT name FROM connections WHERE owner_sub = ?`).bind(owner).all<{ name: string }>()
+  const have = new Set((existing.results ?? []).map((r) => r.name))
+  const added = demoConnectionRows().filter((demo) => !have.has(demo.name))
+  for (const demo of added) await insertConnection(db, owner, demo)
+  return privateJson(c, { added: added.length })
 })
 
 connections.post('/', async (c) => {

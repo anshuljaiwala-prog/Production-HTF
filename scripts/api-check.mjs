@@ -171,6 +171,30 @@ let backtestId
   check('DELETE /backtests/:id', removed.status === 200, `got ${removed.status}`)
 }
 
+// 8b. Bulk import: one good config launches (paused), one bad is reported
+let importedBotId
+{
+  const { status, payload } = await call('POST', '/bots/import', {
+    items: [
+      { name: 'Import test grid', strategyKey: 'grid', symbols: ['BTC-USD'], capital: 5000, mode: 'paper' },
+      { name: 'Import test bad', strategyKey: 'nope', symbols: ['ETH-USD'], capital: 5000, mode: 'paper' },
+    ],
+  })
+  importedBotId = payload?.launched?.[0]?.id
+  check(
+    'POST /bots/import',
+    status === 200 && payload.launched?.length === 1 && payload.failed?.length === 1 && payload.launched[0]?.status === 'paused' && payload.launched[0]?.connectionId === null,
+    `launched=${payload?.launched?.length} failed=${JSON.stringify(payload?.failed)}`.slice(0, 160),
+  )
+  check(
+    'POST /bots/import reports the bad row',
+    payload.failed?.[0]?.name === 'Import test bad' && Boolean(payload.failed?.[0]?.error),
+    JSON.stringify(payload?.failed?.[0]).slice(0, 120),
+  )
+  const empty = await call('POST', '/bots/import', { items: [] })
+  check('POST /bots/import rejects empty payload', empty.status === 400, `got ${empty.status}`)
+}
+
 // 9. Connections: create (masked), list, delete; secret never returned
 let connectionId
 {
@@ -211,10 +235,14 @@ let connectionId
   check('cross-origin mutation refused with 403', cross.status === 403, `got ${cross.status}`)
 }
 
-// 11. Cleanup the bot created for the test
+// 11. Cleanup the bots created for the test
 {
   const removed = await call('DELETE', `/bots/${botId}`)
   check('DELETE /bots/:id', removed.status === 200, `got ${removed.status}`)
+  if (importedBotId) {
+    const removedImport = await call('DELETE', `/bots/${importedBotId}`)
+    check('DELETE imported bot', removedImport.status === 200, `got ${removedImport.status}`)
+  }
 }
 
 console.log(failures === 0 ? '\nAll API checks passed.' : `\n${failures} check(s) failed.`)

@@ -101,13 +101,22 @@ export async function seedWorkspace(db: D1Database, owner: string) {
   const t = Date.now()
   const statements: D1PreparedStatement[] = []
 
+  // Two demo connections so a fresh workspace can test the picker and live
+  // routing immediately — throwaway credentials the simulated venue accepts.
   const connectionId = id()
   statements.push(
     db
       .prepare(
         `INSERT INTO connections (id, owner_sub, name, exchange, api_key, api_secret, mode, created_at) VALUES (?, ?, ?, ?, ?, ?, 'paper', ?)`,
       )
-      .bind(connectionId, owner, 'Alpaca paper account', 'Alpaca', 'HTFDEMOKEY0000', 'demo-secret-not-real', t - 30 * DAY),
+      .bind(connectionId, owner, 'Demo · Alpaca paper', 'Alpaca', 'HTFDEMOALPACA0001', 'demo-secret-not-real', t - 30 * DAY),
+  )
+  statements.push(
+    db
+      .prepare(
+        `INSERT INTO connections (id, owner_sub, name, exchange, api_key, api_secret, mode, created_at) VALUES (?, ?, ?, ?, ?, ?, 'paper', ?)`,
+      )
+      .bind(id(), owner, 'Demo · Binance paper', 'Binance', 'HTFDEMOBINANCE001', 'demo-secret-not-real', t - 29 * DAY),
   )
 
   const seeded: Row[] = []
@@ -145,7 +154,7 @@ export async function seedWorkspace(db: D1Database, owner: string) {
       updated_at: createdAt,
       strategy_name: strategy.name,
       open_positions: 0,
-      connection_name: spec.mode === 'live' ? 'Alpaca paper account' : null,
+      connection_name: spec.mode === 'live' ? 'Demo · Alpaca paper' : null,
       last_event: null,
     }
     seeded.push(row)
