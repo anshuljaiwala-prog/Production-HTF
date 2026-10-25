@@ -374,6 +374,23 @@ function BotPerformance({ audit, flows, onBack }: { audit: PortfolioBotAudit; fl
   const transactions = (detail?.trades ?? []).map((trade) => ({ ...trade, botName: audit.name }))
   const net = audit.equity - audit.capital
 
+  // Cumulative funding on the same timeline as the equity curve: 0 before the
+  // first flow, one visible step per deposit/withdrawal, carried forward to
+  // now so the current funding level reads off the chart directly.
+  const fundingSeries = (() => {
+    if (flows.length === 0) return []
+    const sorted = [...flows].sort((a, b) => a.at - b.at)
+    const start = Math.min(detail?.equity[0]?.t ?? sorted[0].at, sorted[0].at)
+    let cum = 0
+    const points: { label: string; value: number }[] = [{ label: shortDate(start), value: 0 }]
+    for (const flow of sorted) {
+      cum += flow.amount
+      points.push({ label: shortDate(Math.max(flow.at, start)), value: cum })
+    }
+    points.push({ label: shortDate(Date.now()), value: cum })
+    return points
+  })()
+
   const kpis = [
     { label: 'Capital', value: moneyExact(audit.capital), hint: `deployed on ${audit.timeframe} bars` },
     { label: 'Current equity', value: moneyExact(audit.equity), hint: `${audit.roundTrips} round trips`, tone: undefined },
@@ -442,6 +459,21 @@ function BotPerformance({ audit, flows, onBack }: { audit: PortfolioBotAudit; fl
             </>
           )}
         </Card>
+
+        {fundingSeries.length > 1 && (
+          <Card className="p-5">
+            <div className="flex items-center justify-between">
+              <h3 className="text-[14px] font-semibold">Cumulative funding</h3>
+              <span className="text-[12.5px] text-faint">
+                same timeline as the curve above · net {moneyExact(audit.netDeposits)}
+              </span>
+            </div>
+            <p className="mt-1 text-[12px] text-faint">Steps are the bot's own deposits and withdrawals — read together with the equity line to separate cash movement from P&L.</p>
+            <div className="mt-3">
+              <AreaChart data={fundingSeries} height={140} stroke="var(--color-info)" />
+            </div>
+          </Card>
+        )}
 
         <Card className="p-5">
           <div className="flex items-center justify-between">
