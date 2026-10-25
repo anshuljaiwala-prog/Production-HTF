@@ -62,8 +62,8 @@ export async function api<T>(path: string, init?: RequestInit & { json?: unknown
 // recomputed server-side on each poll, so equity moves in real time — while an
 // idle fleet drops to a slow heartbeat instead of re-polling at run speed.
 
-/** Adaptive refetch cadence in milliseconds, chosen from the last response. */
-function liveInterval<T>(fast: number, slow: number, hasActivity: (data: T) => boolean) {
+/** Adaptive refetch cadence: fast while active, `slow` otherwise (false stops polling). */
+function liveInterval<T>(fast: number, slow: number | false, hasActivity: (data: T) => boolean) {
   return (query: { state: { data?: T } }): number | false => {
     const data = query.state.data
     if (!data) return false
@@ -113,7 +113,14 @@ export const useBot = (botId: string | undefined) =>
   })
 
 export const useBacktests = () =>
-  useQuery({ queryKey: ['backtests'], queryFn: () => api<{ items: Backtest[] }>('/backtests') })
+  useQuery({
+    queryKey: ['backtests'],
+    queryFn: () => api<{ items: Backtest[] }>('/backtests'),
+    // Runs execute lazily on read; poll while anything is pending so the
+    // status flips to done/failed (and the results appear) automatically.
+    refetchInterval: liveInterval<{ items: Backtest[] }>(1_000, false, (d) => d.items.some((b) => b.status === 'running')),
+    placeholderData: (p) => p,
+  })
 
 export const useConnections = () =>
   useQuery({ queryKey: ['connections'], queryFn: () => api<{ items: Connection[]; exchanges: string[] }>('/connections') })

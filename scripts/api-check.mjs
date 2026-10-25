@@ -109,15 +109,28 @@ let backtestId
     params: {},
   })
   backtestId = payload?.backtest?.id
-  const metrics = payload?.backtest?.metrics
   check(
     'POST /backtests run',
-    status === 201 && Boolean(backtestId) && typeof metrics?.totalReturn === 'number' && payload.backtest.curve?.length > 0,
-    JSON.stringify(metrics).slice(0, 160),
+    status === 201 && Boolean(backtestId) && payload.backtest?.status === 'running' && payload.backtest.metrics === null,
+    JSON.stringify(payload?.backtest?.status).slice(0, 160),
   )
 
-  const bad = await call('POST', '/backtests', { strategyKey: 'momentum', symbol: 'BTC-USD', timeframe: '1h', capital: 10000, days: 60000 })
-  check('POST /backtests handles impossible range', bad.status === 422 || bad.status === 201, `got ${bad.status}`)
+  const resolved = await call('GET', `/backtests/${backtestId}`)
+  const metrics = resolved.payload?.backtest?.metrics
+  check(
+    'GET /backtests/:id resolves a running run',
+    resolved.status === 200 && resolved.payload.backtest.status === 'done' && typeof metrics?.totalReturn === 'number' && resolved.payload.backtest.curve?.length > 0,
+    JSON.stringify(resolved.payload?.backtest?.status).slice(0, 160),
+  )
+
+  const bad = await call('POST', '/backtests', { strategyKey: 'momentum', symbol: 'BTC-USD', timeframe: '1h', capital: 10000, from: Date.now() + 30 * 86_400_000, to: Date.now() })
+  if (bad.status === 201 && bad.payload?.backtest?.id) {
+    const resolved = await call('GET', `/backtests/${bad.payload?.backtest?.id}`)
+    check('POST /backtests handles impossible range', resolved.payload?.backtest?.status === 'failed' && Boolean(resolved.payload?.backtest?.error), JSON.stringify(resolved.payload?.backtest?.error).slice(0, 120))
+    await call('DELETE', `/backtests/${bad.payload?.backtest?.id}`)
+  } else {
+    check('POST /backtests handles impossible range', bad.status === 422, `got ${bad.status}`)
+  }
 
   const list = await call('GET', '/backtests')
   check('GET /backtests', list.status === 200 && list.payload.items?.some((b) => b.id === backtestId), `items=${list.payload?.items?.length}`)

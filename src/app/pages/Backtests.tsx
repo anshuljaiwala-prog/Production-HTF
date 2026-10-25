@@ -4,7 +4,7 @@ import { useSearchParams } from 'react-router'
 
 import { AreaChart } from '../components/charts'
 import { BacktestDialog } from '../components/forms'
-import { Badge, Button, Card, ConfirmDialog, Drawer, EmptyState, PageHeader, Skeleton, useToast } from '../components/ui'
+import { Badge, Button, Card, ConfirmDialog, Drawer, EmptyState, Live, PageHeader, Skeleton, useToast } from '../components/ui'
 import { deleteBacktest, useApiMutation, useBacktests } from '../lib/api'
 import { cx } from '../lib/cx'
 import { money, shortDate } from '../lib/format'
@@ -147,6 +147,7 @@ function BacktestDrawer({ id, onClose }: { id: string | null; onClose: () => voi
           backtest && (
             <div className="flex items-center gap-2">
               <Badge tone={backtest.status === 'done' ? 'success' : backtest.status === 'failed' ? 'danger' : 'neutral'}>{backtest.status}</Badge>
+              {backtest.status === 'running' && <Live active label="1s poll" />}
               <span className="truncate text-[13px] text-muted">
                 {backtest.strategyName} · {backtest.symbol} · {backtest.timeframe}
               </span>
