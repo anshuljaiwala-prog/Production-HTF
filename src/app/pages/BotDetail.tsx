@@ -4,10 +4,10 @@ import { Link, useNavigate, useParams } from 'react-router'
 
 import { AreaChart, BarChart, DrawdownChart } from '../components/charts'
 import { Badge, Button, Card, ConfirmDialog, EmptyState, Live, PageHeader, Skeleton, useToast } from '../components/ui'
-import { controlBot, deleteBot, patchBot, useApiMutation, useBot } from '../lib/api'
+import { controlBot, deleteBot, patchBot, useApiMutation, useBot, useBotAccuracy } from '../lib/api'
 import { cx } from '../lib/cx'
 import { money, relativeTime, shortDate } from '../lib/format'
-import { BOT_STAGES, activityOf, type BotStage } from '../../shared/types'
+import { BOT_STAGES, activityOf, type AccuracyStat, type BotStage } from '../../shared/types'
 
 export function BotDetail() {
   const { id } = useParams()
@@ -221,6 +221,8 @@ export function BotDetail() {
         </Card>
       </div>
 
+      <AccuracyCard botId={id} liveWins={bot.wins} roundTrips={bot.roundTrips} />
+
       <Card className="mt-3 overflow-hidden">
         <div className="flex items-center justify-between px-5 pt-5">
           <h2 className="text-[14px] font-semibold">Open positions</h2>
@@ -332,4 +334,93 @@ function sample<T extends { t: number }>(points: T[]): T[] {
   if (points.length <= 90) return points
   const step = Math.ceil(points.length / 90)
   return points.filter((_, i) => i % step === 0 || i === points.length - 1)
+}
+
+const RATING_TONE: Record<NonNullable<AccuracyStat['rating']>, 'success' | 'warning' | 'danger' | 'neutral'> = {
+  edge: 'success',
+  'coin-flip': 'warning',
+  anti: 'danger',
+  'thin-sample': 'neutral',
+}
+
+/** How well this bot's rules predict the next bar, measured over a bounded
+ * recent window of the same feed the bot trades. The gauge line marks the
+ * coin-flip baseline (50%) so "60%" reads as a real edge, not noise. */
+function AccuracyCard({ botId, liveWins, roundTrips }: { botId: string | undefined; liveWins: number; roundTrips: number }) {
+  const { data, isLoading } = useBotAccuracy(botId)
+  const accuracy = data?.accuracy
+  const hitRate = roundTrips > 0 ? (liveWins / roundTrips) * 100 : null
+
+  return (
+    <Card className="mt-3 p-5">
+      <div className="flex items-center justify-between">
+        <h2 className="text-[14px] font-semibold">Market-edge accuracy</h2>
+        <span className="text-[12.5px] text-faint">
+          {accuracy
+            ? `${data.window.bars} bars · ${data.window.symbol ?? '—'} @ ${data.window.timeframe}`
+            : 'measured on every read'}
+        </span>
+      </div>
+
+      {isLoading && <Skeleton className="mt-4 h-24 rounded-tile" />}
+
+      {!isLoading && accuracy && (
+        <div className="mt-4 grid gap-4 sm:grid-cols-[minmax(0,2fr)_minmax(0,3fr)] sm:items-center">
+          <div>
+            <div className="flex items-baseline gap-3">
+              <span className="text-[30px] font-semibold tracking-[-0.02em] tabular-nums">
+                {accuracy.directionalAccuracy === null ? '—' : `${accuracy.directionalAccuracy.toFixed(1)}%`}
+              </span>
+              {accuracy.rating && <Badge tone={RATING_TONE[accuracy.rating]}>{accuracy.rating}</Badge>}
+            </div>
+            <p className="mt-1 text-[12px] leading-relaxed text-muted">
+              Of {accuracy.entryBars} entry-signal bars in the window, {accuracy.correct} closed in the direction the
+              strategy bet on.
+            </p>
+          </div>
+
+          <div>
+            {/* Gauge: 0–100% of next-bar direction, with a marker at the
+                50% coin-flip baseline. Evidence beats decoration. */}
+            <div className="relative h-3 overflow-hidden rounded-full bg-surface-2" role="img" aria-label={`Directional accuracy ${accuracy.directionalAccuracy ?? 0} percent`}
+            >
+              <div
+                className="h-full rounded-full bg-accent transition-[width] duration-500"
+                style={{ width: `${Math.max(2, Math.min(100, accuracy.directionalAccuracy ?? 0))}%` }}
+              />
+              <span className="absolute inset-y-0 left-1/2 w-px bg-fg/60" title="coin-flip baseline (50%)" />
+            </div>
+            <div className="mt-1.5 flex justify-between text-[11px] tabular-nums text-faint">
+              <span>0%</span>
+              <span>50% coin-flip</span>
+              <span>100%</span>
+            </div>
+
+            <dl className="mt-3 grid grid-cols-2 gap-x-4 gap-y-1.5 text-[12.5px] sm:grid-cols-4">
+              <div>
+                <dt className="text-faint">Edge / signal bar</dt>
+                <dd className="tabular-nums">{accuracy.edgePct === null ? '—' : `${accuracy.edgePct >= 0 ? '+' : ''}${accuracy.edgePct.toFixed(3)}%`}</dd>
+              </div>
+              <div>
+                <dt className="text-faint">Mean signal return</dt>
+                <dd className="tabular-nums">{accuracy.signalReturnPct === null ? '—' : `${accuracy.signalReturnPct >= 0 ? '+' : ''}${accuracy.signalReturnPct.toFixed(3)}%`}</dd>
+              </div>
+              <div>
+                <dt className="text-faint">Samples</dt>
+                <dd className="tabular-nums">{accuracy.sample} bar{accuracy.sample === 1 ? '' : 's'}</dd>
+              </div>
+              <div>
+                <dt className="text-faint">Realised hit rate</dt>
+                <dd className="tabular-nums">{hitRate === null ? 'no trades yet' : `${hitRate.toFixed(0)}% (${liveWins}/${roundTrips})`}</dd>
+              </div>
+            </dl>
+          </div>
+        </div>
+      )}
+
+      {!isLoading && !accuracy && (
+        <p className="mt-2 text-[13px] text-muted">Not enough bar history in this window to score prediction quality yet.</p>
+      )}
+    </Card>
+  )
 }

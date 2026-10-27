@@ -2,6 +2,7 @@ import type { MiddlewareHandler } from 'hono'
 
 import type { AppContext } from './env'
 import type {
+  AccuracyStat,
   Backtest,
   Bot,
   BotEvent,
@@ -288,20 +289,35 @@ export function mapEvent(r: Row): BotEvent {
 }
 
 export function mapBacktest(r: Row): Backtest {
+  // Accuracy rides inside the metrics blob; split it out on the way through.
+  const metricsRaw = parseJson<(RunMetrics & { accuracy?: AccuracyStat }) | null>(r.metrics, null)
+  const { accuracy, ...metrics } = metricsRaw ?? { accuracy: undefined }
+  const params = parseJson<Record<string, ParamValue>>(r.params, {})
+  // Custom (uploaded) strategies carry their display name inside the params.
+  let strategyName = (r.strategy_name as string | undefined) ?? String(r.strategy_key)
+  if (String(r.strategy_key) === 'custom' && typeof params.rules === 'string') {
+    try {
+      const parsed = JSON.parse(params.rules) as { name?: string }
+      if (parsed?.name) strategyName = parsed.name
+    } catch {
+      /* keep key fallback */
+    }
+  }
   return {
     id: r.id as string,
     name: r.name as string,
     strategyKey: r.strategy_key as string,
-    strategyName: (r.strategy_name as string | undefined) ?? (r.strategy_key as string),
+    strategyName,
     symbol: r.symbol as string,
     timeframe: r.timeframe as Timeframe,
-    params: parseJson<Record<string, ParamValue>>(r.params, {}),
+    params,
     capital: Number(r.capital ?? 0),
     from: Number(r.from_ts),
     to: Number(r.to_ts),
     status: r.status as Backtest['status'],
     error: (r.error as string | null) ?? null,
-    metrics: parseJson<RunMetrics | null>(r.metrics, null),
+    metrics: metricsRaw ? (metrics as RunMetrics) : null,
+    accuracy: metricsRaw ? (accuracy ?? null) : null,
     curve: parseJson<EquityPoint[]>(r.curve, []),
     trades: parseJson<Trade[]>(r.trades, []),
     createdAt: Number(r.created_at),

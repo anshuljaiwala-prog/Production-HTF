@@ -242,6 +242,134 @@ let connectionId
   check('DELETE /connections/:id', removed.status === 200, `got ${removed.status}`)
 }
 
+// 9b. Uploaded rules strategy: POST -> list -> GET detail -> backtest with
+// inline rules -> bot accuracy on the created bot; then discard.
+let customStrategyId
+{
+  const rules = {
+    name: 'Check suite rules',
+    entry: [{ metric: 'rsi', n: 14, op: '<', value: 35 }],
+    entryLogic: 'any',
+    exit: [{ metric: 'rsi', n: 14, op: '>', value: 60 }],
+    exitLogic: 'all',
+    stopLossPct: 4,
+    takeProfitPct: 8,
+  }
+  const bad = await call('POST', '/strategies/custom', { rules: { name: 'broken', entry: 'no' } })
+  check('POST /strategies/custom rejects a malformed payload', bad.status === 400 && bad.payload?.error === 'invalid_rules', `got ${bad.status}`)
+
+  const upload = await call('POST', '/strategies/custom', { rules })
+  customStrategyId = upload.payload?.strategy?.id
+  check(
+    'POST /strategies/custom uploads rules',
+    upload.status === 201 && Boolean(customStrategyId) && upload.payload.strategy?.rules === 2 && upload.payload.strategy?.lookback > 0 && upload.payload.durable === false,
+    JSON.stringify(upload.payload?.strategy).slice(0, 160),
+  )
+
+  const list = await call('GET', '/strategies/custom')
+  check(
+    'GET /strategies/custom lists the upload',
+    list.status === 200 && list.payload.items?.some((s) => s.id === customStrategyId && s.name === 'Check suite rules'),
+    `items=${list.payload?.items?.length}`,
+  )
+
+  const detail = await call('GET', `/strategies/custom/${customStrategyId}`)
+  check(
+    'GET /strategies/custom/:id returns the accepted rules',
+    detail.status === 200 && detail.payload.rules?.entry?.[0]?.metric === 'rsi' && detail.payload.rules?.takeProfitPct === 8,
+    JSON.stringify(detail.payload?.rules).slice(0, 140),
+  )
+
+  // Rule-driven backtest: strategyKey 'custom' + inline rules runs the
+  // uploaded strategist over real history.
+  const run = await call('POST', '/backtests', {
+    strategyKey: 'custom',
+    rules,
+    symbol: 'BTC-USD',
+    timeframe: '1h',
+    capital: 10_000,
+    days: 30,
+    name: 'Check suite rules backtest',
+  })
+  const rulesBacktestId = run.payload?.backtest?.id
+  check(
+    'POST /backtests with inline rules runs the uploaded strategist',
+    run.status === 201 && Boolean(rulesBacktestId) && run.payload.backtest?.strategyName === 'Check suite rules',
+    JSON.stringify(run.payload?.backtest?.strategyName).slice(0, 140),
+  )
+
+  let rulesDone = null
+  for (let i = 0; i < 20 && !rulesDone; i++) {
+    const poll = await call('GET', `/backtests/${rulesBacktestId}`)
+    if (poll.payload?.backtest?.status !== 'running') rulesDone = poll.payload.backtest
+    else await new Promise((r) => setTimeout(r, 250))
+  }
+  check(
+    'rules backtest resolves with metrics + accuracy',
+    rulesDone?.status === 'done' && rulesDone?.metrics?.trades >= 0 && Number.isFinite(rulesDone?.accuracy?.sample) && rulesDone.accuracy.sample > 0,
+    JSON.stringify(rulesDone?.metrics ?? rulesDone?.status ?? 'stuck running').slice(0, 160),
+  )
+  check(
+    'accuracy sample covers the market window',
+    rulesDone?.accuracy?.sample > 0 && rulesDone.accuracy.sample <= 2000 && (rulesDone.accuracy.directionalAccuracy === null || (rulesDone.accuracy.directionalAccuracy >= 0 && rulesDone.accuracy.directionalAccuracy <= 100)),
+    JSON.stringify(rulesDone?.accuracy?.sample).slice(0, 120),
+  )
+  await call('DELETE', `/backtests/${rulesBacktestId}`)
+
+  // A bot created with inline rules carries the uploaded name and runs on
+  // the custom strategist; its accuracy endpoint reports a scored window.
+  const bot = await call('POST', '/bots', {
+    strategyKey: 'custom',
+    rules,
+    name: 'Check suite rules bot',
+    symbols: ['BTC-USD'],
+    timeframe: '1h',
+    capital: 10_000,
+    mode: 'paper',
+  })
+  const rulesBotId = bot.payload?.bot?.id
+  check(
+    'POST /bots with inline rules creates a custom bot',
+    bot.status === 201 && bot.payload.bot?.strategyName === 'Check suite rules' && rulesBotId,
+    JSON.stringify(bot.payload?.bot?.strategyName).slice(0, 140),
+  )
+
+  const accuracy = await call('GET', `/bots/${rulesBotId}/accuracy`)
+  check(
+    'GET /bots/:id/accuracy scores prediction quality',
+    accuracy.status === 200 && accuracy.payload.accuracy?.sample > 0 && Number.isFinite(accuracy.payload.accuracy?.entryBars) && accuracy.payload.live?.roundTrips >= 0,
+    JSON.stringify(accuracy.payload?.window).slice(0, 160),
+  )
+
+  const removedRulesBot = await call('DELETE', `/bots/${rulesBotId}`)
+  check('DELETE the rules bot', removedRulesBot.status === 200, `got ${removedRulesBot.status}`)
+}
+
+// 9c. Bulk connections upload: two good rows + one bad; per-row result
+{
+  const upload = await call('POST', '/connections/bulk', {
+    items: [
+      { name: 'Bulk Alpaca test', exchange: 'Alpaca', apiKey: 'BULKALPACA0001', apiSecret: 'bulk-secret-not-real', mode: 'paper' },
+      { name: 'Bulk Kraken test', exchange: 'Kraken', apiKey: 'BULKKRAKEN001', apiSecret: 'bulk-secret-not-real', mode: 'live' },
+      { name: '', exchange: 'Coinbase', apiKey: '' },
+    ],  })
+  const createdNames = (upload.payload?.created ?? []).map((r) => r.name)
+  const serialized = JSON.stringify(upload.payload)
+  check(
+    'POST /connections/bulk creates good rows',
+    upload.status === 201 && createdNames.includes('Bulk Alpaca test') && createdNames.includes('Bulk Kraken test') && upload.payload.created?.find((c) => c.name === 'Bulk Alpaca test')?.mode === 'paper' && upload.payload.created?.find((c) => c.name === 'Bulk Kraken test')?.mode === 'live',
+    JSON.stringify(createdNames).slice(0, 160),
+  )
+  check(
+    'bulk upload reports the bad row without leaking secrets',
+    upload.payload.failed?.[0]?.error && !serialized.includes('bulk-secret-not-real') && serialized.includes('••••'),
+    JSON.stringify(upload.payload?.failed).slice(0, 140),
+  )
+  for (const conn of upload.payload?.created ?? []) await call('DELETE', `/connections/${conn.id}`)
+  const afterBulk = await call('GET', '/connections')
+  check('bulk-created connections deleted', afterBulk.status === 200 && !JSON.stringify(afterBulk.payload?.items ?? []).includes('Bulk Alpaca test'))
+}
+
 // 10. Search + me + same-origin refusal
 {
   const search = await call('GET', '/search?q=momentum')

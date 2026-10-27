@@ -1,11 +1,12 @@
-import { FlaskConical, Play, Rocket, Zap } from 'lucide-react'
+import { FlaskConical, Play, Rocket, Trash2, Upload, Zap } from 'lucide-react'
 import { useState } from 'react'
 import { useSearchParams } from 'react-router'
 
-import { BacktestDialog, LaunchWizard } from '../components/forms'
+import { BacktestDialog, LaunchWizard, UploadStrategyDialog } from '../components/forms'
 import { Backtests } from './Backtests'
-import { Badge, Button, Card, EmptyState, PageHeader, Skeleton } from '../components/ui'
-import { useStrategies } from '../lib/api'
+import { Badge, Button, Card, ConfirmDialog, EmptyState, PageHeader, Skeleton, useToast } from '../components/ui'
+import { deleteCustomStrategy, useApiMutation, useCustomStrategies, useStrategies } from '../lib/api'
+import { shortDate } from '../lib/format'
 import type { RiskLevel, Strategy } from '../../shared/types'
 
 const riskTone: Record<RiskLevel, 'success' | 'warning' | 'danger'> = { low: 'success', medium: 'warning', high: 'danger' }
@@ -15,6 +16,19 @@ export function Strategies() {
   const [params, setParams] = useSearchParams()
   const [launchKey, setLaunchKey] = useState<string | null>(null)
   const [backtestKey, setBacktestKey] = useState<string | null>(null)
+  // Uploaded rules strategies live outside the catalog — track which one is
+  // being launched / backtested alongside the catalog key.
+  const customList = useCustomStrategies().data?.items ?? []
+  const toast = useToast()
+  const [customId, setCustomId] = useState<string | null>(null)
+  const [uploadOpen, setUploadOpen] = useState(false)
+  const [removing, setRemoving] = useState<string | null>(null)
+  const remove = useApiMutation((id: string) => deleteCustomStrategy(id), ['custom-strategies'], {
+    onSuccess: () => {
+      toast('Uploaded strategy discarded')
+      setRemoving(null)
+    },
+  })
   // Separate open flag: `strategyKey = null` means "free-form backtest", not
   // "closed".
   const [backtestOpen, setBacktestOpen] = useState(false)
@@ -28,6 +42,12 @@ export function Strategies() {
       <PageHeader
         title="Strategies"
         subtitle="Six templates on one engine. Backtest before you launch, or go straight to paper."
+        actions={
+          <Button variant="primary" onClick={() => setUploadOpen(true)}>
+            <Upload />
+            Upload strategy (JSON)
+          </Button>
+        }
       />
 
       {/* Tab switcher: catalog / backtests */}
@@ -54,6 +74,57 @@ export function Strategies() {
         <Backtests embedded />
       ) : (
         <>
+          {customList.length > 0 && (
+            <section className="mt-6">
+              <div className="mb-3 flex items-baseline justify-between">
+                <h2 className="text-[14px] font-semibold">Uploaded strategies (rules DSL · in-memory)</h2>
+                <span className="text-[12px] text-faint">held in worker memory until a restart — backtest with historical data before launching</span>
+              </div>
+              <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+                {customList.map((entry) => (
+                  <Card key={entry.id} className="flex flex-col p-5">
+                    <div className="flex items-start justify-between gap-2">
+                      <div className="min-w-0">
+                        <h3 className="truncate text-[15px] font-semibold tracking-tight">{entry.name}</h3>
+                        <p className="mt-0.5 text-[12.5px] text-faint">
+                          {entry.rules} rules · lookback {entry.lookback} bars · uploaded {shortDate(entry.createdAt)}
+                        </p>
+                      </div>
+                      <Badge tone="info">custom</Badge>
+                    </div>
+                    <div className="mt-5 flex items-center gap-2 border-t border-line pt-4">
+                      <Button
+                        size="sm"
+                        onClick={() => {
+                          setCustomId(entry.id)
+                          setBacktestKey('custom')
+                          setBacktestOpen(true)
+                        }}
+                      >
+                        <FlaskConical />
+                        Backtest
+                      </Button>
+                      <Button
+                        variant="primary"
+                        size="sm"
+                        onClick={() => {
+                          setCustomId(entry.id)
+                          setLaunchKey('custom')
+                        }}
+                      >
+                        <Rocket />
+                        Launch
+                      </Button>
+                      <Button variant="ghost" size="icon-sm" aria-label={`Delete ${entry.name}`} className="ml-auto" onClick={() => setRemoving(entry.id)}>
+                        <Trash2 />
+                      </Button>
+                    </div>
+                  </Card>
+                ))}
+              </div>
+            </section>
+          )}
+
           {isLoading ? (
             <div className="mt-6 grid gap-3 md:grid-cols-2 xl:grid-cols-3">
               {Array.from({ length: 6 }).map((_, i) => (
@@ -83,8 +154,17 @@ export function Strategies() {
         </>
       )}
 
-      <LaunchWizard open={launchKey !== null} onClose={() => setLaunchKey(null)} strategyKey={launchKey} />
-      <BacktestDialog open={backtestOpen} onClose={() => setBacktestOpen(false)} strategyKey={backtestKey} />
+      <LaunchWizard open={launchKey !== null} onClose={() => setLaunchKey(null)} strategyKey={launchKey} customId={customId} />
+      <BacktestDialog open={backtestOpen} onClose={() => setBacktestOpen(false)} strategyKey={backtestKey} customId={customId} />
+      <UploadStrategyDialog open={uploadOpen} onClose={() => setUploadOpen(false)} />
+      <ConfirmDialog
+        open={removing !== null}
+        onClose={() => setRemoving(null)}
+        onConfirm={() => removing && remove.mutate(removing)}
+        loading={remove.isPending}
+        title="Discard this uploaded strategy?"
+        description="In-memory storage is not durable — the payload is gone once it is removed. Bots already launched with it keep running with their own copy of the rules."
+      />
     </div>
   )
 }

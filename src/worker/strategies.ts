@@ -1,9 +1,14 @@
-import type { ParamValue, Strategy, Timeframe } from '../shared/types'
+import type { AccuracyStat, ParamValue, Strategy, Timeframe } from '../shared/types'
 import type { Bar } from './market'
 
 // Strategy templates. Each returns a signal for the current closed bar; the
 // engine and the backtester both decide position sizing, so the same function
 // runs in both paths and behaves identically.
+//
+// Beyond the built-in templates there is a rules DSL (CUSTOM_STRATEGY): an
+// uploaded strategy is a JSON object whose entry/exit rules reference
+// standard indicators. `parseRules` validates it, and the custom strategist
+// evaluates it against the same bars every template sees.
 
 export interface SignalContext {
   /** History ending with the current closed bar (at least `lookback` bars when available). */
@@ -261,7 +266,249 @@ export const STRATEGIES: StrategyDef[] = [
   },
 ]
 
-export const strategyBy = (key: string): StrategyDef | undefined => STRATEGIES.find((s) => s.key === key)
+export const strategyBy = (key: string): StrategyDef | undefined =>
+  STRATEGIES.find((s) => s.key === key) ?? (key === 'custom' ? CUSTOM_STRATEGY : undefined)
+
+// --- Custom (uploaded) strategies ------------------------------------------
+
+/** One testable condition, e.g. { metric: 'rsi', n: 14, op: '<', value: 30 }. */
+export interface CustomRule {
+  metric: 'rsi' | 'ema' | 'zscore' | 'donchianHigh' | 'donchianLow' | 'momentum'
+  /** Window for the metric (default per metric). */
+  n: number
+  /** ema only: second window for a fast/slow relationship. */
+  n2?: number
+  op: '>' | '<'
+  /** Threshold; unit depends on the metric (see metricHint). */
+  value: number
+}
+
+export interface CustomRules {
+  name: string
+  entry: CustomRule[]
+  entryLogic: 'all' | 'any'
+  exit: CustomRule[]
+  exitLogic: 'all' | 'any'
+  stopLossPct: number
+  takeProfitPct: number
+}
+
+const METRIC_BOUNDS: Record<CustomRule['metric'], { nMin: number; nMax: number; valueHint: string }> = {
+  rsi: { nMin: 2, nMax: 100, valueHint: 'RSI level, 0–100' },
+  ema: { nMin: 2, nMax: 200, valueHint: 'gap of close vs EMA(n), in percent (n2 for a fast/slow pair)' },
+  zscore: { nMin: 2, nMax: 200, valueHint: 'z-score of close vs rolling mean(n)' },
+  donchianHigh: { nMin: 2, nMax: 400, valueHint: 'distance of close above the highest high of the last n bars, in percent (negative = below)' },
+  donchianLow: { nMin: 2, nMax: 400, valueHint: 'distance of close below the lowest low of the last n bars, in percent (negative = above)' },
+  momentum: { nMin: 2, nMax: 400, valueHint: 'return over n bars, in percent' },
+}
+
+function metricValue(metric: CustomRule['metric'], bars: Bar[], rule: CustomRule): number | null {
+  const closes = bars.map((b) => b.c)
+  const last = closes.at(-1)
+  if (last === undefined) return null
+  const n = Math.max(2, Math.round(rule.n))
+  if (closes.length < n) return null
+  switch (metric) {
+    case 'rsi': {
+      let gain = 0
+      let loss = 0
+      for (let i = closes.length - n; i < closes.length; i++) {
+        const change = closes[i] - closes[i - 1]
+        if (change >= 0) gain += change
+        else loss -= change
+      }
+      if (gain + loss === 0) return 50
+      return (100 * gain) / (gain + loss)
+    }
+    case 'ema': {
+      const fast = ema(closes, n)
+      if (rule.n2) {
+        const slowN = Math.max(n + 1, Math.round(rule.n2))
+        if (closes.length < slowN) return null
+        const slow = ema(closes, slowN)
+        return ((fast - slow) / slow) * 100
+      }
+      return ((last - fast) / fast) * 100
+    }
+    case 'zscore': {
+      const window = closes.slice(-n)
+      const sd = stdev(window)
+      if (sd <= 0) return null
+      const mean = window.reduce((s, v) => s + v, 0) / window.length
+      return (last - mean) / sd
+    }
+    case 'donchianHigh':
+      return ((last - highest(bars, n)) / highest(bars, n)) * 100
+    case 'donchianLow':
+      return ((last - lowest(bars, n)) / lowest(bars, n)) * 100
+    case 'momentum': {
+      const prior = closes.at(-1 - n)
+      if (prior === undefined) return null
+      return ((last - prior) / prior) * 100
+    }
+  }
+}
+
+function rulePasses(rule: CustomRule, bars: Bar[]): boolean {
+  if (rule.op !== '>' && rule.op !== '<') return false
+  const value = metricValue(rule.metric, bars, rule)
+  if (value === null || !Number.isFinite(value)) return false
+  return rule.op === '>' ? value > rule.value : value < rule.value
+}
+
+function ruleGroupPasses(rules: CustomRule[] | undefined, logic: 'all' | 'any', bars: Bar[]): boolean {
+  if (!rules || rules.length === 0) return false
+  return logic === 'any' ? rules.some((rule) => rulePasses(rule, bars)) : rules.every((rule) => rulePasses(rule, bars))
+}
+
+/** The uploaded-strategy strategist: same SignalContext as every template.
+ * Rules ride into the context as a JSON string under params.rules. */
+export const CUSTOM_STRATEGY: StrategyDef = {
+  key: 'custom',
+  name: 'Custom Strategy',
+  summary: 'Uploaded rules — entry and exit conditions on standard indicators.',
+  description:
+    'Evaluates an uploaded rules DSL: entry rules (all/any) open a position, exit rules (all/any) or stop/target close it. Metrics: rsi, ema, zscore, donchian highs/lows and momentum, each with a window and a threshold.',
+  risk: 'medium',
+  tags: ['Custom', 'Uploaded'],
+  timeframes: ['1m', '5m', '15m', '1h', '4h', '1d'],
+  lookback: 400,
+  params: [],
+  signal(ctx) {
+    if (!ctx.bars.at(-1)) return { action: 'hold' }
+    const stop = stopExit(ctx, num(ctx.params.stopLossPct, 0))
+    if (stop) return stop
+    const gain = gainPct(ctx)
+    const target = num(ctx.params.takeProfitPct, 0)
+    if (gain !== null && target > 0 && gain >= target) return { action: 'sell', reason: `target hit at +${gain.toFixed(1)}%` }
+    let rules: CustomRules | null = null
+    try {
+      rules = typeof ctx.params.rules === 'string' ? (JSON.parse(ctx.params.rules) as CustomRules) : null
+    } catch {
+      rules = null
+    }
+    if (!rules) return { action: 'hold' }
+    if (ctx.position) {
+      return ruleGroupPasses(rules.exit, rules.exitLogic ?? 'all', ctx.bars)
+        ? { action: 'sell', reason: 'exit rule triggered' }
+        : { action: 'hold' }
+    }
+    return ruleGroupPasses(rules.entry, rules.entryLogic ?? 'all', ctx.bars)
+      ? { action: 'buy', reason: 'entry rule triggered' }
+      : { action: 'hold' }
+  },
+}
+
+export interface ParsedRules {
+  rules: CustomRules
+  /** Bars of history the rules need (largest n + 2, capped). */
+  lookback: number
+}
+
+/** Validate an uploaded rules payload. Throws with a human message on the
+ * first problem — the routes surface that to the upload dialog. */
+export function parseRules(raw: unknown): ParsedRules {
+  if (typeof raw !== 'object' || raw === null) throw new Error('Rules must be a JSON object.')
+  const input = raw as Record<string, unknown>
+  const name = String(input.name ?? '').trim().slice(0, 80)
+  if (!name) throw new Error('Rules need a "name".')
+
+  const parseOp = (value: unknown): '>' | '<' => {
+    if (value === '>' || value === '&gt;') return '>'
+    if (value === '<' || value === '&lt;') return '<'
+    throw new Error('Each rule needs op ">" or op "<".')
+  }
+  const parseRule = (value: unknown, where: string): CustomRule => {
+    if (typeof value !== 'object' || value === null) throw new Error(`${where} rules must be objects.`)
+    const rule = value as Record<string, unknown>
+    const metric = String(rule.metric ?? '') as CustomRule['metric']
+    if (!(metric in METRIC_BOUNDS)) {
+      throw new Error(`${where}: unknown metric "${metric}" — use one of ${Object.keys(METRIC_BOUNDS).join(', ')}.`)
+    }
+    const bounds = METRIC_BOUNDS[metric]
+    const n = Math.round(Number(rule.n ?? (metric === 'rsi' ? 14 : metric === 'ema' ? 20 : 20)))
+    if (!Number.isFinite(n) || n < bounds.nMin || n > bounds.nMax) {
+      throw new Error(`${where}: ${metric} window ${bounds.nMin}–${bounds.nMax} bars, got ${n}.`)
+    }
+    const parsed: CustomRule = { metric, n, op: parseOp(rule.op), value: Number(rule.value) }
+    if (!Number.isFinite(parsed.value)) throw new Error(`${where}: ${metric} needs a numeric value (${bounds.valueHint}).`)
+    if (metric === 'ema' && rule.n2 !== undefined) {
+      const n2 = Math.round(Number(rule.n2))
+      if (!Number.isFinite(n2) || n2 < bounds.nMin || n2 > bounds.nMax) throw new Error(`${where}: ema n2 window out of range.`)
+      parsed.n2 = n2
+    }
+    return parsed
+  }
+
+  const parseGroup = (value: unknown, where: string): CustomRule[] => {
+    if (value === undefined || value === null) return []
+    if (!Array.isArray(value)) throw new Error(`"${where}" must be an array of rules.`)
+    return value.map((rule) => parseRule(rule, where))
+  }
+
+  const entry = parseGroup(input.entry, 'entry')
+  if (entry.length === 0) throw new Error('At least one "entry" rule is required.')
+  const exit = parseGroup(input.exit, 'exit')
+  const entryLogic = input.entryLogic === 'any' ? 'any' : 'all'
+  const exitLogic = input.exitLogic === 'any' ? 'any' : 'all'
+  const stopLossPct = Math.max(0, Math.min(90, Number(input.stopLossPct) || 0))
+  const takeProfitPct = Math.max(0, Math.min(500, Number(input.takeProfitPct) || 0))
+
+  const windows = [...entry, ...exit].map((rule) => Math.max(rule.n, rule.n2 ?? rule.n))
+  const lookback = Math.min(400, Math.max(64, Math.max(...windows) + 2))
+
+  return { rules: { name, entry, entryLogic, exit, exitLogic, stopLossPct, takeProfitPct }, lookback }
+}
+
+/** Serialise validated rules to the params blob a bot or backtest stores. */
+export const rulesToParams = (rules: CustomRules, stopLossPct?: number, takeProfitPct?: number): Record<string, ParamValue> => ({
+  rules: JSON.stringify(rules),
+  stopLossPct: stopLossPct ?? rules.stopLossPct,
+  takeProfitPct: takeProfitPct ?? rules.takeProfitPct,
+})
+
+// --- Accuracy ------------------------------------------------------------
+
+/** How well a strategy's entry signals predict the very next bar. Walks the
+ * history once: at every bar with enough history, feed the same signal
+ * function a flat position — when it wants to buy, the strategy is
+ * "predicting up" for the following bar. Cheap enough to run per request. */
+export function measureAccuracy(strategyKey: string, params: Record<string, ParamValue>, bars: Bar[], tfMs: number): AccuracyStat {
+  const strategy = strategyBy(strategyKey)
+  const fallback = { sample: bars.length, entryBars: 0, correct: 0, directionalAccuracy: null, edgePct: null, signalReturnPct: null, rating: null }
+  if (!strategy || bars.length < 3) return fallback
+  let entryBars = 0
+  let correct = 0
+  let signalSumPct = 0
+  let marketSumPct = 0
+  let marketBars = 0
+  const start = Math.min(strategy.lookback, Math.floor(bars.length / 2))
+  for (let i = start; i < bars.length - 1; i++) {
+    const forwardPct = ((bars[i + 1].c - bars[i].c) / bars[i].c) * 100
+    marketSumPct += forwardPct
+    marketBars++
+    const slice = bars.slice(Math.max(0, i + 1 - strategy.lookback), i + 1)
+    const signal = strategy.signal({
+      bars: slice,
+      position: null,
+      cash: 1,
+      equity: 1,
+      params,
+      tfMs,
+    })
+    if (signal.action !== 'buy') continue
+    entryBars++
+    signalSumPct += forwardPct
+    if (forwardPct > 0) correct++
+  }
+  if (entryBars === 0) return { ...fallback, sample: marketBars, rating: null }
+  const directionalAccuracy = (correct / entryBars) * 100
+  const signalReturnPct = signalSumPct / entryBars
+  const marketMean = marketBars > 0 ? marketSumPct / marketBars : 0
+  const edgePct = signalReturnPct - marketMean
+  const rating: AccuracyStat['rating'] = entryBars < 8 ? 'thin-sample' : directionalAccuracy >= 54 ? 'edge' : directionalAccuracy >= 48 ? 'coin-flip' : 'anti'
+  return { sample: marketBars, entryBars, correct, directionalAccuracy, edgePct, signalReturnPct, rating }
+}
 
 /** Parameter defaults as a flat record, ready to store on a bot. */
 export function defaultParams(strategy: Strategy): Record<string, ParamValue> {

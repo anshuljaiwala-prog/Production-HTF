@@ -1,6 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import type {
+  AccuracyStat,
   Backtest,
   Bot,
   BotEvent,
@@ -8,6 +9,7 @@ import type {
   BotStatus,
   Candle,
   Connection,
+  CustomStrategySummary,
   Dashboard,
   EquityPoint,
   Me,
@@ -17,6 +19,7 @@ import type {
   SearchResults,
   SimBudget,
   Strategy,
+  SymbolMeta,
   Timeframe,
   Trade,
 } from '../../shared/types'
@@ -86,8 +89,52 @@ export const useDashboard = () =>
 export const useStrategies = () =>
   useQuery({
     queryKey: ['strategies'],
-    queryFn: () => api<{ strategies: Strategy[]; symbols: string[]; timeframes: { key: Timeframe; label: string }[] }>('/strategies'),
+    queryFn: () =>
+      api<{ strategies: Strategy[]; symbols: SymbolMeta[]; timeframes: { key: Timeframe; label: string }[] }>('/strategies'),
     staleTime: 60_000,
+  })
+
+export const useCustomStrategies = () =>
+  useQuery({
+    queryKey: ['custom-strategies'],
+    queryFn: () => api<{ items: CustomStrategySummary[] }>('/strategies/custom'),
+    staleTime: 15_000,
+  })
+
+/** Uploaded strategy detail (the validated rules payload as accepted). */
+export const useCustomStrategy = (id: string | undefined) =>
+  useQuery({
+    queryKey: ['custom-strategy', id],
+    queryFn: () =>
+      api<{ strategy: CustomStrategySummary; rules: Record<string, unknown>; durable: boolean }>(`/strategies/custom/${id}`),
+    enabled: Boolean(id),
+    staleTime: 60_000,
+  })
+
+/** Upload a rules JSON payload to the in-memory strategy store. */
+export const uploadCustomStrategy = (rules: unknown) =>
+  api<
+    { strategy: CustomStrategySummary; detail: Record<string, unknown>; durable: boolean }
+  >('/strategies/custom', { method: 'POST', json: { rules } })
+export const deleteCustomStrategy = (id: string) => api<{ ok: true }>(`/strategies/custom/${id}`, { method: 'DELETE' })
+
+export interface BotAccuracy {
+  botId: string
+  strategyKey: string
+  window: { bars: number; from: number; to: number; timeframe: Timeframe; symbol: string | null }
+  accuracy: AccuracyStat
+  live: { wins: number; roundTrips: number; hitRate: number | null }
+}
+
+/** How well this bot's strategy predicts the next bar (per request — wrapped
+ * in 2s-poll cadence alongside the run monitor). */
+export const useBotAccuracy = (botId: string | undefined) =>
+  useQuery({
+    queryKey: ['bot-accuracy', botId],
+    queryFn: () => api<BotAccuracy>(`/bots/${botId}/accuracy`),
+    enabled: Boolean(botId),
+    refetchInterval: 30_000,
+    placeholderData: (p) => p,
   })
 
 export const useBots = () =>
@@ -210,19 +257,46 @@ export interface LaunchInput {
   mode: 'paper' | 'live'
   connectionId?: string | null
   status?: BotStatus
+  /** Inline uploaded rules — the bot runs the `custom` strategist with them. */
+  rules?: unknown
 }
 
 export const launchBot = (input: LaunchInput) => api<{ bot: Bot }>('/bots', { method: 'POST', json: input })
 export const controlBot = (botId: string, action: 'start' | 'pause' | 'stop') =>
   api<{ bot: Bot }>(`/bots/${botId}/control`, { method: 'POST', json: { action } })
 
-/** Bulk bot config import (uploaded file). Good rows launch (paused); bad
- * rows come back with the reason so the dialog can show them. */
+/** Review the payload before importing: same validation, nothing created. */
+export interface ImportReviewRow {
+  label: string
+  problem: string | null
+}
+export interface ImportPreview {
+  ready: number
+  rows: ImportReviewRow[]
+}
+export const reviewImport = (items: Record<string, unknown>[]) =>
+  api<ImportPreview>('/bots/import?validate=1', { method: 'POST', json: { items } })
+
+/** Bulk bot config import (uploaded file or pasted JSON payload). Good rows
+ * launch (paused); bad rows come back with the reason so the dialog can show
+ * them. Rows may carry inline `rules` (custom strategy) and `connectionId`
+ * (which saved exchange API the bot routes through). */
 export interface BotImportResult {
   launched: Bot[]
   failed: { name: string; error: string }[]
 }
-export const importBots = (items: LaunchInput[]) => api<BotImportResult>('/bots/import', { method: 'POST', json: { items } })
+export const importBots = (items: LaunchInput[]) =>
+  api<BotImportResult>('/bots/import', { method: 'POST', json: { items } })
+
+/** Bulk exchange-API upload: create many connections from one pasted JSON
+ * payload. Each row is validated exactly like a single create; good rows are
+ * stored, bad rows come back with their reason for the preview table. */
+export interface ConnectionImportResult {
+  created: Connection[]
+  failed: { name: string; error: string }[]
+}
+export const uploadConnections = (items: { name: string; exchange: string; apiKey: string; apiSecret: string; mode: 'paper' | 'live' }[]) =>
+  api<ConnectionImportResult>('/connections/bulk', { method: 'POST', json: { items } })
 export const adjustFunding = (botId: string, input: { amount: number; note?: string }) =>
   api<{ bot: Bot }>(`/bots/${botId}/cashflow`, { method: 'POST', json: input })
 /** Operator edits. Trading settings (symbols, timeframe, risk, params,
@@ -250,6 +324,8 @@ export interface BacktestInput {
   capital: number
   days: number
   name?: string
+  /** Inline uploaded rules — run the `custom` strategist with them. */
+  rules?: unknown
 }
 
 export const runBacktest = async (input: BacktestInput) => {

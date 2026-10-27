@@ -3,6 +3,7 @@ import { Hono } from 'hono'
 import { privateJson } from '../auth'
 import { id, mapConnection, now } from '../db'
 import type { AppContext } from '../env'
+import type { Connection } from '../../shared/types'
 
 type Row = Record<string, unknown>
 
@@ -20,12 +21,14 @@ export function demoConnectionRows(): { name: string; exchange: string; apiKey: 
 }
 
 export async function insertConnection(db: D1Database, owner: string, spec: { name: string; exchange: string; apiKey: string; apiSecret: string; mode: string }) {
+  const connId = id()
   await db
     .prepare(
       `INSERT INTO connections (id, owner_sub, name, exchange, api_key, api_secret, mode, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
     )
-    .bind(id(), owner, spec.name, spec.exchange, spec.apiKey, spec.apiSecret, spec.mode, now())
+    .bind(connId, owner, spec.name, spec.exchange, spec.apiKey, spec.apiSecret, spec.mode, now())
     .run()
+  return db.prepare(`SELECT * FROM connections WHERE id = ?`).bind(connId).first<Row>()
 }
 
 connections.get('/', async (c) => {
@@ -56,6 +59,46 @@ connections.post('/demo', async (c) => {
   const added = demoConnectionRows().filter((demo) => !have.has(demo.name))
   for (const demo of added) await insertConnection(db, owner, demo)
   return privateJson(c, { added: added.length })
+})
+
+/** Bulk exchange-API upload: paste many credential sets at once. Every row
+ * is validated exactly like a single create — good rows are stored, bad rows
+ * come back with the reason so the caller can show a per-row preview. */
+const MAX_BULK_CONNECTIONS = 20
+
+connections.post('/bulk', async (c) => {
+  const db = c.get('db')
+  const owner = c.get('user').sub
+  const body = await c.req.json<{ items?: unknown }>()
+  const items = Array.isArray(body.items) ? (body.items as Record<string,unknown>[]).slice(0, MAX_BULK_CONNECTIONS) : []
+  if (items.length === 0) {
+    return c.json({ error: 'nothing_to_import', message: 'No connections found in the upload — expected an array under "items".' }, 400)
+  }
+
+  const created: Connection[] = []
+  const failed: { name: string; error: string }[] = []
+  for (const [index, raw] of items.entries()) {
+    const name = typeof raw?.name === 'string' ? raw.name.trim().slice(0, 60) : ''
+    const exchange = typeof raw?.exchange === 'string' && raw.exchange.trim() ? raw.exchange.trim().slice(0, 40) : EXCHANGES[1]
+    const apiKey = typeof raw?.apiKey === 'string' ? raw.apiKey.trim() : ''
+    const apiSecret = typeof raw?.apiSecret === 'string' ? raw.apiSecret.trim() : ''
+    if (!name || !apiKey || !apiSecret) {
+      failed.push({
+        name: name || exchange || `row ${index + 1}`,
+        error: !name ? 'Missing a name.' : 'Missing the API key or API secret.',
+      })
+      continue
+    }
+    const row = await insertConnection(db, owner, {
+      name,
+      exchange,
+      apiKey,
+      apiSecret,
+      mode: raw?.mode === 'live' ? 'live' : 'paper',
+    })
+    if (row) created.push(mapConnection(row))
+  }
+  return privateJson(c, { created, failed }, created.length > 0 ? 201 : 200)
 })
 
 connections.post('/', async (c) => {

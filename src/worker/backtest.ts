@@ -1,8 +1,8 @@
-import type { EquityPoint, ParamValue, RunMetrics, Timeframe, Trade } from '../shared/types'
+import type { AccuracyStat, EquityPoint, ParamValue, RunMetrics, Timeframe, Trade } from '../shared/types'
 import { PaperBroker } from './broker'
 import { id } from './db'
 import { TIMEFRAME_MS, barsBetween } from './market'
-import { strategyBy } from './strategies'
+import { measureAccuracy, strategyBy } from './strategies'
 
 // Deterministic backtest over the synthetic feed. It mirrors the live engine:
 // same signal function, same sizing rule, same fee and slippage model, so a
@@ -29,6 +29,8 @@ export interface BacktestInput {
 
 export interface BacktestResult {
   metrics: RunMetrics
+  /** Prediction accuracy of the strategy's entry rules over this window. */
+  accuracy: AccuracyStat
   curve: EquityPoint[]
   trades: Trade[]
   bars: number
@@ -157,6 +159,7 @@ export function runBacktest(input: BacktestInput): BacktestResult {
       trades: trades.length,
       finalEquity: equity,
     },
+    accuracy: measureAccuracy(input.strategyKey, input.params, bars, tfMs),
     curve,
     trades: trades.slice(-MAX_TRADES),
     bars: bars.length,

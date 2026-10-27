@@ -1,7 +1,7 @@
-import { Info, Plug, Plus, Trash2 } from 'lucide-react'
+import { Info, Plug, Plus, Trash2, Upload } from 'lucide-react'
 import { useState } from 'react'
 
-import { ConnectionForm } from '../components/forms'
+import { BulkConnectionsDialog, ConnectionForm } from '../components/forms'
 import { Badge, Button, Card, ConfirmDialog, EmptyState, PageHeader, Skeleton, useToast } from '../components/ui'
 import { addDemoConnections, deleteConnection, useApiMutation, useConnections } from '../lib/api'
 import { shortDate } from '../lib/format'
@@ -11,6 +11,7 @@ export function Connections() {
   const { data, isLoading } = useConnections()
   const toast = useToast()
   const [composing, setComposing] = useState(false)
+  const [bulkOpen, setBulkOpen] = useState(false)
   const [removing, setRemoving] = useState<Connection | null>(null)
 
   const remove = useApiMutation((connectionId: string) => deleteConnection(connectionId), ['connections'], {
@@ -36,6 +37,10 @@ export function Connections() {
             <Button loading={addDemo.isPending} onClick={() => addDemo.mutate(undefined)}>
               <Plus />
               Add demo connections
+            </Button>
+            <Button onClick={() => setBulkOpen(true)}>
+              <Upload />
+              Upload APIs (JSON)
             </Button>
             <Button variant="primary" onClick={() => setComposing(true)}>
               <Plus />
@@ -105,6 +110,7 @@ export function Connections() {
       </div>
 
       <ConnectionForm open={composing} onClose={() => setComposing(false)} />
+      <BulkConnectionsDialog open={bulkOpen} onClose={() => setBulkOpen(false)} />
       <ConfirmDialog
         open={removing !== null}
         onClose={() => setRemoving(null)}

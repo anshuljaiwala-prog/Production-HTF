@@ -5,7 +5,8 @@ import { backtestWindow, runBacktest } from '../backtest'
 import { id, mapBacktest, now } from '../db'
 import type { AppContext } from '../env'
 import { TIMEFRAME_MS, barsBetween } from '../market'
-import { sanitizeParams, strategyBy } from '../strategies'
+import type { CustomRules } from '../strategies'
+import { parseRules, rulesToParams, sanitizeParams, strategyBy } from '../strategies'
 import type { Backtest, Candle, SimBudget, Timeframe } from '../../shared/types'
 import { SIM_BUDGET } from '../../shared/types'
 
@@ -21,7 +22,8 @@ const DEFAULTS: Record<Timeframe, number> = { '1m': 3, '5m': 7, '15m': 14, '1h':
 /** List view drops the trade payload; the detail route returns it in full. */
 const withName = (backtest: Backtest): Backtest => ({
   ...backtest,
-  strategyName: strategyBy(backtest.strategyKey)?.name ?? backtest.strategyKey,
+  // Uploaded custom strategies already carry their rules name from mapBacktest.
+  strategyName: backtest.strategyKey === 'custom' ? backtest.strategyName : (strategyBy(backtest.strategyKey)?.name ?? backtest.strategyKey),
 })
 const summary = (backtest: Backtest): Backtest => ({ ...withName(backtest), trades: [] })
 
@@ -60,11 +62,13 @@ async function resolveBacktest(db: D1Database, row: Row): Promise<Row> {
       from: backtest.from,
       to: backtest.to,
     })
+    // Accuracy rides inside the metrics blob — no schema churn for it.
+    const metricsJson = JSON.stringify({ ...result.metrics, accuracy: result.accuracy })
     await db
       .prepare(`UPDATE backtests SET status = 'done', error = NULL, metrics = ?, curve = ?, trades = ? WHERE id = ?`)
-      .bind(JSON.stringify(result.metrics), JSON.stringify(result.curve), JSON.stringify(result.trades), backtest.id)
+      .bind(metricsJson, JSON.stringify(result.curve), JSON.stringify(result.trades), backtest.id)
       .run()
-    return { ...row, status: 'done', error: null, metrics: JSON.stringify(result.metrics), curve: JSON.stringify(result.curve), trades: JSON.stringify(result.trades) }
+    return { ...row, status: 'done', error: null, metrics: metricsJson, curve: JSON.stringify(result.curve), trades: JSON.stringify(result.trades) }
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Backtest failed.'
     await db
@@ -162,10 +166,26 @@ backtests.post('/', async (c) => {
     from?: number
     to?: number
     name?: string
+    /** Upload a rules payload inline, pointing the run at the `custom`
+     * strategist with these rules instead of a catalog template. */
+    rules?: unknown
   }>()
 
   const strategy = strategyBy(String(body.strategyKey ?? ''))
   if (!strategy) return c.json({ error: 'unknown_strategy', message: 'Pick a strategy from the catalog.' }, 400)
+
+  // Inline rules (uploaded strategy) route through the `custom` strategist.
+  let rulesRules: CustomRules | null = null
+  let displayName = strategy.name
+  if (body.rules !== undefined) {
+    try {
+      rulesRules = parseRules(body.rules).rules
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Invalid rules.'
+      return c.json({ error: 'invalid_rules', message }, 400)
+    }
+    displayName = rulesRules.name
+  }
 
   const timeframe = (body.timeframe ?? strategy.timeframes[Math.floor(strategy.timeframes.length / 2)]) as Timeframe
   if (!strategy.timeframes.includes(timeframe)) {
@@ -195,8 +215,11 @@ backtests.post('/', async (c) => {
 
   const backtestId = id()
   const createdAt = now()
-  const params = sanitizeParams(strategy.key, body.params)
-  const name = (body.name?.trim() || `${strategy.name} · ${symbol}`).slice(0, 90)
+  // Custom rules become their own params blob; catalog strategies sanitize
+  // against their declared schema as before.
+  const params = rulesRules ? rulesToParams(rulesRules) : sanitizeParams(strategy.key, body.params)
+  const strategyKey = rulesRules ? 'custom' : strategy.key
+  const name = (body.name?.trim() || `${displayName} · ${symbol}`).slice(0, 90)
 
   await db
     .prepare(
@@ -207,7 +230,7 @@ backtests.post('/', async (c) => {
       backtestId,
       owner,
       name,
-      strategy.key,
+      strategyKey,
       symbol,
       timeframe,
       JSON.stringify(params),
@@ -219,7 +242,7 @@ backtests.post('/', async (c) => {
     .run()
 
   const row = await db.prepare(`SELECT * FROM backtests WHERE id = ?`).bind(backtestId).first<Row>()
-  return privateJson(c, { backtest: row ? withName(mapBacktest(row)) : null }, 201)
+  return privateJson(c, { backtest: row ? withName({ ...mapBacktest(row), strategyName: displayName }) : null }, 201)
 })
 
 backtests.delete('/:id', async (c) => {

@@ -4,9 +4,9 @@ import { privateJson } from '../auth'
 import { BOT_SELECT, id, mapBot, mapEvent, mapPosition, mapTrade, now } from '../db'
 import type { AppContext } from '../env'
 import { advanceBot } from '../engine'
-import { quote } from '../market'
-import { STRATEGIES, sanitizeParams, strategyBy } from '../strategies'
-import type { Bot, BotStage, BotStatus, Timeframe } from '../../shared/types'
+import { TIMEFRAME_MS, barsBetween, quote } from '../market'
+import { STRATEGIES, measureAccuracy, parseRules, rulesToParams, sanitizeParams, strategyBy } from '../strategies'
+import type { Bot, BotStage, BotStatus, ParamValue, Timeframe } from '../../shared/types'
 
 type Row = Record<string, unknown>
 
@@ -17,6 +17,15 @@ const MAX_ADVANCE_PER_REQUEST = 12
 const MAX_SYMBOLS = 6
 
 function withStrategy(bot: Bot): Bot {
+  // Uploaded (custom) strategies report their rules name, not the generic one.
+  if (bot.strategyKey === 'custom' && typeof bot.params.rules === 'string') {
+    try {
+      const parsed = JSON.parse(bot.params.rules) as { name?: string }
+      if (parsed?.name) return { ...bot, strategyName: parsed.name }
+    } catch {
+      /* fall through */
+    }
+  }
   return { ...bot, strategyName: strategyBy(bot.strategyKey)?.name ?? bot.strategyKey }
 }
 
@@ -63,15 +72,51 @@ interface CreateBody {
   capital?: number
   riskPct?: number
   mode?: 'paper' | 'live'
+  /** Exchange-API binding: bots route through a saved connection. */
   connectionId?: string | null
+  /** Inline uploaded strategy: validated rules routed through `custom`. */
+  rules?: unknown
   stage?: BotStage
   status?: BotStatus
 }
 
-/** One bot creation, shared by single launch and bulk import: validates and
- * inserts, returning either the bot or a rejection reason. */
-async function createBot(db: D1Database, owner: string, body: CreateBody): Promise<{ bot?: Bot; error?: string; message?: string }> {
-  const strategy = strategyBy(String(body.strategyKey ?? ''))
+interface ValidatedSpec {
+  strategyKey: string
+  strategyName: string
+  symbols: string[]
+  timeframe: Timeframe
+  params: Record<string, ParamValue> | null
+  capital: number
+  riskPct: number
+  mode: 'paper' | 'live'
+  connectionId: string | null
+  status: BotStatus
+  stage: BotStage
+  name: string
+}
+
+/** Everything createBot needs as already-validated typed values — or the
+ * reason the spec was rejected. Shared by single launch, bulk import, and
+ * the import review (dry-run) mode. */
+async function validateSpec(db: D1Database, owner: string, body: CreateBody): Promise<ValidatedSpec | { error: string; message: string }> {
+  // Inline rules create a custom-strategy bot; the rules payload is
+  // validated the same way the standalone upload path validates it.
+  let isCustom = false
+  let rulesForParams: Record<string, ParamValue> | null = null
+  let displayName = body.strategyKey ? (strategyBy(String(body.strategyKey))?.name ?? String(body.strategyKey)) : ''
+  if (body.rules !== undefined) {
+    try {
+      const parsed = parseRules(body.rules)
+      isCustom = true
+      rulesForParams = rulesToParams(parsed.rules)
+      displayName = parsed.rules.name
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Invalid rules.'
+      return { error: 'invalid_rules', message }
+    }
+  }
+
+  const strategy = strategyBy(isCustom ? 'custom' : String(body.strategyKey ?? ''))
   if (!strategy) return { error: 'unknown_strategy', message: 'Pick a strategy from the catalog.' }
 
   const symbols = [...new Set((body.symbols ?? []).map((s) => String(s).trim().toUpperCase()).filter(Boolean))].slice(
@@ -106,7 +151,30 @@ async function createBot(db: D1Database, owner: string, body: CreateBody): Promi
 
   const status: BotStatus = body.status === 'stopped' || body.status === 'paused' ? body.status : 'running'
   const stage: BotStage = body.stage ?? (status === 'running' ? (mode === 'live' ? 'live' : 'paper') : 'draft')
-  const name = (body.name?.trim() || `${strategy.name} · ${symbols.join(' / ')}`).slice(0, 90)
+  const name = (body.name?.trim() || `${displayName || strategy.name} · ${symbols.join(' / ')}`).slice(0, 90)
+
+  return {
+    strategyKey: strategy.key,
+    strategyName: displayName || strategy.name,
+    symbols,
+    timeframe,
+    params: isCustom ? rulesForParams : sanitizeParams(strategy.key, body.params),
+    capital,
+    riskPct,
+    mode,
+    connectionId,
+    status,
+    stage,
+    name,
+  }
+}
+
+/** One bot creation, shared by single launch and bulk import: validates and
+ * inserts, returning either the bot or a rejection reason. */
+async function createBot(db: D1Database, owner: string, body: CreateBody): Promise<{ bot?: Bot; error?: string; message?: string }> {
+  const spec = await validateSpec(db, owner, body)
+  if ('error' in spec) return spec
+
   const t = now()
   const botId = id()
 
@@ -119,22 +187,22 @@ async function createBot(db: D1Database, owner: string, body: CreateBody): Promi
     .bind(
       botId,
       owner,
-      name,
-      strategy.key,
-      JSON.stringify(symbols),
-      timeframe,
-      JSON.stringify(sanitizeParams(strategy.key, body.params)),
-      capital,
-      riskPct,
-      mode,
-      stage,
-      status,
-      connectionId,
-      capital,
-      capital,
-      capital,
+      spec.name,
+      spec.strategyKey,
+      JSON.stringify(spec.symbols),
+      spec.timeframe,
+      JSON.stringify(spec.params ?? {}),
+      spec.capital,
+      spec.riskPct,
+      spec.mode,
+      spec.stage,
+      spec.status,
+      spec.connectionId,
+      spec.capital,
+      spec.capital,
+      spec.capital,
       t,
-      status === 'running' ? t : null,
+      spec.status === 'running' ? t : null,
       t,
       t,
     )
@@ -145,7 +213,7 @@ async function createBot(db: D1Database, owner: string, body: CreateBody): Promi
     owner,
     botId,
     'info',
-    `Launched in ${mode} mode with ${capital.toLocaleString('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 })} on ${symbols.join(', ')} (${timeframe}).`,
+    `Launched in ${spec.mode} mode with ${spec.capital.toLocaleString('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 })} on ${spec.symbols.join(', ')} (${spec.timeframe}).`,
   )
 
   const bot = await loadBot(db, owner, botId)
@@ -161,18 +229,35 @@ bots.post('/', async (c) => {
   return privateJson(c, { bot: withStrategy(result.bot!) }, 201)
 })
 
-/** Bulk bot config import: an uploaded file becomes many paper bots at once.
- * Everything is validated per row — good configs launch, bad ones report why.
- * Imported bots start paused so the operator can review before running. */
+/** Bulk bot config import — the direct JSON-payload upload path. Accepts
+ * `{ items: [...] }` (or `{ bots: [...] }`) where each row may carry inline
+ * `rules` (uploaded strategy) and a `connectionId` (which API the bot routes
+ * through). With `?validate=1` nothing is created: every row is checked
+ * exactly as a real import would be, and the reasons come back for a
+ * preview before the operator commits. */
 const MAX_IMPORT = 25
 
 bots.post('/import', async (c) => {
   const db = c.get('db')
   const owner = c.get('user').sub
-  const body = await c.req.json<{ items?: CreateBody[] }>()
-  const items = Array.isArray(body.items) ? body.items.slice(0, MAX_IMPORT) : []
+  const validateOnly = c.req.query('validate') === '1'
+  const body = await c.req.json<{ items?: CreateBody[]; bots?: CreateBody[] }>()
+  const rawItems = Array.isArray(body.items) ? body.items : Array.isArray(body.bots) ? body.bots : []
+  const items = rawItems.slice(0, MAX_IMPORT)
   if (items.length === 0) {
     return c.json({ error: 'nothing_to_import', message: 'No bot configs found in the upload — expected an array under "items".' }, 400)
+  }
+
+  const ready: ValidateRowResult[] = []
+  for (const [index, item] of items.entries()) {
+    const label = item.name?.trim() || item.symbols?.filter(Boolean).join(', ') || `Import ${index + 1}`
+    const spec = await validateSpec(db, owner, { ...item, status: 'paused' })
+    if ('error' in spec) ready.push({ label, problem: spec.message })
+    else ready.push({ label, problem: null })
+  }
+
+  if (validateOnly) {
+    return privateJson(c, { ready: ready.filter((r) => r.problem === null).length, rows: ready })
   }
 
   const launched: Bot[] = []
@@ -186,6 +271,44 @@ bots.post('/import', async (c) => {
   return privateJson(c, { launched, failed })
 })
 
+interface ValidateRowResult {
+  label: string
+  problem: string | null
+}
+
+const ACCURACY_WINDOW_BARS = 900
+
+/** Prediction accuracy for one bot: how well its strategy's entry rules
+ * forecast the next bar over a bounded recent window of the feed, plus the
+ * realised hit rate of its actual round trips alongside it. Analytic and
+ * deterministic — the same config always scores the same on the same clock. */
+bots.get('/:id/accuracy', async (c) => {
+  const db = c.get('db')
+  const owner = c.get('user').sub
+  const botId = c.req.param('id')
+  const bot = await loadBot(db, owner, botId)
+  if (!bot) return c.json({ error: 'not_found', message: 'Bot not found.' }, 404)
+
+  const tfMs = TIMEFRAME_MS[bot.timeframe]
+  const to = now()
+  const bars = barsBetween(bot.symbols[0] ?? 'BTC-USD', bot.timeframe, to - ACCURACY_WINDOW_BARS * tfMs, to + tfMs)
+  const accuracy = measureAccuracy(bot.strategyKey, bot.params, bars, tfMs)
+  return privateJson(c, {
+    botId,
+    strategyKey: bot.strategyKey,
+    window: { bars: bars.length, from: bars[0]?.t ?? 0, to, timeframe: bot.timeframe, symbol: bot.symbols[0] ?? null },
+    accuracy,
+    live: {
+      wins: bot.wins,
+      roundTrips: bot.roundTrips,
+      hitRate: bot.roundTrips > 0 ? (bot.wins / bot.roundTrips) * 100 : null,
+    },
+  })
+})
+
+/** Full run detail for one bot: positions marked live, trade log, events
+ * and the stored equity curve (extended by one provisional "now" point
+ * while running). */
 bots.get('/:id', async (c) => {
   const db = c.get('db')
   const owner = c.get('user').sub
@@ -274,7 +397,8 @@ bots.patch('/:id', async (c) => {
   if (symbols.length === 0) return c.json({ error: 'invalid_symbols', message: 'Keep at least one symbol.' }, 400)
   const timeframe = body.timeframe !== undefined && strategy?.timeframes.includes(body.timeframe) ? body.timeframe : bot.timeframe
   const riskPct = Number.isFinite(Number(body.riskPct)) && body.riskPct !== undefined ? Math.min(100, Math.max(1, Number(body.riskPct))) : bot.riskPct
-  const params = body.params !== undefined ? sanitizeParams(bot.strategyKey, body.params) : bot.params
+  // Custom bots keep their rules blob — the editor sends no schema params.
+  const params = body.params !== undefined && bot.strategyKey !== 'custom' ? sanitizeParams(bot.strategyKey, body.params) : bot.params
   const connectionId = body.connectionId !== undefined ? (body.connectionId === null ? null : String(body.connectionId)) : bot.connectionId
 
   await db

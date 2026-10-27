@@ -41,6 +41,58 @@ export function activityOf(bot: Pick<Bot, 'status' | 'openPositions'>): BotActiv
 
 export type ParamValue = number | string | boolean
 
+/** Asset classes the simulated market covers. Options are modelled as
+ * constant-maturity synthetic derivatives over an underlying; everything
+ * else is a plain instrument with its own synthetic price path. */
+export type AssetKind = 'crypto' | 'equity' | 'etf' | 'fund' | 'commodity' | 'option'
+
+export const ASSET_CLASSES: { key: AssetKind; label: string; hint: string }[] = [
+  { key: 'crypto', label: 'Crypto', hint: '24/7 spot pairs' },
+  { key: 'equity', label: 'Stocks', hint: 'single-name equities' },
+  { key: 'etf', label: 'ETFs', hint: 'exchange-traded funds' },
+  { key: 'fund', label: 'Mutual funds', hint: 'once-daily NAV-like funds' },
+  { key: 'commodity', label: 'Commodities', hint: 'metals, energy' },
+  { key: 'option', label: 'Options', hint: 'calls & puts on the same synthetic feed' },
+]
+
+export interface SymbolMeta {
+  symbol: string
+  kind: AssetKind
+  /** For options: the instrument it derives from. */
+  underlying?: string
+  label?: string
+}
+
+/** Accuracy of a strategy's directional predictions over a bar window:
+ * at every entry-signal bar, did the next bar close in the sign the
+ * strategy put money on, and by how much was such a bar better than the
+ * unconditional average bar? */
+export interface AccuracyStat {
+  /** Bars evaluated (bars with full history for the signal). */
+  sample: number
+  /** Bars where the strategy fired an entry signal. */
+  entryBars: number
+  /** Entry-signal bars whose next bar closed in the predicted direction. */
+  correct: number
+  /** `correct / entryBars` in percent — the raw prediction accuracy. */
+  directionalAccuracy: number | null
+  /** Mean next-bar return on signal bars minus the unconditional mean, in
+   * percent of price. Positive means the signals land on above-average
+   * moves, not merely directionally correct ones. */
+  edgePct: number | null
+  /** Mean next-bar return on signal bars, in percent. */
+  signalReturnPct: number | null
+  rating: 'edge' | 'coin-flip' | 'anti' | 'thin-sample' | null}
+
+export interface CustomStrategySummary {
+  id: string
+  name: string
+  lookback: number
+  createdAt: number
+  /** Rule count across entry and exit lists — a rough size hint. */
+  rules: number
+}
+
 /** Drives both the launch wizard and the backtest form from one definition. */
 export interface ParamDef {
   key: string
@@ -189,6 +241,9 @@ export interface Backtest {
   status: 'running' | 'done' | 'failed'
   error: string | null
   metrics: RunMetrics | null
+  /** How well the strategy's entry signals predicted the next bar, over the
+   * exact window the run replayed. Present on completed runs. */
+  accuracy: AccuracyStat | null
   curve: EquityPoint[]
   trades: Trade[]
   createdAt: number
