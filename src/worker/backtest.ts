@@ -1,7 +1,7 @@
 import type { AccuracyStat, EquityPoint, ParamValue, RunMetrics, Timeframe, Trade } from '../shared/types'
 import { PaperBroker } from './broker'
 import { id } from './db'
-import { TIMEFRAME_MS, barsBetween } from './market'
+import { TIMEFRAME_MS, barsBetween, historyStart } from './market'
 import { measureAccuracy, strategyBy } from './strategies'
 
 // Deterministic backtest over the synthetic feed. It mirrors the live engine:
@@ -37,13 +37,15 @@ export interface BacktestResult {
 }
 
 /** The exact bar window a run replayed: `to` floored to the bar grid and
- * `from` capped so the run stays within MAX_BARS bars. Shared with the
+ * `from` capped so the run stays within MAX_BARS bars — and never earlier
+ * than the platform's stored-history window (five years), so a replay only
+ * ever consumes data the market API would serve. Shared with the
  * market-data route so charts show precisely the bars that were traded. */
 export function backtestWindow(timeframe: Timeframe, from: number, to: number): { from: number; to: number } {
   const tfMs = TIMEFRAME_MS[timeframe]
   const toFloored = Math.floor(to / tfMs) * tfMs
   return {
-    from: Math.max(Math.floor(from / tfMs) * tfMs, toFloored - MAX_BARS * tfMs),
+    from: Math.max(Math.floor(from / tfMs) * tfMs, toFloored - MAX_BARS * tfMs, historyStart(toFloored)),
     to: toFloored,
   }
 }

@@ -12,18 +12,19 @@ import { Portfolio } from './pages/Portfolio'
 import { Settings } from './pages/Settings'
 import { SetupNeeded, SignIn } from './pages/SignIn'
 import { Strategies } from './pages/Strategies'
+import { Training } from './pages/Training'
 
 const client = new QueryClient({
   defaultOptions: { queries: { retry: 1, refetchOnWindowFocus: false, staleTime: 15_000 } },
 })
 
-/** Backtests now live as a tab on /strategies — forward old links with
+/** Backtests now live on the Training page — forward old links with
  * their drawer id intact. */
 function BacktestsRedirect() {
   const location = useLocation()
   const params = new URLSearchParams(location.search)
   params.set('tab', 'backtests')
-  return <Navigate to={`/strategies?${params.toString()}`} replace />
+  return <Navigate to={`/training?${params.toString()}`} replace />
 }
 
 function Gate() {
@@ -48,6 +49,7 @@ function Gate() {
         <Route path="bots/:id" element={<BotDetail />} />
         <Route path="board" element={<Navigate to="/bots?tab=board" replace />} />
         <Route path="strategies" element={<Strategies />} />
+        <Route path="training" element={<Training />} />
         <Route path="backtests" element={<BacktestsRedirect />} />
         <Route path="connections" element={<Connections />} />
         <Route path="portfolio" element={<Portfolio />} />

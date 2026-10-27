@@ -1,6 +1,6 @@
 import { Upload } from 'lucide-react'
 import { useEffect, useRef, useState, type FormEvent } from 'react'
-import { useNavigate } from 'react-router'
+import { useLocation, useNavigate } from 'react-router'
 
 import { ASSET_CLASSES, TIMEFRAMES, type CustomStrategySummary, type ParamDef, type ParamValue, type Strategy, type SymbolMeta, type Timeframe } from '../../shared/types'
 import { createConnection, importBots, launchBot, runBacktest, uploadConnections, uploadCustomStrategy, useApiMutation, useBacktests, useBots, useConnections, useCustomStrategy, useCustomStrategies, useStrategies, type BacktestInput, type LaunchInput } from '../lib/api'
@@ -319,6 +319,7 @@ export function BacktestDialog({
 }) {
   const toast = useToast()
   const navigate = useNavigate()
+  const location = useLocation()
   const { data: catalog } = useStrategies()
   const { data: botList } = useBots()
   const { data: backtestList } = useBacktests()
@@ -332,11 +333,33 @@ export function BacktestDialog({
   // the preselected key, then the chosen bot's stored strategy.
   const customEntry = activeKey.startsWith('custom:') ? activeKey.slice('custom:'.length) : null
   const custom = useCustomStrategy(customEntry ?? undefined)
+  // A picked bot running uploaded rules carries its own copy of the rules
+  // blob — replay those verbatim, so imported / custom bots backtest as-is.
+  let botRules: Record<string, unknown> | null = null
+  if (bot && bot.strategyKey === 'custom' && typeof bot.params.rules === 'string') {
+    try {
+      const parsed = JSON.parse(bot.params.rules) as Record<string, unknown>
+      if (parsed && typeof parsed === 'object') botRules = parsed
+    } catch {
+      /* rules blob unreadable — fall through to the catalog lookup */
+    }
+  }
   const strategy = customEntry
     ? custom?.data
       ? customStrategyView(customEntry, custom.data)
       : null
-    : catalog?.strategies.find((s) => s.key === activeKey)
+    : botRules
+      ? customStrategyView('from-bot', {
+          strategy: {
+            id: 'from-bot',
+            name: typeof botRules.name === 'string' ? botRules.name : `${bot?.name ?? 'Bot'} rules`,
+            lookback: Number((botRules.entry as { n?: number }[] | undefined)?.[0]?.n ?? 64) || 64,
+            createdAt: 0,
+            rules: (Array.isArray(botRules.entry) ? botRules.entry.length : 0) + (Array.isArray(botRules.exit) ? botRules.exit.length : 0),
+          },
+          rules: botRules,
+        })
+      : catalog?.strategies.find((s) => s.key === activeKey)
   const catalogKey = catalog && !customEntry ? `${activeKey}:${catalog.symbols.map((s) => s.symbol).join(',')}` : ''
 
   useEffect(() => {
@@ -356,11 +379,12 @@ export function BacktestDialog({
   useEffect(() => {
     if (!open || !strategy) return
     const bot = botList?.items.find((b) => b.id === botId)
+    const botMatches = Boolean(bot && (bot.strategyKey === strategy.key || (bot.strategyKey === 'custom' && strategy.key.startsWith('custom:'))))
     const tf =
-      bot && bot.strategyKey === strategy.key && strategy.timeframes.includes(bot.timeframe)
+      bot && botMatches && strategy.timeframes.includes(bot.timeframe)
         ? bot.timeframe
         : strategy.timeframes[Math.floor(strategy.timeframes.length / 2)]
-    if (bot && bot.strategyKey === strategy.key) {
+    if (bot && botMatches) {
       setParams({ ...paramDefaults(strategy), ...bot.params })
       setSymbol(bot.symbols[0] ?? catalog?.symbols[0]?.symbol ?? '')
       setCapital(String(bot.capital))
@@ -381,7 +405,9 @@ export function BacktestDialog({
     onSuccess: (result) => {
       toast('Backtest complete')
       onClose()
-      navigate(`/strategies?tab=backtests&id=${result.backtest.id}`)
+      // Land on the Backtests tab of whichever page launched the run.
+      const home = location.pathname.startsWith('/training') ? '/training' : '/strategies'
+      navigate(`${home}?tab=backtests&id=${result.backtest.id}`)
     },
   })
 
@@ -390,14 +416,15 @@ export function BacktestDialog({
   function submit(e: FormEvent) {
     e.preventDefault()
     if (!strategy) return
+    const rules = customEntry ? custom?.data?.rules : botRules ?? undefined
     run.mutate({
-      strategyKey: customEntry ? 'custom' : strategy.key,
+      strategyKey: rules ? 'custom' : strategy.key,
       symbol,
       timeframe,
       capital: Number(capital),
       days,
       params,
-      ...(customEntry ? { rules: custom?.data?.rules } : {}),
+      ...(rules ? { rules } : {}),
     })
   }
 
@@ -482,7 +509,7 @@ export function BacktestDialog({
               <FieldInput type="number" min={100} step={100} className="pl-7" value={capital} onChange={(e) => setCapital(e.target.value)} />
             </span>
           </Field>
-          <Field label="Period">
+          <Field label="Period" hint="Replays the platform's stored history — the last 5 years per market.">
             <FieldSelect value={String(days)} onChange={(e) => setDays(Number(e.target.value))}>
               {PERIODS.map((period) => (
                 <option key={period.days} value={period.days}>

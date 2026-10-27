@@ -16,6 +16,7 @@ import type {
   ParamValue,
   Portfolio,
   Position,
+  RunMetrics,
   SearchResults,
   SimBudget,
   Strategy,
@@ -262,7 +263,10 @@ export interface LaunchInput {
 }
 
 export const launchBot = (input: LaunchInput) => api<{ bot: Bot }>('/bots', { method: 'POST', json: input })
-export const controlBot = (botId: string, action: 'start' | 'pause' | 'stop') =>
+/** Ground = stop with operator vocabulary (holds its book, opens nothing);
+ * resume = start again. */
+export type BotControl = 'start' | 'pause' | 'stop' | 'ground' | 'resume'
+export const controlBot = (botId: string, action: BotControl) =>
   api<{ bot: Bot }>(`/bots/${botId}/control`, { method: 'POST', json: { action } })
 
 /** Review the payload before importing: same validation, nothing created. */
@@ -336,6 +340,78 @@ export const runBacktest = async (input: BacktestInput) => {
   })
 }
 export const deleteBacktest = (backtestId: string) => api<{ ok: true }>(`/backtests/${backtestId}`, { method: 'DELETE' })
+
+// --- Training (grid search over stored history) -----------------------------
+
+/** One parameter knob to sweep: from → to across `steps` values. */
+export interface OptimizeKnob {
+  key: string
+  from: number
+  to: number
+  steps: number
+}
+
+export interface OptimizeRunRow {
+  params: Record<string, ParamValue>
+  train: RunMetrics
+  test: RunMetrics | null
+  error: string | null
+}
+
+export interface OptimizeInput {
+  strategyKey?: string
+  /** Train an existing bot's config instead of composing one. */
+  botId?: string
+  symbol?: string
+  timeframe?: Timeframe
+  capital?: number
+  params?: Record<string, ParamValue>
+  days?: number
+  objective?: 'return' | 'sharpe'
+  vary: OptimizeKnob[]
+}
+
+export interface OptimizeResult {
+  source: {
+    strategyKey: string
+    strategyName: string
+    symbol: string
+    timeframe: Timeframe
+    capital: number
+    days: number
+    from: number
+    to: number
+    split: number
+    label: string
+  }
+  objective: 'return' | 'sharpe'
+  history: { years: number; from: number }
+  runs: OptimizeRunRow[]
+  bestIndex: number
+  best: { curve: EquityPoint[]; accuracy: AccuracyStat; metrics: RunMetrics } | null
+  knobs: { key: string; label: string; unit: string | null; values: number[] }[]
+}
+
+/** Sweep a parameter grid over the stored five-year history. Training runs
+ * are in-memory: they never allocate the simulation pot and persist nothing. */
+export const optimizeTraining = (input: OptimizeInput) => api<OptimizeResult>('/backtests/optimize', { method: 'POST', json: input })
+
+/** The platform's stored historical candles, bounded to the retention window. */
+export interface MarketHistory {
+  symbol: string
+  timeframe: Timeframe
+  from: number
+  to: number
+  bars: number
+  history: { years: number; from: number; to: number }
+  candles: Candle[]
+}
+export const fetchMarketHistory = (symbol: string, timeframe: Timeframe, days = 90) => {
+  const to = Date.now()
+  return api<MarketHistory>(
+    `/market/history?symbol=${encodeURIComponent(symbol)}&timeframe=${timeframe}&from=${to - days * 86_400_000}&to=${to}`,
+  )
+}
 
 export const createConnection = (input: { name: string; exchange: string; apiKey: string; apiSecret: string; mode: 'paper' | 'live' }) =>
   api<{ connection: Connection }>('/connections', { method: 'POST', json: input })

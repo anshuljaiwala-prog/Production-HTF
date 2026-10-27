@@ -45,14 +45,27 @@ const UNIVERSE: Record<string, SymbolSpec> = {
   'BTC-USD': { kind: 'crypto', base: 64_200, vol: 0.11, drift: 0.0009, decimals: 1 },
   'ETH-USD': { kind: 'crypto', base: 3_140, vol: 0.13, drift: 0.0006, decimals: 2 },
   'SOL-USD': { kind: 'crypto', base: 148, vol: 0.17, drift: 0.0011, decimals: 2 },
-  // Single-name equities
+  // US single-name equities
   NVDA: { kind: 'equity', base: 128, vol: 0.1, drift: 0.0013, decimals: 2 },
   AAPL: { kind: 'equity', base: 232, vol: 0.06, drift: 0.0005, decimals: 2 },
   TSLA: { kind: 'equity', base: 268, vol: 0.12, drift: 0.0007, decimals: 2 },
+  // Foreign single-name equities (multi-nation listings / ADRs)
+  TM: { kind: 'equity', base: 196, vol: 0.07, drift: 0.0004, decimals: 2 },
+  SAP: { kind: 'equity', base: 228, vol: 0.075, drift: 0.0006, decimals: 2 },
+  TSM: { kind: 'equity', base: 186, vol: 0.095, drift: 0.0008, decimals: 2 },
+  ASML: { kind: 'equity', base: 712, vol: 0.1, drift: 0.0007, decimals: 2 },
+  HSBC: { kind: 'equity', base: 47.2, vol: 0.06, drift: 0.0003, decimals: 2 },
+  BABA: { kind: 'equity', base: 86.4, vol: 0.13, drift: 0.0002, decimals: 2 },
+  INFY: { kind: 'equity', base: 19.1, vol: 0.08, drift: 0.0005, decimals: 2 },
+  NESN: { kind: 'equity', base: 92.6, vol: 0.05, drift: 0.0003, decimals: 2 },
   // Index ETFs
   SPY: { kind: 'etf', base: 583, vol: 0.045, drift: 0.0004, decimals: 2 },
   QQQ: { kind: 'etf', base: 505, vol: 0.055, drift: 0.0005, decimals: 2 },
   VTI: { kind: 'etf', base: 268, vol: 0.042, drift: 0.0004, decimals: 2 },
+  // Foreign-market ETFs (developed ex-US, emerging, single nations)
+  EFA: { kind: 'etf', base: 79.8, vol: 0.05, drift: 0.0003, decimals: 2 },
+  EWJ: { kind: 'etf', base: 70.4, vol: 0.055, drift: 0.0003, decimals: 2 },
+  EWZ: { kind: 'etf', base: 34.6, vol: 0.085, drift: 0.0004, decimals: 2 },
   // Mutual funds: calm, NAV-like series
   FXAIX: { kind: 'fund', base: 198, vol: 0.038, drift: 0.0004, decimals: 2 },
   VWELX: { kind: 'fund', base: 48.6, vol: 0.031, drift: 0.00035, decimals: 2 },
@@ -61,6 +74,40 @@ const UNIVERSE: Record<string, SymbolSpec> = {
   'XAG-USD': { kind: 'commodity', base: 31.5, vol: 0.09, drift: 0.0004, decimals: 3 },
   WTI: { kind: 'commodity', base: 71.4, vol: 0.1, drift: 0.0002, decimals: 2 },
   NGAS: { kind: 'commodity', base: 3.2, vol: 0.14, drift: 0.0001, decimals: 3 },
+  // Multi-nation forex: majors, a commodity dollar and two emerging markets.
+  // Quotes follow the platform convention BASE-QUOTE (EUR-USD = 1 USD per EUR).
+  'EUR-USD': { kind: 'fx', base: 1.092, vol: 0.045, drift: 0.00008, decimals: 4 },
+  'GBP-USD': { kind: 'fx', base: 1.284, vol: 0.05, drift: 0.00007, decimals: 4 },
+  'USD-JPY': { kind: 'fx', base: 151.4, vol: 0.055, drift: 0.0001, decimals: 3 },
+  'USD-CHF': { kind: 'fx', base: 0.886, vol: 0.045, drift: 0.00006, decimals: 4 },
+  'AUD-USD': { kind: 'fx', base: 0.664, vol: 0.06, drift: 0.00005, decimals: 4 },
+  'USD-CAD': { kind: 'fx', base: 1.362, vol: 0.05, drift: 0.00006, decimals: 4 },
+  'USD-INR': { kind: 'fx', base: 83.4, vol: 0.04, drift: 0.00012, decimals: 3 },
+  'USD-MXN': { kind: 'fx', base: 17.2, vol: 0.085, drift: 0.0001, decimals: 4 },
+}
+
+/** Nation/venue labels for foreign listings — shown as pickers' tooltips so
+ * a multi-nation catalog stays readable. */
+const FOREIGN_LABELS: Record<string, string> = {
+  TM: 'Toyota · Japan',
+  SAP: 'SAP · Germany',
+  TSM: 'TSMC · Taiwan',
+  ASML: 'ASML · Netherlands',
+  HSBC: 'HSBC · United Kingdom',
+  BABA: 'Alibaba · China (ADR)',
+  INFY: 'Infosys · India (ADR)',
+  NESN: 'Nestlé · Switzerland',
+  EFA: 'Developed ex-US · ETF',
+  EWJ: 'Japan · ETF',
+  EWZ: 'Brazil · ETF',
+  'EUR-USD': 'Euro / US dollar',
+  'GBP-USD': 'Sterling / US dollar',
+  'USD-JPY': 'US dollar / Japanese yen',
+  'USD-CHF': 'US dollar / Swiss franc',
+  'AUD-USD': 'Australian dollar / US dollar',
+  'USD-CAD': 'US dollar / Canadian dollar',
+  'USD-INR': 'US dollar / Indian rupee',
+  'USD-MXN': 'US dollar / Mexican peso',
 }
 
 /** Synthetic option symbols: UNDERLYING-STRIKE-CALL|PUT-DTE(D). The maturity
@@ -74,6 +121,7 @@ export const OPTION_SYMBOLS = [
   'AAPL-240-PUT-45D',
   'SPY-580-PUT-45D',
   'XAU-2800-CALL-30D',
+  'EUR-USD-1.10-CALL-30D',
 ]
 
 export interface OptionSpec {
@@ -100,12 +148,20 @@ export function isOptionSymbol(symbol: string): boolean {
 
 export const SYMBOL_LIST = [...Object.keys(UNIVERSE), ...OPTION_SYMBOLS]
 
+/** How far back the platform retains (and serves) historical bars through
+ * the market-data API: five years of stored history per symbol/timeframe.
+ * Backtests and training windows are clamped to this same window, so what
+ * a run replays is exactly what the API would serve. */
+export const HISTORY_YEARS = 5
+export const historyStart = (at: number) => at - HISTORY_YEARS * 365 * DAY
+
 /** Catalogue metadata: what each symbol is and what it belongs to. */
 export function symbolMeta(symbol: string): SymbolMeta {
   const option = parseOptionSymbol(symbol)
   if (option) return { symbol, kind: 'option', underlying: option.underlying, label: `${option.type} ${option.strike} · ${option.dteDays}D` }
   const spec = UNIVERSE[symbol]
-  return { symbol, kind: spec ? spec.kind : 'equity' }
+  const label = FOREIGN_LABELS[symbol]
+  return { symbol, kind: spec ? spec.kind : 'equity', ...(label ? { label } : {}) }
 }
 
 export const SYMBOL_METAS: SymbolMeta[] = SYMBOL_LIST.map(symbolMeta)

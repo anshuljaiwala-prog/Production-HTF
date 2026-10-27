@@ -1,4 +1,4 @@
-import { Bot, Check, FlaskConical, LayoutGrid, Menu as MenuIcon, Moon, Plug, Search, Settings, Sun, Wallet, X } from 'lucide-react'
+import { Bot, Check, FlaskConical, GraduationCap, LayoutGrid, Menu as MenuIcon, Moon, Plug, Search, Settings, Sun, Wallet, X } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { NavLink, Outlet, useLocation } from 'react-router'
 
@@ -12,6 +12,7 @@ const links = [
   { to: '/', label: 'Dashboard', icon: LayoutGrid, end: true },
   { to: '/bots', label: 'Bots', icon: Bot },
   { to: '/strategies', label: 'Strategies', icon: FlaskConical },
+  { to: '/training', label: 'Training', icon: GraduationCap },
   { to: '/portfolio', label: 'Portfolio', icon: Wallet },
   { to: '/connections', label: 'Connections', icon: Plug },
 ]

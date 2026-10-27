@@ -401,6 +401,23 @@ bots.patch('/:id', async (c) => {
   const params = body.params !== undefined && bot.strategyKey !== 'custom' ? sanitizeParams(bot.strategyKey, body.params) : bot.params
   const connectionId = body.connectionId !== undefined ? (body.connectionId === null ? null : String(body.connectionId)) : bot.connectionId
 
+  // Diff the applied settings against what was stored so the event stream
+  // shows config changes — "timeframe 1h → 4h, risk 25% → 30%" — not just
+  // trades. Only real changes are logged.
+  const changes: string[] = []
+  if (name !== bot.name) changes.push(`name → "${name}"`)
+  if (stage !== bot.stage) changes.push(`stage ${bot.stage} → ${stage}`)
+  if (timeframe !== bot.timeframe) changes.push(`timeframe ${bot.timeframe} → ${timeframe}`)
+  if (riskPct !== bot.riskPct) changes.push(`risk ${bot.riskPct}% → ${riskPct}%`)
+  if (JSON.stringify(symbols) !== JSON.stringify(bot.symbols)) changes.push(`symbols ${bot.symbols.join(', ')} → ${symbols.join(', ')}`)
+  if (connectionId !== bot.connectionId) changes.push(`connection → ${connectionId ?? 'demo venue'}`)
+  if (bot.strategyKey !== 'custom') {
+    const paramChanges = Object.keys(params)
+      .filter((key) => JSON.stringify(params[key]) !== JSON.stringify(bot.params[key]))
+      .map((key) => `${key} ${bot.params[key]} → ${params[key]}`)
+    if (paramChanges.length) changes.push(`params: ${paramChanges.join(', ')}`)
+  }
+
   await db
     .prepare(
       `UPDATE bots SET name = ?, stage = ?, position = ?, symbols = ?, timeframe = ?, risk_pct = ?, params = ?, connection_id = ?, updated_at = ?
@@ -421,6 +438,10 @@ bots.patch('/:id', async (c) => {
     )
     .run()
 
+  if (changes.length) {
+    await logEvent(db, owner, botId, 'info', `Settings edited — ${changes.join('; ')}`.slice(0, 500))
+  }
+
   const updated = await loadBot(db, owner, botId)
   return privateJson(c, { bot: updated ? withStrategy(updated) : null })
 })
@@ -432,17 +453,26 @@ bots.post('/:id/control', async (c) => {
   const { action } = await c.req.json<{ action?: string }>()
   const bot = await loadBot(db, owner, botId)
   if (!bot) return c.json({ error: 'not_found', message: 'Bot not found.' }, 404)
-  if (!['start', 'pause', 'stop'].includes(String(action))) {
-    return c.json({ error: 'unknown_action', message: 'Use start, pause or stop.' }, 400)
+  if (!['start', 'pause', 'stop', 'ground', 'resume'].includes(String(action))) {
+    return c.json({ error: 'unknown_action', message: 'Use start, pause, stop, ground or resume.' }, 400)
   }
 
   const t = now()
-  const status: BotStatus = action === 'start' ? 'running' : action === 'pause' ? 'paused' : 'stopped'
+  // Ground/resume are the operator's blunt control: grounding stops the bot
+  // (it holds its book and opens nothing until resumed); resuming starts it
+  // again. Aliases of stop/start with their own vocabulary in the event log.
+  const status: BotStatus = action === 'start' || action === 'resume' ? 'running' : action === 'pause' ? 'paused' : 'stopped'
   await db
     .prepare(`UPDATE bots SET status = ?, started_at = COALESCE(started_at, ?), updated_at = ? WHERE id = ? AND owner_sub = ?`)
     .bind(status, t, t, botId, owner)
     .run()
-  await logEvent(db, owner, botId, 'info', `${status === 'running' ? 'Started' : status === 'paused' ? 'Paused' : 'Stopped'} by operator.`)
+  const controlEvent =
+    action === 'ground'
+      ? 'Grounded by operator — no new trades until resumed.'
+      : action === 'resume'
+        ? 'Resumed by operator — trading again.'
+        : `${status === 'running' ? 'Started' : status === 'paused' ? 'Paused' : 'Stopped'} by operator.`
+  await logEvent(db, owner, botId, 'info', controlEvent)
 
   let updated = (await loadBot(db, owner, botId)) ?? bot
   if (status === 'running') {

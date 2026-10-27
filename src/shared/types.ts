@@ -44,14 +44,15 @@ export type ParamValue = number | string | boolean
 /** Asset classes the simulated market covers. Options are modelled as
  * constant-maturity synthetic derivatives over an underlying; everything
  * else is a plain instrument with its own synthetic price path. */
-export type AssetKind = 'crypto' | 'equity' | 'etf' | 'fund' | 'commodity' | 'option'
+export type AssetKind = 'crypto' | 'equity' | 'etf' | 'fund' | 'commodity' | 'fx' | 'option'
 
 export const ASSET_CLASSES: { key: AssetKind; label: string; hint: string }[] = [
   { key: 'crypto', label: 'Crypto', hint: '24/7 spot pairs' },
-  { key: 'equity', label: 'Stocks', hint: 'single-name equities' },
+  { key: 'equity', label: 'Stocks', hint: 'US and foreign single-name equities' },
   { key: 'etf', label: 'ETFs', hint: 'exchange-traded funds' },
   { key: 'fund', label: 'Mutual funds', hint: 'once-daily NAV-like funds' },
   { key: 'commodity', label: 'Commodities', hint: 'metals, energy' },
+  { key: 'fx', label: 'Forex', hint: 'multi-nation currency pairs' },
   { key: 'option', label: 'Options', hint: 'calls & puts on the same synthetic feed' },
 ]
 

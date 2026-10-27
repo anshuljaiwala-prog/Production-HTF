@@ -1,4 +1,4 @@
-import { ArrowLeft, ChevronRight, Pause, Play, Plus, Square, Trash2 } from 'lucide-react'
+import { ArrowLeft, ChevronRight, Pause, Play, Plus, PowerOff, Trash2 } from 'lucide-react'
 import { useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router'
 
@@ -17,9 +17,18 @@ export function BotDetail() {
   const [deleting, setDeleting] = useState(false)
 
   const control = useApiMutation(
-    (action: 'start' | 'pause' | 'stop') => controlBot(id!, action),
+    (action: 'pause' | 'ground' | 'resume') => controlBot(id!, action),
     ['bot', 'bots', 'dashboard'],
-    { onSuccess: (result) => toast(`Bot is now ${activityOf(result.bot)}`) },
+    {
+      onSuccess: (result) =>
+        toast(
+          result.bot.status === 'running'
+            ? 'Bot resumed — trading again'
+            : result.bot.status === 'paused'
+              ? 'Bot paused — holds its book'
+              : 'Bot grounded — no new trades until resumed',
+        ),
+    },
   )
   const remove = useApiMutation(() => deleteBot(id!), ['bots', 'bot', 'dashboard'], {
     onSuccess: () => {
@@ -88,21 +97,28 @@ export function BotDetail() {
           subtitle={bot.lastEvent ?? `${bot.strategyName} · ${bot.symbols.join(', ')}`}
           actions={
             <>
+              {/* Ground/Resume: the blunt operator control. Grounding stops
+                  the bot — it holds its book and opens nothing new; Resume
+                  starts it again from paused or grounded. */}
               {bot.status === 'running' ? (
                 <Button onClick={() => control.mutate('pause')} loading={control.isPending}>
                   <Pause />
                   Pause
                 </Button>
               ) : (
-                <Button variant="primary" onClick={() => control.mutate('start')} loading={control.isPending}>
+                <Button variant="primary" onClick={() => control.mutate('resume')} loading={control.isPending}>
                   <Play />
-                  Start
+                  Resume
                 </Button>
               )}
               {bot.status !== 'stopped' && (
-                <Button onClick={() => control.mutate('stop')} loading={control.isPending}>
-                  <Square />
-                  Stop
+                <Button
+                  onClick={() => control.mutate('ground')}
+                  loading={control.isPending}
+                  title="Ground: stop opening trades. The bot keeps its positions until they close."
+                >
+                  <PowerOff />
+                  Ground
                 </Button>
               )}
               <Button variant="ghost" size="icon-sm" aria-label="Delete bot" onClick={() => setDeleting(true)}>

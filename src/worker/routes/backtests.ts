@@ -2,12 +2,12 @@ import { Hono } from 'hono'
 
 import { privateJson } from '../auth'
 import { backtestWindow, runBacktest } from '../backtest'
-import { id, mapBacktest, now } from '../db'
+import { id, mapBacktest, mapBot, now } from '../db'
 import type { AppContext } from '../env'
-import { TIMEFRAME_MS, barsBetween } from '../market'
+import { HISTORY_YEARS, TIMEFRAME_MS, barsBetween, historyStart } from '../market'
 import type { CustomRules } from '../strategies'
 import { parseRules, rulesToParams, sanitizeParams, strategyBy } from '../strategies'
-import type { Backtest, Candle, SimBudget, Timeframe } from '../../shared/types'
+import type { AccuracyStat, Backtest, Candle, EquityPoint, ParamDef, ParamValue, RunMetrics, SimBudget, Timeframe } from '../../shared/types'
 import { SIM_BUDGET } from '../../shared/types'
 
 type Row = Record<string, unknown>
@@ -110,7 +110,7 @@ backtests.get('/:id', async (c) => {
  * display candles so a 5,000-bar replay still draws legibly. */
 const MAX_CANDLES = 160
 
-function toCandles(bars: { t: number; o: number; h: number; l: number; c: number; v: number }[]): Candle[] {
+export function toCandles(bars: { t: number; o: number; h: number; l: number; c: number; v: number }[]): Candle[] {
   if (bars.length <= MAX_CANDLES) return bars
   const per = Math.ceil(bars.length / MAX_CANDLES)
   const candles: Candle[] = []
@@ -210,8 +210,17 @@ backtests.post('/', async (c) => {
 
   const to = Number(body.to) || now()
   const requested = Number(body.from) || to - DEFAULTS[timeframe] * 86_400_000
-  // Keep the run bounded: the engine caps a backtest at MAX_BARS bars.
-  const from = Math.max(requested, to - MAX_BARS * TIMEFRAME_MS[timeframe])
+  // The platform retains HISTORY_YEARS of stored history — a run entirely
+  // outside that window has no data to replay.
+  if (to < historyStart(now())) {
+    return c.json(
+      { error: 'outside_history', message: `Stored history covers the last ${HISTORY_YEARS} years — pick a period that reaches into it.` },
+      400,
+    )
+  }
+  // Keep the run bounded: the engine caps a backtest at MAX_BARS bars and
+  // never replays earlier than the stored-history window.
+  const from = Math.max(requested, to - MAX_BARS * TIMEFRAME_MS[timeframe], historyStart(to))
 
   const backtestId = id()
   const createdAt = now()
@@ -243,6 +252,176 @@ backtests.post('/', async (c) => {
 
   const row = await db.prepare(`SELECT * FROM backtests WHERE id = ?`).bind(backtestId).first<Row>()
   return privateJson(c, { backtest: row ? withName({ ...mapBacktest(row), strategyName: displayName }) : null }, 201)
+})
+
+// --- Training: grid search over stored history ------------------------------
+
+/** One parameter knob to sweep: from → to across `steps` values (inclusive). */
+interface VaryParam {
+  key: string
+  from: number
+  to: number
+  steps: number
+}
+
+const MAX_COMBOS = 12
+const MAX_VARY_STEPS = 6
+const OPTIMIZE_DAYS_MIN = 30
+const OPTIMIZE_DAYS_MAX = 5 * 365
+/** Share of the window used to train (fit params); the tail is the hold-out
+ * test slice so the table shows generalisation, not just in-sample fit. */
+const TRAIN_SPLIT = 0.7
+
+interface OptimizerRun {
+  params: Record<string, ParamValue>
+  train: RunMetrics
+  test: RunMetrics | null
+  error: string | null
+}
+
+/** Training endpoint: sweeps a small parameter grid over the stored
+ * five-year history, scoring every combination on a train slice (70% of the
+ * window) and a hold-out test slice (30%). Nothing is persisted — training
+ * runs are in-memory and never allocate the simulation pot. */
+backtests.post('/optimize', async (c) => {
+  const db = c.get('db')
+  const owner = c.get('user').sub
+  const body = await c.req.json<{
+    strategyKey?: string
+    botId?: string
+    symbol?: string
+    timeframe?: Timeframe
+    capital?: number
+    params?: Record<string, unknown>
+    days?: number
+    objective?: 'return' | 'sharpe'
+    vary?: VaryParam[]
+  }>()
+
+  // A bot config seeds every field: pick "train this bot" and its strategy,
+  // market, timeframe, capital and params come straight off the bot.
+  let strategyKey = String(body.strategyKey ?? '')
+  let baseParams: Record<string, ParamValue> = sanitizeParams(strategyKey, body.params)
+  let symbol = String(body.symbol ?? '').trim().toUpperCase()
+  let timeframe = body.timeframe
+  let capital = Number(body.capital)
+  let sourceName = 'new config'
+  if (body.botId) {
+    const botRow = await db
+      .prepare(`SELECT * FROM bots WHERE id = ? AND owner_sub = ?`)
+      .bind(body.botId, owner)
+      .first<Row>()
+    if (!botRow) return c.json({ error: 'not_found', message: 'Bot not found.' }, 404)
+    const bot = mapBot(botRow)
+    if (bot.strategyKey === 'custom') {
+      return c.json(
+        { error: 'custom_strategy', message: 'Uploaded-rules bots have no tunable parameters to train — backtest them from the Backtests tab instead.' },
+        400,
+      )
+    }
+    strategyKey = bot.strategyKey
+    baseParams = bot.params
+    symbol = bot.symbols[0] ?? symbol
+    timeframe = bot.timeframe
+    capital = bot.capital
+    sourceName = bot.name
+  }
+
+  const strategy = strategyBy(strategyKey)
+  if (!strategy) return c.json({ error: 'unknown_strategy', message: 'Pick a strategy from the catalog.' }, 400)
+  const tf: Timeframe = timeframe ?? strategy.timeframes[Math.floor(strategy.timeframes.length / 2)]
+  if (!strategy.timeframes.includes(tf)) {
+    return c.json({ error: 'timeframe_unsupported', message: `${strategy.name} does not run on the ${tf} timeframe.` }, 400)
+  }
+  if (!symbol) return c.json({ error: 'symbol_required', message: 'Choose a symbol.' }, 400)
+  if (!Number.isFinite(capital) || capital < 100) {
+    return c.json({ error: 'invalid_capital', message: 'Starting capital must be at least $100.' }, 400)
+  }
+
+  const days = Math.min(OPTIMIZE_DAYS_MAX, Math.max(OPTIMIZE_DAYS_MIN, Math.round(Number(body.days) || DEFAULTS[tf] * 2)))
+  const objective: 'return' | 'sharpe' = body.objective === 'return' ? 'return' : 'sharpe'
+
+  // Build the grid: 1–2 numeric knobs from the strategy's own param schema.
+  const vary = (Array.isArray(body.vary) ? body.vary : []).slice(0, 2)
+  if (vary.length === 0) {
+    return c.json({ error: 'nothing_to_train', message: 'Pick at least one parameter to sweep.' }, 400)
+  }
+  const knobs: { def: ParamDef; values: number[] }[] = []
+  for (const knob of vary) {
+    const def = strategy.params.find((p) => p.key === knob.key)
+    if (!def || def.type !== 'number') {
+      return c.json({ error: 'unknown_param', message: `"${knob.key}" is not a tunable numeric parameter of ${strategy.name}.` }, 400)
+    }
+    const from = Number(knob.from)
+    const to = Number(knob.to)
+    const steps = Math.round(Number(knob.steps))
+    if (!Number.isFinite(from) || !Number.isFinite(to) || to <= from || steps < 2 || steps > MAX_VARY_STEPS) {
+      return c.json({ error: 'bad_sweep', message: `${def.label}: use a range from < to with 2–${MAX_VARY_STEPS} steps.` }, 400)
+    }
+    const values = Array.from({ length: steps }, (_, i) => from + ((to - from) * i) / (steps - 1))
+    knobs.push({ def, values })
+  }
+  const combos = knobs.reduce((n, knob) => n * knob.values.length, 1)
+  if (combos > MAX_COMBOS) {
+    return c.json({ error: 'grid_too_big', message: `That grid is ${combos} runs — keep it to ${MAX_COMBOS} (fewer steps or parameters).` }, 400)
+  }
+
+  const to = now()
+  const from = Math.max(to - days * 86_400_000, historyStart(to))
+  const split = Math.round(from + (to - from) * TRAIN_SPLIT)
+
+  const rows: OptimizerRun[] = []
+  for (let combo = 0; combo < combos; combo++) {
+    let rest = combo
+    const params: Record<string, ParamValue> = { ...baseParams }
+    for (const knob of [...knobs].reverse()) {
+      const value = knob.values[rest % knob.values.length]
+      rest = Math.floor(rest / knob.values.length)
+      params[knob.def.key] = Number.isInteger(value) ? value : Number(value.toFixed(4))
+    }
+    try {
+      const train = runBacktest({ strategyKey: strategy.key, symbol, timeframe: tf, params, capital, from, to: split })
+      let test: RunMetrics | null = null
+      try {
+        test = runBacktest({ strategyKey: strategy.key, symbol, timeframe: tf, params, capital, from: split, to }).metrics
+      } catch {
+        // A tail slice too short for the lookback: keep the train score and
+        // mark the hold-out null rather than failing the whole sweep.
+        test = null
+      }
+      rows.push({ params, train: train.metrics, test, error: null })
+    } catch (error) {
+      rows.push({ params, train: null as unknown as RunMetrics, test: null, error: error instanceof Error ? error.message : 'Run failed.' })
+    }
+  }
+
+  const score = (row: OptimizerRun) => {
+    if (row.error || !row.train) return Number.NEGATIVE_INFINITY
+    return objective === 'return' ? row.train.totalReturn : row.train.sharpe
+  }
+  const ranked = [...rows].sort((a, b) => score(b) - score(a))
+  const bestIndex = rows.indexOf(ranked[0])
+
+  // One full-window replay of the winner: curve + accuracy for the report.
+  let bestDetail: { curve: EquityPoint[]; accuracy: AccuracyStat; metrics: RunMetrics } | null = null
+  if (!ranked[0]?.error) {
+    try {
+      const full = runBacktest({ strategyKey: strategy.key, symbol, timeframe: tf, params: ranked[0].params, capital, from, to })
+      bestDetail = { curve: full.curve, accuracy: full.accuracy, metrics: full.metrics }
+    } catch {
+      bestDetail = null
+    }
+  }
+
+  return privateJson(c, {
+    source: { strategyKey: strategy.key, strategyName: strategy.name, symbol, timeframe: tf, capital, days, from, to, split, label: sourceName },
+    objective,
+    history: { years: HISTORY_YEARS, from: historyStart(to) },
+    runs: rows,
+    bestIndex,
+    best: bestDetail,
+    knobs: knobs.map((knob) => ({ key: knob.def.key, label: knob.def.label, unit: knob.def.unit ?? null, values: knob.values })),
+  })
 })
 
 backtests.delete('/:id', async (c) => {

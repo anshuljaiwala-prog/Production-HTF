@@ -370,6 +370,131 @@ let customStrategyId
   check('bulk-created connections deleted', afterBulk.status === 200 && !JSON.stringify(afterBulk.payload?.items ?? []).includes('Bulk Alpaca test'))
 }
 
+// 9d. Stored history API: 5-year retention, foreign markets, clamped runs
+{
+  const hist = await call('GET', '/market/history?symbol=BTC-USD&timeframe=1h')
+  const candles = hist.payload?.candles ?? []
+  const sane = candles.length > 0 && candles.every((k) => k.h >= Math.max(k.o, k.c) && k.l <= Math.min(k.o, k.c))
+  check(
+    'GET /market/history serves stored candles',
+    hist.status === 200 && hist.payload.bars > 0 && hist.payload.history?.years === 5 && sane,
+    `bars=${hist.payload?.bars} history=${JSON.stringify(hist.payload?.history)}`,
+  )
+
+  const sixYearsAgo = Date.now() - 6 * 365 * 86_400_000
+  const outside = await call('GET', `/market/history?symbol=BTC-USD&timeframe=1h&from=${sixYearsAgo - 86_400_000}&to=${sixYearsAgo}`)
+  check('market history outside 5y window refused', outside.status === 400 && outside.payload?.error === 'outside_history', `got ${outside.status}`)
+
+  // Multi-nation markets: a forex pair and a foreign listing chart like any other.
+  const fx = await call('GET', '/market/history?symbol=EUR-USD&timeframe=1d')
+  const intl = await call('GET', '/market/history?symbol=TM&timeframe=1d')
+  check(
+    'GET /market/history covers multi-nation markets',
+    fx.status === 200 && fx.payload.bars > 0 && intl.status === 200 && intl.payload.bars > 0,
+    `EUR-USD bars=${fx.payload?.bars} TM bars=${intl.payload?.bars}`,
+  )
+
+  const oldRun = await call('POST', '/backtests', {
+    strategyKey: 'momentum',
+    symbol: 'EUR-USD',
+    timeframe: '1d',
+    capital: 1_000,
+    days: 365,
+    from: sixYearsAgo - 86_400_000,
+    to: sixYearsAgo,
+    params: {},
+  })
+  check('POST /backtests outside stored history refused', oldRun.status === 400 && oldRun.payload?.error === 'outside_history', `got ${oldRun.status} ${oldRun.payload?.error ?? ''}`)
+}
+
+// 9e. Training: grid search over stored history with a train/test split
+{
+  const catalog = await call('GET', '/strategies')
+  const momentum = (catalog.payload?.strategies ?? []).find((s) => s.key === 'momentum')
+  const knob = (momentum?.params ?? []).find((p) => p.type === 'number')
+  const from = knob?.min ?? (Number(knob?.default) || 1) * 0.5
+  const to = knob?.max ?? (Number(knob?.default) || 1) * 1.5
+
+  const opt = await call('POST', '/backtests/optimize', {
+    strategyKey: 'momentum',
+    symbol: 'BTC-USD',
+    timeframe: '1h',
+    capital: 10_000,
+    days: 180,
+    objective: 'sharpe',
+    vary: [{ key: knob?.key, from, to, steps: 3 }],
+  })
+  const runs = opt.payload?.runs ?? []
+  check(
+    'POST /backtests/optimize sweeps a grid',
+    opt.status === 200 && runs.length === 3 && runs.every((r) => !r.error && Number.isFinite(r.train?.totalReturn)) && Number.isFinite(opt.payload?.bestIndex),
+    `runs=${runs.length} ${JSON.stringify(runs[0] ?? {}).slice(0, 100)}`,
+  )
+  const source = opt.payload?.source
+  const splitInside = source && source.split > source.from && source.split < source.to
+  check(
+    'training splits train (70%) vs hold-out test',
+    splitInside && Math.abs((source.split - source.from) / (source.to - source.from) - 0.7) < 0.01 && opt.payload.history?.years === 5,
+    JSON.stringify(source),
+  )
+  check(
+    'best config comes back with a full replay',
+    Boolean(opt.payload?.best?.curve?.length) && Number.isFinite(opt.payload?.best?.accuracy?.sample) && opt.payload.best.accuracy.sample > 0,
+    `curve=${opt.payload?.best?.curve?.length ?? 0}`,
+  )
+
+  const tooBig = await call('POST', '/backtests/optimize', {
+    strategyKey: 'momentum',
+    symbol: 'BTC-USD',
+    timeframe: '1h',
+    capital: 10_000,
+    days: 180,
+    vary: [{ key: knob?.key, from, to, steps: 7 }],
+  })
+  check('optimize rejects out-of-range sweeps', tooBig.status === 400 && tooBig.payload?.error === 'bad_sweep', `got ${tooBig.status} ${tooBig.payload?.error ?? ''}`)
+}
+
+// 9f. Ground/resume control + config-change events
+let groundBotId
+{
+  const bot = await call('POST', '/bots', {
+    strategyKey: 'dca',
+    name: 'Ground check bot',
+    symbols: ['BTC-USD'],
+    timeframe: '1h',
+    capital: 1_000,
+    mode: 'paper',
+    status: 'paused',
+  })
+  groundBotId = bot.payload?.bot?.id
+  check('POST /bots creates a paused bot for control checks', bot.status === 201 && groundBotId && bot.payload.bot?.status === 'paused', `got ${bot.status}`)
+
+  const patched = await call('PATCH', `/bots/${groundBotId}`, { name: 'Ground check bot v2', riskPct: 42 })
+  check('PATCH applies edited settings', patched.status === 200 && patched.payload.bot?.riskPct === 42, `got ${patched.status}`)
+
+  const detail = await call('GET', `/bots/${groundBotId}`)
+  const configEvent = (detail.payload?.events ?? []).find((e) => e.message.includes('Settings edited'))
+  check(
+    'settings edit logs a config-change event',
+    Boolean(configEvent) && configEvent.message.includes('risk 25% → 42%') && configEvent.message.includes('name →'),
+    JSON.stringify(configEvent?.message ?? null).slice(0, 200),
+  )
+
+  const grounded = await call('POST', `/bots/${groundBotId}/control`, { action: 'ground' })
+  check('POST control ground', grounded.status === 200 && grounded.payload.bot?.status === 'stopped', `got ${grounded.payload?.bot?.status}`)
+  const groundedDetail = await call('GET', `/bots/${groundBotId}`)
+  check(
+    'ground logs its own event',
+    (groundedDetail.payload?.events ?? []).some((e) => e.message.includes('Grounded by operator')),
+    `events=${groundedDetail.payload?.events?.length}`,
+  )
+
+  const resumed = await call('POST', `/bots/${groundBotId}/control`, { action: 'resume' })
+  check('POST control resume', resumed.status === 200 && resumed.payload.bot?.status === 'running', `got ${resumed.payload?.bot?.status}`)
+
+  await call('DELETE', `/bots/${groundBotId}`)
+}
+
 // 10. Search + me + same-origin refusal
 {
   const search = await call('GET', '/search?q=momentum')
