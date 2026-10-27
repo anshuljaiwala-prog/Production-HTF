@@ -154,6 +154,15 @@ let backtestId
 
   const list = await call('GET', '/backtests')
   check('GET /backtests', list.status === 200 && list.payload.items?.some((b) => b.id === backtestId), `items=${list.payload?.items?.length}`)
+  const sim = list.payload?.sim
+  check(
+    'GET /backtests reports the simulation pot',
+    sim?.total === 1_000_000 && Number.isFinite(sim?.used) && Math.abs((sim?.used ?? 0) + (sim?.available ?? 0) - (sim?.total ?? 0)) < 0.01,
+    JSON.stringify(sim),
+  )
+
+  const tooBig = await call('POST', '/backtests', { strategyKey: 'momentum', symbol: 'ETH-USD', timeframe: '1h', capital: 2_000_000, days: 30, params: {} })
+  check('POST /backtests refuses capital beyond the sim pot', tooBig.status === 400 && tooBig.payload?.error === 'sim_budget_exhausted', `got ${tooBig.status} ${tooBig.payload?.error ?? ''}`)
 
   const detail = await call('GET', `/backtests/${backtestId}`)
   check('GET /backtests/:id', detail.status === 200 && detail.payload.backtest?.trades?.length >= 0 && detail.payload.backtest.strategyName === 'EMA Momentum')
@@ -193,6 +202,19 @@ let importedBotId
   )
   const empty = await call('POST', '/bots/import', { items: [] })
   check('POST /bots/import rejects empty payload', empty.status === 400, `got ${empty.status}`)
+}
+
+// 8c. Bot PATCH: trading settings only change while the bot is not active
+{
+  const activePatch = await call('PATCH', `/bots/${botId}`, { riskPct: 55 })
+  check('PATCH a running bot is refused with 409', activePatch.status === 409 && activePatch.payload?.error === 'bot_active', `got ${activePatch.status}`)
+
+  const paused = importedBotId ? await call('PATCH', `/bots/${importedBotId}`, { name: 'Import test grid · tuned', riskPct: 40 }) : { status: 404, payload: {} }
+  check(
+    'PATCH a paused bot applies trading settings',
+    paused.status === 200 && paused.payload?.bot?.name === 'Import test grid · tuned' && paused.payload?.bot?.riskPct === 40,
+    JSON.stringify(paused.payload?.bot?.name).slice(0, 120),
+  )
 }
 
 // 9. Connections: create (masked), list, delete; secret never returned

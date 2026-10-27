@@ -7,12 +7,13 @@ import { useSyncExternalStore } from 'react'
 
 // ---------- Currency ----------
 
-export type Currency = 'USD' | 'EUR' | 'GBP'
+export type Currency = 'USD' | 'EUR' | 'GBP' | 'INR'
 
 export const CURRENCIES: { key: Currency; label: string }[] = [
   { key: 'USD', label: 'USD' },
   { key: 'EUR', label: 'EUR' },
   { key: 'GBP', label: 'GBP' },
+  { key: 'INR', label: 'INR' },
 ]
 
 /**
@@ -24,6 +25,7 @@ export const CURRENCY_RATES: Record<Currency, number> = {
   USD: 1,
   EUR: 0.92,
   GBP: 0.79,
+  INR: 83.1,
 }
 
 export function convert(value: number, currency: Currency): number {
@@ -35,7 +37,7 @@ let currency: Currency = 'USD'
 
 if (typeof window !== 'undefined') {
   const stored = window.localStorage.getItem('htf.currency')
-  if (stored === 'USD' || stored === 'EUR' || stored === 'GBP') currency = stored
+  if (stored === 'USD' || stored === 'EUR' || stored === 'GBP' || stored === 'INR') currency = stored
 }
 
 export const getCurrency = () => currency

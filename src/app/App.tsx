@@ -1,10 +1,9 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { BrowserRouter, Navigate, Route, Routes } from 'react-router'
+import { BrowserRouter, Navigate, Route, Routes, useLocation } from 'react-router'
 
 import { Shell } from './components/Shell'
 import { Spinner, ToastProvider } from './components/ui'
 import { ApiError, useMe } from './lib/api'
-import { Backtests } from './pages/Backtests'
 import { BotDetail } from './pages/BotDetail'
 import { Bots } from './pages/Bots'
 import { Connections } from './pages/Connections'
@@ -17,6 +16,15 @@ import { Strategies } from './pages/Strategies'
 const client = new QueryClient({
   defaultOptions: { queries: { retry: 1, refetchOnWindowFocus: false, staleTime: 15_000 } },
 })
+
+/** Backtests now live as a tab on /strategies — forward old links with
+ * their drawer id intact. */
+function BacktestsRedirect() {
+  const location = useLocation()
+  const params = new URLSearchParams(location.search)
+  params.set('tab', 'backtests')
+  return <Navigate to={`/strategies?${params.toString()}`} replace />
+}
 
 function Gate() {
   const me = useMe()
@@ -40,7 +48,7 @@ function Gate() {
         <Route path="bots/:id" element={<BotDetail />} />
         <Route path="board" element={<Navigate to="/bots?tab=board" replace />} />
         <Route path="strategies" element={<Strategies />} />
-        <Route path="backtests" element={<Backtests />} />
+        <Route path="backtests" element={<BacktestsRedirect />} />
         <Route path="connections" element={<Connections />} />
         <Route path="portfolio" element={<Portfolio />} />
         <Route path="settings" element={<Settings />} />

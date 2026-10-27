@@ -9,9 +9,21 @@ import { Badge, Button, Card, ConfirmDialog, Drawer, EmptyState, Live, PageHeade
 import { deleteBacktest, useApiMutation, useBacktestDetail, useBacktestMarket, useBacktests } from '../lib/api'
 import { cx } from '../lib/cx'
 import { money, shortDate } from '../lib/format'
+import { SIM_BUDGET } from '../../shared/types'
 import type { Backtest } from '../../shared/types'
 
-export function Backtests() {
+/** Period label that keeps the year when the window crosses one. */
+function periodSpan(from: number, to: number): string {
+  const stamp = (ts: number) =>
+    new Date(ts).toLocaleDateString('en-US', {
+      month: 'short',
+      day: 'numeric',
+      ...(new Date(ts).getFullYear() !== new Date(to).getFullYear() ? { year: 'numeric' } : {}),
+    })
+  return `${stamp(from)} – ${stamp(to)}`
+}
+
+export function Backtests({ embedded = false }: { embedded?: boolean }) {
   const { data, isLoading } = useBacktests()
   const [params, setParams] = useSearchParams()
   const [composing, setComposing] = useState(false)
@@ -42,7 +54,7 @@ export function Backtests() {
       toast(`${finished.name} finished`)
     }
     setFlipped(finished.id)
-    if (!selected) setParams({ id: finished.id })
+    if (!selected) setParams({ tab: 'backtests', id: finished.id })
     // selected/params intentionally read but not re-run on: a flip announces
     // once, not on every poll.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -54,20 +66,47 @@ export function Backtests() {
     return () => window.clearTimeout(timer)
   }, [flipped])
 
-  return (
-    <div className="mx-auto max-w-[1200px] p-5 sm:p-8">
-      <PageHeader
-        title="Backtests"
-        subtitle="Deterministic replays over the simulated feed — same inputs, same result, every time."
-        actions={
-          <Button variant="primary" onClick={() => setComposing(true)}>
-            <Play />
-            New backtest
-          </Button>
-        }
-      />
+  const sim = data?.sim
 
-      <div className="mt-6 overflow-hidden rounded-card border border-line">
+  return (
+    <div className={!embedded ? 'mx-auto max-w-[1200px] p-5 sm:p-8' : undefined}>
+      {!embedded && (
+        <PageHeader
+          title="Backtests"
+          subtitle="Deterministic replays over the simulated feed — same inputs, same result, every time."
+          actions={
+            <Button variant="primary" onClick={() => setComposing(true)}>
+              <Play />
+              New backtest
+            </Button>
+          }
+        />
+      )}
+
+      {/* Simulated pot: backtests draw from on this fixed budget, never from
+          workspace funding — deleting a run frees its allocation. */}
+      {sim && (
+        <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-2 rounded-card border border-line bg-bg/60 px-4 py-3 text-[12.5px]">
+          <span className="font-medium">Simulation pot</span>
+          <span className="inline-flex items-center gap-2">
+            <span className="h-1.5 w-32 overflow-hidden rounded-full bg-surface-2">
+              <span
+                className="block h-full rounded-full bg-accent transition-[width] duration-500"
+                style={{ width: `${Math.min(100, (sim.used / SIM_BUDGET) * 100)}%` }}
+              />
+            </span>
+            <span className="text-faint">{((sim.used / SIM_BUDGET) * 100).toFixed(1)}% allocated</span>
+          </span>
+          <span className="text-muted">
+            allocated <span className="font-medium tabular-nums">{money(sim.used)}</span> of {money(SIM_BUDGET)} · free <span className="font-medium tabular-nums">{money(sim.available)}</span>
+          </span>
+          <span className="ml-auto text-[11.5px] text-faint">
+            made-up money — backtests never touch workspace funding · delete a run to free its allocation
+          </span>
+        </div>
+      )}
+
+      <div className={!embedded ? 'mt-6 overflow-hidden rounded-card border border-line' : 'mt-3 overflow-hidden rounded-card border border-line'}>
         <div className="overflow-x-auto">
           <table className="w-full min-w-[900px] table-fixed text-left text-[13.5px]">
             <thead>
@@ -88,7 +127,7 @@ export function Backtests() {
                 return (
                   <tr
                     key={backtest.id}
-                    onClick={() => setParams({ id: backtest.id })}
+                    onClick={() => setParams({ tab: 'backtests', id: backtest.id })}
                     className={cx('h-13 cursor-pointer transition-colors hover:bg-surface-2/60', selected === backtest.id && 'bg-surface-2/80')}
                   >
                     <td className="truncate px-4">
@@ -99,7 +138,7 @@ export function Backtests() {
                       {backtest.symbol} · {backtest.timeframe}
                     </td>
                     <td className="px-4 text-muted">
-                      {shortDate(backtest.from)} – {shortDate(backtest.to)}
+                      {periodSpan(backtest.from, backtest.to)}
                     </td>
                     <td className="px-4 text-right tabular-nums">
                       {backtest.status !== 'done' || !metrics ? (
@@ -144,7 +183,7 @@ export function Backtests() {
       </div>
 
       <BacktestDialog open={composing} onClose={() => setComposing(false)} strategyKey={null} />
-      <BacktestDrawer id={selected} flashId={flipped} onClose={() => setParams({})} />
+      <BacktestDrawer id={selected} flashId={flipped} onClose={() => setParams({ tab: 'backtests' })} />
     </div>
   )
 }
@@ -296,7 +335,7 @@ function BacktestDrawer({
               <div className="flex items-center justify-between">
                 <h3 className="text-[13.5px] font-semibold">Equity curve</h3>
                 <span className="text-[12px] text-faint">
-                  {shortDate(backtest.from)} – {shortDate(backtest.to)}
+                  {periodSpan(backtest.from, backtest.to)}
                 </span>
               </div>
               <div className="mt-3">

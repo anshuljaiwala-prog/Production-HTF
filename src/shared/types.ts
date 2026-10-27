@@ -22,6 +22,23 @@ export const BOT_STAGES: { key: BotStage; label: string }[] = [
 export type BotStatus = 'running' | 'paused' | 'stopped'
 export type BotMode = 'paper' | 'live'
 
+/** What a bot is doing right now, in the operator's vocabulary.
+ * Running bots are actively trading; a bot that is not running but still
+ * holds open positions is inactive (holds its book, opens nothing new); a
+ * flat, non-running bot is grounded (no trades, no positions). */
+export type BotActivity = 'active' | 'inactive' | 'grounded'
+
+export const ACTIVITIES: { key: BotActivity; label: string; hint: string }[] = [
+  { key: 'active', label: 'Active', hint: 'actively trading' },
+  { key: 'inactive', label: 'Inactive', hint: 'holding positions, opening none' },
+  { key: 'grounded', label: 'Grounded', hint: 'not trading, not holding' },
+]
+
+export function activityOf(bot: Pick<Bot, 'status' | 'openPositions'>): BotActivity {
+  if (bot.status === 'running') return 'active'
+  return bot.openPositions > 0 ? 'inactive' : 'grounded'
+}
+
 export type ParamValue = number | string | boolean
 
 /** Drives both the launch wizard and the backtest form from one definition. */
@@ -148,6 +165,16 @@ export interface RunMetrics {
   finalEquity: number
 }
 
+/** Pot of made-up money backtests draw from. Backtests are hypotheticals:
+ * they never touch workspace funding, only this simulation budget. */
+export const SIM_BUDGET = 1_000_000
+
+export interface SimBudget {
+  total: number
+  used: number
+  available: number
+}
+
 export interface Backtest {
   id: string
   name: string
@@ -170,6 +197,7 @@ export interface Backtest {
 export interface Dashboard {
   kpis: {
     capitalDeployed: number
+    liveBots: number
     activeBots: number
     todayPnl: number
     winRate: number | null
@@ -200,6 +228,7 @@ export interface CashFlow {
 export interface PortfolioBotAudit {
   id: string
   name: string
+  strategyKey: string
   strategyName: string
   status: BotStatus
   mode: BotMode

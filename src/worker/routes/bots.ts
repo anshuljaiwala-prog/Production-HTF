@@ -244,17 +244,57 @@ bots.patch('/:id', async (c) => {
   const db = c.get('db')
   const owner = c.get('user').sub
   const botId = c.req.param('id')
-  const body = await c.req.json<{ name?: string; stage?: BotStage; position?: number }>()
+  const body = await c.req.json<{
+    name?: string
+    stage?: BotStage
+    position?: number
+    symbols?: string[]
+    timeframe?: Timeframe
+    riskPct?: number
+    params?: Record<string, unknown>
+    connectionId?: string | null
+  }>()
   const bot = await loadBot(db, owner, botId)
   if (!bot) return c.json({ error: 'not_found', message: 'Bot not found.' }, 404)
+
+  // Trading settings are only editable while the bot is not active — pause or
+  // stop it first so what it decides on never changes mid-run.
+  const wantsTradingSettings = body.symbols !== undefined || body.timeframe !== undefined || body.riskPct !== undefined || body.params !== undefined || body.connectionId !== undefined
+  if (wantsTradingSettings && bot.status === 'running') {
+    return c.json({ error: 'bot_active', message: 'Pause or stop this bot before editing its trading settings.' }, 409)
+  }
 
   const stage = body.stage && ['draft', 'backtest', 'paper', 'live'].includes(body.stage) ? body.stage : bot.stage
   const name = body.name ? body.name.trim().slice(0, 90) || bot.name : bot.name
   const position = Number.isFinite(body.position) ? Number(body.position) : bot.position
 
+  // Trading settings: each falls back to the stored value when absent.
+  const strategy = strategyBy(bot.strategyKey)
+  const symbols = body.symbols !== undefined ? body.symbols.map((s) => String(s).trim().toUpperCase()).filter(Boolean).slice(0, MAX_SYMBOLS) : bot.symbols
+  if (symbols.length === 0) return c.json({ error: 'invalid_symbols', message: 'Keep at least one symbol.' }, 400)
+  const timeframe = body.timeframe !== undefined && strategy?.timeframes.includes(body.timeframe) ? body.timeframe : bot.timeframe
+  const riskPct = Number.isFinite(Number(body.riskPct)) && body.riskPct !== undefined ? Math.min(100, Math.max(1, Number(body.riskPct))) : bot.riskPct
+  const params = body.params !== undefined ? sanitizeParams(bot.strategyKey, body.params) : bot.params
+  const connectionId = body.connectionId !== undefined ? (body.connectionId === null ? null : String(body.connectionId)) : bot.connectionId
+
   await db
-    .prepare(`UPDATE bots SET name = ?, stage = ?, position = ?, updated_at = ? WHERE id = ? AND owner_sub = ?`)
-    .bind(name, stage, position, now(), botId, owner)
+    .prepare(
+      `UPDATE bots SET name = ?, stage = ?, position = ?, symbols = ?, timeframe = ?, risk_pct = ?, params = ?, connection_id = ?, updated_at = ?
+       WHERE id = ? AND owner_sub = ?`,
+    )
+    .bind(
+      name,
+      stage,
+      position,
+      JSON.stringify(symbols),
+      timeframe,
+      riskPct,
+      JSON.stringify(params),
+      connectionId,
+      now(),
+      botId,
+      owner,
+    )
     .run()
 
   const updated = await loadBot(db, owner, botId)

@@ -110,9 +110,9 @@ const toneClasses: Record<Tone, string> = {
   danger: 'bg-danger-soft text-danger',
   info: 'bg-info-soft text-info',
 }
-export function Badge({ tone = 'neutral', className, children, dot }: { tone?: Tone; className?: string; children: ReactNode; dot?: boolean }) {
+export function Badge({ tone = 'neutral', className, children, dot, title }: { tone?: Tone; className?: string; children: ReactNode; dot?: boolean; title?: string }) {
   return (
-    <span className={cx('inline-flex h-6 items-center gap-1.5 whitespace-nowrap rounded-[8px] px-2 text-[12px] font-medium', toneClasses[tone], className)}>
+    <span title={title} className={cx('inline-flex h-6 items-center gap-1.5 whitespace-nowrap rounded-[8px] px-2 text-[12px] font-medium', toneClasses[tone], className)}>
       {dot && <span className="round size-1.5 bg-current" />}
       {children}
     </span>

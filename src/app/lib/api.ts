@@ -15,6 +15,7 @@ import type {
   Portfolio,
   Position,
   SearchResults,
+  SimBudget,
   Strategy,
   Timeframe,
   Trade,
@@ -117,10 +118,10 @@ export const useBot = (botId: string | undefined) =>
 export const useBacktests = () =>
   useQuery({
     queryKey: ['backtests'],
-    queryFn: () => api<{ items: Backtest[] }>('/backtests'),
+    queryFn: () => api<{ items: Backtest[]; sim: SimBudget }>('/backtests'),
     // Runs execute lazily on read; poll while anything is pending so the
     // status flips to done/failed (and the results appear) automatically.
-    refetchInterval: liveInterval<{ items: Backtest[] }>(1_000, false, (d) => d.items.some((b) => b.status === 'running')),
+    refetchInterval: liveInterval<{ items: Backtest[]; sim: SimBudget }>(1_000, false, (d) => d.items.some((b) => b.status === 'running')),
     placeholderData: (p) => p,
   })
 
@@ -224,7 +225,20 @@ export interface BotImportResult {
 export const importBots = (items: LaunchInput[]) => api<BotImportResult>('/bots/import', { method: 'POST', json: { items } })
 export const adjustFunding = (botId: string, input: { amount: number; note?: string }) =>
   api<{ bot: Bot }>(`/bots/${botId}/cashflow`, { method: 'POST', json: input })
-export const patchBot = (botId: string, patch: { name?: string; stage?: BotStage; position?: number }) =>
+/** Operator edits. Trading settings (symbols, timeframe, risk, params,
+ * connection) are only accepted while the bot is not active — the server
+ * answers 409 otherwise. */
+export interface BotPatch {
+  name?: string
+  stage?: BotStage
+  position?: number
+  symbols?: string[]
+  timeframe?: Timeframe
+  riskPct?: number
+  params?: Record<string, ParamValue>
+  connectionId?: string | null
+}
+export const patchBot = (botId: string, patch: BotPatch) =>
   api<{ bot: Bot }>(`/bots/${botId}`, { method: 'PATCH', json: patch })
 export const deleteBot = (botId: string) => api<{ ok: true }>(`/bots/${botId}`, { method: 'DELETE' })
 

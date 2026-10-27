@@ -210,6 +210,10 @@ export async function advanceBot(db: D1Database, owner: string, bot: Bot, option
   const statements: PendingRow[] = []
   for (const position of positions.values()) {
     if (position.dirty === 'insert') {
+      // A sell→re-buy inside one pass leaves the old row in place with a new
+      // entry in the map — clear the (bot_id, symbol) row first so the insert
+      // never trips the unique index.
+      statements.push({ sql: `DELETE FROM positions WHERE bot_id = ? AND symbol = ?`, bind: [bot.id, position.symbol] })
       statements.push({
         sql: `INSERT INTO positions (id, owner_sub, bot_id, symbol, qty, avg_price, opened_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
         bind: [position.id, owner, bot.id, position.symbol, position.qty, position.avgPrice, position.openedAt],

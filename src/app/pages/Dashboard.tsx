@@ -6,7 +6,7 @@ import { Badge, Button, Card, EmptyState, Live, PageHeader, Skeleton } from '../
 import { useDashboard } from '../lib/api'
 import { cx } from '../lib/cx'
 import { money, relativeTime } from '../lib/format'
-import { BOT_STAGES, type BotStage } from '../../shared/types'
+import { BOT_STAGES, activityOf, type BotStage } from '../../shared/types'
 
 const stageTone: Record<BotStage, string> = {
   draft: '#c6c6d2',
@@ -144,14 +144,17 @@ export function Dashboard() {
                 <li key={bot.id}>
                   <Link to={`/bots/${bot.id}`} className="flex items-center gap-3 py-3 transition-colors hover:bg-surface-2/60">
                     <span className="grid size-7 shrink-0 place-items-center rounded-[9px] bg-surface-2 text-muted [&_svg]:size-3.5">
-                      {bot.status === 'paused' ? <Pause /> : <BotIcon />}
+                      {bot.status === 'running' ? <BotIcon /> : <Pause />}
                     </span>
                     <span className="min-w-0 flex-1">
                       <span className="block truncate text-[13.5px] font-medium">{bot.name}</span>
                       <span className="block truncate text-[12.5px] text-faint">{bot.lastEvent ?? bot.strategyName}</span>
                     </span>
-                    <Badge tone={bot.status === 'paused' ? 'warning' : pnl >= 0 ? 'success' : 'danger'}>
-                      {bot.status === 'paused' ? 'Paused' : `${pnl >= 0 ? '+' : ''}${pnl.toFixed(1)}%`}
+                    <Badge
+                      tone={bot.status === 'paused' ? 'warning' : pnl >= 0 ? 'success' : 'danger'}
+                      title="Active: trading · Inactive: holding only · Grounded: no trades, no positions"
+                    >
+                      {bot.status === 'running' ? `${pnl >= 0 ? '+' : ''}${pnl.toFixed(1)}%` : activityOf(bot)}
                     </Badge>
                   </Link>
                 </li>

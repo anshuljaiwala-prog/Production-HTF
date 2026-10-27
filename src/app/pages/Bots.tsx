@@ -9,14 +9,14 @@ import { Badge, Button, Card, EmptyState, PageHeader, Skeleton } from '../compon
 import { useBots } from '../lib/api'
 import { cx } from '../lib/cx'
 import { money, relativeTime } from '../lib/format'
-import { BOT_STAGES, type Bot, type BotStatus } from '../../shared/types'
+import { ACTIVITIES, BOT_STAGES, activityOf, type Bot, type BotActivity } from '../../shared/types'
 
-const statusTone: Record<BotStatus, 'success' | 'warning' | 'neutral'> = { running: 'success', paused: 'warning', stopped: 'neutral' }
-const FILTERS: { key: BotStatus | 'all'; label: string }[] = [
+const activityTone: Record<BotActivity, 'success' | 'warning' | 'neutral'> = { active: 'success', inactive: 'warning', grounded: 'neutral' }
+const FILTERS: { key: BotActivity | 'all'; label: string }[] = [
   { key: 'all', label: 'All' },
-  { key: 'running', label: 'Running' },
-  { key: 'paused', label: 'Paused' },
-  { key: 'stopped', label: 'Stopped' },
+  { key: 'active', label: 'Active' },
+  { key: 'inactive', label: 'Inactive' },
+  { key: 'grounded', label: 'Grounded' },
 ]
 const TABS: { key: 'list' | 'board'; label: string }[] = [
   { key: 'list', label: 'Bot list' },
@@ -27,13 +27,13 @@ export function Bots() {
   const { data, isLoading } = useBots()
   const navigate = useNavigate()
   const [params, setParams] = useSearchParams()
-  const [filter, setFilter] = useState<BotStatus | 'all'>('all')
+  const [filter, setFilter] = useState<BotActivity | 'all'>('all')
   const [importing, setImporting] = useState(false)
   const view = params.get('tab') === 'board' ? 'board' : 'list'
 
   const items = useMemo(() => data?.items ?? [], [data])
-  const bots = useMemo(() => items.filter((bot) => filter === 'all' || bot.status === filter), [items, filter])
-  const running = items.filter((bot) => bot.status === 'running').length
+  const bots = useMemo(() => items.filter((bot) => filter === 'all' || activityOf(bot) === filter), [items, filter])
+  const active = items.filter((bot) => activityOf(bot) === 'active').length
 
   return (
     <div className="mx-auto max-w-[1200px] p-5 sm:p-8">
@@ -43,7 +43,7 @@ export function Bots() {
           data
             ? view === 'board'
               ? 'Drag bots across their lifecycle: draft → backtest → paper → live.'
-              : `${items.length} launched · ${running} running — each read fast-forwards the fleet`
+              : `${items.length} launched · ${active} active — each read fast-forwards the fleet`
             : undefined
         }
         actions={
@@ -140,9 +140,9 @@ export function Bots() {
                       {BOT_STAGES.find((s) => s.key === bot.stage)?.label}
                     </Badge>
                   </td>
-                  <td className="px-4">
-                    <Badge tone={statusTone[bot.status]} dot>
-                      {bot.status}
+                  <td className="px-4" title="Active: trading · Inactive: holding only · Grounded: not trading or holding">
+                    <Badge tone={activityTone[activityOf(bot)]} dot>
+                      {activityOf(bot)}
                     </Badge>
                   </td>
                   <td className="px-4 text-right tabular-nums">{money(bot.equity)}</td>
@@ -168,7 +168,7 @@ export function Bots() {
         {!isLoading && bots.length === 0 && (
           <EmptyState
             icon={<BotIcon />}
-            title={filter === 'all' ? 'No bots yet' : `No ${filter} bots`}
+            title= {filter === 'all' ? 'No bots yet' : `No ${ACTIVITIES.find((a) => a.key === filter)?.label.toLowerCase() ?? filter} bots`}
             description="Pick a strategy from the catalog, set your risk and launch it into paper mode."
             action={
               <Button variant="primary" onClick={() => navigate('/strategies')}>
@@ -211,7 +211,7 @@ function BotCharts({ items, isLoading }: { items: Bot[]; isLoading: boolean }) {
             format={(v) => `${v.toFixed(1)}%`}
             items={items.map((bot) => ({
               label: bot.name,
-              caption: `${bot.status} · ${bot.symbols[0]}`,
+              caption: `${activityOf(bot)} · ${bot.symbols[0]}`,
               value: bot.initialEquity > 0 ? ((bot.equity - bot.initialEquity) / bot.initialEquity) * 100 : 0,
             }))}
           />

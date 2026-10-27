@@ -6,7 +6,8 @@ import { id, mapBacktest, now } from '../db'
 import type { AppContext } from '../env'
 import { TIMEFRAME_MS, barsBetween } from '../market'
 import { sanitizeParams, strategyBy } from '../strategies'
-import type { Backtest, Candle, Timeframe } from '../../shared/types'
+import type { Backtest, Candle, SimBudget, Timeframe } from '../../shared/types'
+import { SIM_BUDGET } from '../../shared/types'
 
 type Row = Record<string, unknown>
 
@@ -29,6 +30,18 @@ const summary = (backtest: Backtest): Backtest => ({ ...withName(backtest), trad
 // a `running` row; the next read (list or detail) executes it and flips the
 // status to done or failed, so a UI that polls sees the transition without
 // any long-lived process.
+
+/** Backtests play with made-up money: a fixed simulation pot, reported with
+ * the list so the UI can show what is allocated. Deleting a run frees its
+ * allocation. */
+async function simBudget(db: D1Database, owner: string): Promise<SimBudget> {
+  const row = await db
+    .prepare(`SELECT COALESCE(SUM(capital), 0) AS v FROM backtests WHERE owner_sub = ?`)
+    .bind(owner)
+    .first<{ v: number }>()
+  const used = Number(row?.v ?? 0)
+  return { total: SIM_BUDGET, used, available: Math.max(0, SIM_BUDGET - used) }
+}
 
 /**
  * Executes one pending backtest and persists the outcome. Returns the row
@@ -64,15 +77,19 @@ async function resolveBacktest(db: D1Database, row: Row): Promise<Row> {
 
 backtests.get('/', async (c) => {
   const db = c.get('db')
+  const owner = c.get('user').sub
   const result = await db
     .prepare(`SELECT * FROM backtests WHERE owner_sub = ? ORDER BY created_at DESC LIMIT 50`)
-    .bind(c.get('user').sub)
+    .bind(owner)
     .all<Row>()
   const rows = result.results ?? []
   const pending = rows.filter((row) => String(row.status) === 'running').slice(0, MAX_RESOLVE_PER_REQUEST)
   const resolved = new Map<string, Row>()
   for (const row of pending) resolved.set(String(row.id), await resolveBacktest(db, row))
-  return privateJson(c, { items: rows.map((row) => summary(withName(mapBacktest(resolved.get(String(row.id)) ?? row)))) })
+  return privateJson(c, {
+    items: rows.map((row) => summary(withName(mapBacktest(resolved.get(String(row.id)) ?? row)))),
+    sim: await simBudget(db, owner),
+  })
 })
 
 backtests.get('/:id', async (c) => {
@@ -161,6 +178,14 @@ backtests.post('/', async (c) => {
   const capital = Number(body.capital)
   if (!Number.isFinite(capital) || capital < 100) {
     return c.json({ error: 'invalid_capital', message: 'Starting capital must be at least $100.' }, 400)
+  }
+  // Runs draw from the simulation pot, never from workspace funding.
+  const sim = await simBudget(db, owner)
+  if (capital > sim.available) {
+    return c.json(
+      { error: 'sim_budget_exhausted', message: `Backtests draw from the simulation pot — $${sim.available.toLocaleString('en-US')} available of the $${SIM_BUDGET.toLocaleString('en-US')} pot. Delete old runs to free money.` },
+      400,
+    )
   }
 
   const to = Number(body.to) || now()

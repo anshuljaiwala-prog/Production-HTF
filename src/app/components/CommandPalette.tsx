@@ -1,5 +1,5 @@
 import { AnimatePresence, motion } from 'motion/react'
-import { Bot, CandlestickChart, FlaskConical, LayoutGrid, Plug, Search, Wallet } from 'lucide-react'
+import { Bot, FlaskConical, LayoutGrid, Plug, Search, Wallet } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 import { useNavigate } from 'react-router'
 
@@ -53,7 +53,7 @@ export function CommandPalette({ open, onClose }: { open: boolean; onClose: () =
     { key: 's-dashboard', label: 'Go to dashboard', to: '/', icon: <LayoutGrid className="size-4 text-muted" /> },
   { key: 's-bots', label: 'Go to bots', to: '/bots', icon: <Bot className="size-4 text-muted" /> },
   { key: 's-board', label: 'Go to the lifecycle board', to: '/bots?tab=board', icon: <Bot className="size-4 text-muted" /> },
-    { key: 's-backtests', label: 'Go to backtests', to: '/backtests', icon: <CandlestickChart className="size-4 text-muted" /> },
+    { key: 's-backtests', label: 'Go to backtests', to: '/strategies?tab=backtests', icon: <FlaskConical className="size-4 text-muted" /> },
     { key: 's-portfolio', label: 'Go to portfolio', to: '/portfolio', icon: <Wallet className="size-4 text-muted" /> },
     { key: 's-connections', label: 'Go to connections', to: '/connections', icon: <Plug className="size-4 text-muted" /> },
   ]

@@ -3,7 +3,7 @@ import { useEffect, useRef, useState, type FormEvent } from 'react'
 import { useNavigate } from 'react-router'
 
 import { TIMEFRAMES, type ParamDef, type ParamValue, type Strategy, type Timeframe } from '../../shared/types'
-import { createConnection, importBots, launchBot, runBacktest, useApiMutation, useConnections, useStrategies, type BacktestInput, type LaunchInput } from '../lib/api'
+import { createConnection, importBots, launchBot, runBacktest, useApiMutation, useBacktests, useBots, useConnections, useStrategies, type BacktestInput, type LaunchInput } from '../lib/api'
 import { Badge, Button, Checkbox, Dialog, Field, Input, Select, useFieldId, useToast } from './ui'
 
 // Forms built from the strategy param schema, so the catalog, the launch
@@ -78,7 +78,7 @@ export function ParamFields({
   )
 }
 
-function SymbolPicker({ symbols, value, onChange }: { symbols: string[]; value: string[]; onChange: (next: string[]) => void }) {
+export function SymbolPicker({ symbols, value, onChange }: { symbols: string[]; value: string[]; onChange: (next: string[]) => void }) {
   return (
     <div className="grid gap-1.5">
       <span className="text-[13px] font-medium text-fg">Symbols</span>
@@ -265,8 +265,13 @@ export function BacktestDialog({ open, onClose, strategyKey }: { open: boolean; 
   const toast = useToast()
   const navigate = useNavigate()
   const { data: catalog } = useStrategies()
+  const { data: botList } = useBots()
+  const { data: backtestList } = useBacktests()
   const [picked, setPicked] = useState('')
-  const activeKey = strategyKey ?? picked
+  const [botId, setBotId] = useState('')
+  // A chosen bot drives the strategy too — its own strategyKey wins.
+  const bot = botList?.items.find((b) => b.id === botId)
+  const activeKey = strategyKey ?? (bot ? bot.strategyKey : picked)
   const strategy = catalog?.strategies.find((s) => s.key === activeKey)
   const catalogKey = catalog ? `${activeKey}:${catalog.symbols.join(',')}` : ''
 
@@ -281,21 +286,38 @@ export function BacktestDialog({ open, onClose, strategyKey }: { open: boolean; 
   const [days, setDays] = useState(30)
   const [params, setParams] = useState<Record<string, ParamValue>>({})
 
+  /** Form defaults: from the picked bot when one is chosen — market,
+   * timeframe, params and capital all come off the bot's real config — or
+   * strategy defaults otherwise. */
   useEffect(() => {
     if (!open || !strategy) return
-    setParams(paramDefaults(strategy))
-    setTimeframe(strategy.timeframes[Math.floor(strategy.timeframes.length / 2)])
-    setSymbol(catalog?.symbols[0] ?? '')
-    setCapital('10000')
-    setDays(strategy.timeframes[0] === '1m' || strategy.timeframes[0] === '5m' ? 7 : 30)
+    const bot = botList?.items.find((b) => b.id === botId)
+    const tf =
+      bot && bot.strategyKey === strategy.key && strategy.timeframes.includes(bot.timeframe)
+        ? bot.timeframe
+        : strategy.timeframes[Math.floor(strategy.timeframes.length / 2)]
+    if (bot && bot.strategyKey === strategy.key) {
+      setParams({ ...paramDefaults(strategy), ...bot.params })
+      setSymbol(bot.symbols[0] ?? catalog?.symbols[0] ?? '')
+      setCapital(String(bot.capital))
+    } else {
+      setParams(paramDefaults(strategy))
+      setSymbol(catalog?.symbols[0] ?? '')
+      setCapital('10000')
+    }
+    setTimeframe(tf)
+    // Default period must cover the strategy's lookback: daily bars need a
+    // year, 4-hour bars a quarter, faster bars a month; under it the engine
+    // refuses with "not enough history".
+    setDays(tf === '1d' ? 365 : tf === '4h' ? 90 : tf === '1m' || tf === '5m' ? 7 : 30)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, catalogKey])
+  }, [open, catalogKey, botId])
 
   const run = useApiMutation((input: BacktestInput) => runBacktest(input), ['backtests'], {
     onSuccess: (result) => {
       toast('Backtest complete')
       onClose()
-      navigate(`/backtests?id=${result.backtest.id}`)
+      navigate(`/strategies?tab=backtests&id=${result.backtest.id}`)
     },
   })
 
@@ -325,6 +347,18 @@ export function BacktestDialog({ open, onClose, strategyKey }: { open: boolean; 
     >
       <form id="backtest-form" onSubmit={submit} className="grid gap-5">
         {!strategyKey && (
+          <Field label="Start from a bot" hint="Prefills the market, timeframe, params and capital from an uploaded bot; everything stays editable.">
+            <FieldSelect value={botId} onChange={(e) => setBotId(e.target.value)}>
+              <option value="">Blank — strategy defaults below</option>
+              {(botList?.items ?? []).map((bot) => (
+                <option key={bot.id} value={bot.id}>
+                  {bot.name} · {bot.strategyName} · {bot.symbols.join(', ')}
+                </option>
+              ))}
+            </FieldSelect>
+          </Field>
+        )}
+        {!strategyKey && !botId && (
           <Field label="Strategy">
             <FieldSelect value={activeKey} onChange={(e) => setPicked(e.target.value)}>
               {catalog.strategies.map((s) => (
@@ -354,7 +388,14 @@ export function BacktestDialog({ open, onClose, strategyKey }: { open: boolean; 
               ))}
             </FieldSelect>
           </Field>
-          <Field label="Starting capital">
+          <Field
+            label="Starting capital"
+            hint={
+              backtestList?.sim
+                ? `sim-only money · ${backtestList.sim.available.toLocaleString('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 })} free of the 1M pot`
+                : 'sim-only money — never workspace funding'
+            }
+          >
             <span className="relative block">
               <span className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-[13.5px] text-faint">$</span>
               <FieldInput type="number" min={100} step={100} className="pl-7" value={capital} onChange={(e) => setCapital(e.target.value)} />

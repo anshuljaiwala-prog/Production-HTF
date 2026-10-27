@@ -1,4 +1,4 @@
-import { Bot, CandlestickChart, Check, FlaskConical, LayoutGrid, Menu as MenuIcon, Moon, Plug, Search, Settings, Sun, Wallet, X } from 'lucide-react'
+import { Bot, Check, FlaskConical, LayoutGrid, Menu as MenuIcon, Moon, Plug, Search, Settings, Sun, Wallet, X } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { NavLink, Outlet, useLocation } from 'react-router'
 
@@ -12,7 +12,6 @@ const links = [
   { to: '/', label: 'Dashboard', icon: LayoutGrid, end: true },
   { to: '/bots', label: 'Bots', icon: Bot },
   { to: '/strategies', label: 'Strategies', icon: FlaskConical },
-  { to: '/backtests', label: 'Backtests', icon: CandlestickChart },
   { to: '/portfolio', label: 'Portfolio', icon: Wallet },
   { to: '/connections', label: 'Connections', icon: Plug },
 ]

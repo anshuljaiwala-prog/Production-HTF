@@ -112,6 +112,7 @@ portfolio.get('/', async (c) => {
     return {
       id: bot.id,
       name: bot.name,
+      strategyKey: bot.strategyKey,
       strategyName: strategyBy(bot.strategyKey)?.name ?? bot.strategyKey,
       status: bot.status,
       mode: bot.mode,

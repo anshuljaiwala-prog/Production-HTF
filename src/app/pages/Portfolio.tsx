@@ -1,14 +1,15 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query'
-import { ArrowDownRight, ArrowUpRight, FileSearch, Plus, Minus, Wallet, X } from 'lucide-react'
-import { useState } from 'react'
+import { ArrowDownRight, ArrowUpRight, FileSearch, Plus, Minus, Settings2, Wallet, X } from 'lucide-react'
+import { useEffect, useState } from 'react'
 import { Link } from 'react-router'
 
 import { AreaChart, BarChart, CompareBars, DrawdownChart } from '../components/charts'
-import { Badge, Button, Card, EmptyState, Input, Live, PageHeader, Skeleton, useToast } from '../components/ui'
-import { adjustFunding, ApiError, useBot, usePortfolio } from '../lib/api'
+import { ParamFields, SymbolPicker } from '../components/forms'
+import { Badge, Button, Card, EmptyState, Field, Input, Live, PageHeader, Skeleton, useToast } from '../components/ui'
+import { adjustFunding, ApiError, controlBot, patchBot, useApiMutation, useBot, usePortfolio, useStrategies, type BotPatch } from '../lib/api'
 import { cx } from '../lib/cx'
 import { money, moneyExact, moneyExactPlain, relativeTime, shortDate } from '../lib/format'
-import type { CashFlow, EquityPoint, Portfolio, PortfolioBotAudit, PortfolioPosition, PortfolioTransaction } from '../../shared/types'
+import { TIMEFRAMES, activityOf, type CashFlow, type EquityPoint, type ParamValue, type Portfolio, type PortfolioBotAudit, type PortfolioPosition, type PortfolioTransaction, type Timeframe } from '../../shared/types'
 
 const pnlText = (value: number) => `${value >= 0 ? '+' : ''}${money(value)}`
 const mark = (value: number) => (value >= 0 ? 'text-success' : 'text-danger')
@@ -17,6 +18,11 @@ const statusDot: Record<PortfolioBotAudit['status'], string> = {
   running: 'bg-success',
   paused: 'bg-warning',
   stopped: 'bg-line-strong',
+}
+const activityTone: Record<ReturnType<typeof activityOf>, 'success' | 'warning' | 'neutral'> = {
+  active: 'success',
+  inactive: 'warning',
+  grounded: 'neutral',
 }
 
 export function Portfolio() {
@@ -142,7 +148,7 @@ function FleetAudit({ data, live }: { data: Portfolio; live: boolean }) {
                 format={(v) => `${v.toFixed(1)}%`}
                 items={data.bots.map((bot) => ({
                   label: bot.name,
-                  caption: `${bot.strategyName} · ${bot.status}`,
+                  caption: `${bot.strategyName} · ${activityOf(bot)}`,
                   value: bot.capital > 0 ? ((bot.equity - bot.capital) / bot.capital) * 100 : 0,
                 }))}
               />
@@ -372,10 +378,11 @@ function BotAuditRow({ bot }: { bot: PortfolioBotAudit }) {
       <td className={cx('px-2 text-right tabular-nums text-muted', mark(bot.unrealizedPnl))}>{moneyExactPlain(bot.unrealizedPnl)}</td>
       <td className="px-2 text-right tabular-nums text-faint">{moneyExactPlain(bot.fees)}</td>
       <td className="px-2 text-right tabular-nums text-muted">{bot.fills}</td>
-      <td className="px-2 text-right tabular-nums text-muted">{bot.winRate === null ? '—' : `${bot.winRate.toFixed(0)}%`}</td>
-      <td className="px-5 text-right">
-        <Badge tone={bot.status === 'running' ? 'success' : bot.status === 'paused' ? 'warning' : 'neutral'} dot>
-          {bot.status}
+      <td className="px-2 text-right tabular-nums text-muted">{bot.winRate === null ? '—' : `${bot.winRate.toFixed(0)}%`}
+      </td>
+      <td className="px-5 text-right" title="Active: trading · Inactive: holding only · Grounded: no trades, no positions">
+        <Badge tone={activityTone[activityOf(bot)]} dot>
+          {activityOf(bot)}
         </Badge>
       </td>
     </tr>
@@ -441,12 +448,17 @@ function BotPerformance({ audit, flows, onBack }: { audit: PortfolioBotAudit; fl
             Close tab
           </button>
           <h2 className="text-[16px] font-semibold">{audit.name}</h2>
-          <Badge tone={audit.status === 'running' ? 'success' : audit.status === 'paused' ? 'warning' : 'neutral'} dot>
-            {audit.status}
+          <Badge
+            tone={activityTone[activityOf(audit)]}
+            dot
+            title="Active: trading · Inactive: holding only · Grounded: no trades, no positions"
+          >
+            {activityOf(audit)}
           </Badge>
           <Badge tone="accent">{audit.strategyName}</Badge>
           <Badge tone={audit.mode === 'live' ? 'success' : 'info'}>{audit.mode}</Badge>
           {audit.status === 'running' && <Live active label="live · 2s" />}
+          <BotControls botId={audit.id} status={audit.status} />
           <Link to={`/bots/${audit.id}`} className="ml-auto text-[12.5px] text-muted transition-colors hover:text-fg">
             Open run monitor
           </Link>
@@ -525,6 +537,8 @@ function BotPerformance({ audit, flows, onBack }: { audit: PortfolioBotAudit; fl
       </div>
 
       <FundingPanel audit={audit} flows={flows} />
+
+      <SettingsPanel audit={audit} />
 
       <div className="mt-3 grid gap-3 lg:grid-cols-2">
         <PositionsCard positions={positions} title="Open positions" countLabel={positions.length} />
@@ -619,6 +633,168 @@ function FundingPanel({ audit, flows }: { audit: PortfolioBotAudit; flows: CashF
           ))
           }
         </ul>
+      )}
+    </Card>
+  )
+}
+
+/** Start/pause/stop controls for one bot's performance tab, so the bot can
+ * be made inactive without leaving the page. */
+function BotControls({ botId, status }: { botId: string; status: PortfolioBotAudit['status'] }) {
+  const toast = useToast()
+  const client = useQueryClient()
+  const control = useMutation({
+    mutationFn: (action: 'start' | 'pause' | 'stop') => controlBot(botId, action),
+    onSuccess: (_result, action) => {
+      toast(action === 'start' ? 'Bot started' : action === 'pause' ? 'Bot paused' : 'Bot stopped')
+      void Promise.all(['bots', 'bot', 'portfolio', 'dashboard'].map((key) => client.invalidateQueries({ queryKey: [key] })))
+    },
+    onError: (error) => toast(error instanceof ApiError ? error.message : 'Control action failed', 'danger'),
+  })
+  const busy = control.isPending || control.isSuccess
+  return (
+    <div className="flex items-center gap-1">
+      {status === 'running' ? (
+        <>
+          <Button size="sm" disabled={busy} title="Pause — holds positions, opens nothing new" onClick={() => control.mutate('pause')}>
+            Pause
+          </Button>
+          <Button size="sm" disabled={busy} title="Stop — closes activity for good" onClick={() => control.mutate('stop')}>
+            Stop
+          </Button>
+        </>
+      ) : (
+        <>
+          <Button size="sm" variant="primary" disabled={busy} title="Start — resumes active trading" onClick={() => control.mutate('start')}>
+            {status === 'paused' ? 'Resume' : 'Start'}
+          </Button>
+          {status === 'paused' && (
+            <Button size="sm" disabled={busy} onClick={() => control.mutate('stop')}>
+              Stop
+            </Button>
+          )}
+        </>
+      )}
+    </div>
+  )
+}
+
+/** Per-bot settings editor. Trading settings (name, symbols, timeframe,
+ * risk, params) only ever change while the bot is not active — pause first,
+ * so nothing it decides on mutates mid-run. */
+function SettingsPanel({ audit }: { audit: PortfolioBotAudit }) {
+  const toast = useToast()
+  const { data: detail } = useBot(audit.id)
+  const { data: catalog } = useStrategies()
+  const strategy = catalog?.strategies.find((s) => s.key === audit.strategyKey)
+  const bot = detail?.bot
+  const active = activityOf(audit) === 'active'
+  const [open, setOpen] = useState(false)
+
+  const [name, setName] = useState('')
+  const [symbols, setSymbols] = useState<string[]>([])
+  const [timeframe, setTimeframe] = useState<Timeframe>('1h')
+  const [riskPct, setRiskPct] = useState('25')
+  const [params, setParams] = useState<Record<string, ParamValue>>({})
+
+  // Re-seed the form from the bot's live config every time the editor opens.
+  useEffect(() => {
+    if (!open || !bot) return
+    setName(bot.name)
+    setSymbols(bot.symbols)
+    setTimeframe(bot.timeframe)
+    setRiskPct(String(bot.riskPct))
+    setParams(bot.params)
+  }, [open, bot])
+
+  const save = useApiMutation((patch: BotPatch) => patchBot(audit.id, patch), ['bots', 'bot', 'portfolio', 'search'], {
+    onSuccess: () => {
+      toast('Bot settings saved')
+      setOpen(false)
+    },
+  })
+
+  // Stopped (grounded) bots are the safest to edit — nothing is held or
+  // trading — so the editor shows for them too, unlike active bots.
+  function submit(e: React.FormEvent) {
+    e.preventDefault()
+    if (active) return
+    save.mutate({
+      name: name.trim() || undefined,
+      symbols,
+      timeframe,
+      riskPct: Number(riskPct),
+      params,
+    })
+  }
+
+  return (
+    <Card className="mt-3 p-5">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div>
+          <h3 className="flex items-center gap-1.5 text-[14px] font-semibold">
+            <Settings2 className="size-4 text-muted" />
+            Bot settings
+          </h3>
+          <p className="mt-0.5 text-[12px] text-faint">
+            {active
+              ? 'This bot is actively trading — pause it above to change its settings.'
+              : 'The bot is not holding or trading: its settings can change right now.'}
+          </p>
+        </div>
+        <Button
+          size="sm"
+          variant={open ? undefined : 'primary'}
+          disabled={active || save.isPending}
+          title={active ? 'Pause the bot before editing its trading settings.' : undefined}
+          onClick={() => setOpen((v) => !v)}
+        >
+          {open ? 'Close editor' : 'Edit settings'}
+        </Button>
+      </div>
+
+      {open && bot && strategy && (
+        <form onSubmit={submit} className="mt-4 grid gap-4 border-t border-line pt-4">
+          <div className="grid grid-cols-2 gap-3">
+            <Field label="Bot name">
+              <Input value={name} onChange={(e) => setName(e.target.value)} maxLength={90} />
+            </Field>
+            <Field label="Timeframe">
+              <select
+                value={timeframe}
+                onChange={(e) => setTimeframe(e.target.value as Timeframe)}
+                className="h-9 rounded-control border border-line-strong bg-surface px-3 text-[13.5px] text-fg outline-none focus:border-accent"
+              >
+                {TIMEFRAMES.filter((tf) => strategy.timeframes.includes(tf.key)).map((tf) => (
+                  <option key={tf.key} value={tf.key}>
+                    {tf.label}
+                  </option>
+                ))}
+              </select>
+            </Field>
+          </div>
+
+          <SymbolPicker symbols={catalog?.symbols ?? []} value={symbols} onChange={setSymbols} />
+
+          <div className="grid grid-cols-2 gap-3">
+            <Field label="Risk per entry" hint="% of equity committed on each entry">
+              <Input type="number" min={1} max={100} step={1} value={riskPct} onChange={(e) => setRiskPct(e.target.value)} />
+            </Field>
+          </div>
+
+          <ParamFields params={params} defs={strategy.params} onChange={setParams} />
+
+          <div className="flex items-center gap-2">
+            <Button variant="primary" type="submit" loading={save.isPending} disabled={active}>
+              Save settings
+            </Button>
+            <Button type="button" onClick={() => setOpen(false)}>
+              Cancel
+            </Button>
+            {active && <span className="text-[12px] text-warning">Bot is active — settings are frozen until it pauses.</span>}
+          </div>
+          {save.error && <p className="text-[13px] text-danger">{save.error.message}</p>}
+        </form>
       )}
     </Card>
   )

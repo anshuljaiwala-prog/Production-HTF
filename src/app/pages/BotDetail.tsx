@@ -7,7 +7,7 @@ import { Badge, Button, Card, ConfirmDialog, EmptyState, Live, PageHeader, Skele
 import { controlBot, deleteBot, patchBot, useApiMutation, useBot } from '../lib/api'
 import { cx } from '../lib/cx'
 import { money, relativeTime, shortDate } from '../lib/format'
-import { BOT_STAGES, type BotStage } from '../../shared/types'
+import { BOT_STAGES, activityOf, type BotStage } from '../../shared/types'
 
 export function BotDetail() {
   const { id } = useParams()
@@ -19,7 +19,7 @@ export function BotDetail() {
   const control = useApiMutation(
     (action: 'start' | 'pause' | 'stop') => controlBot(id!, action),
     ['bot', 'bots', 'dashboard'],
-    { onSuccess: (result) => toast(`Bot ${result.bot.status}`) },
+    { onSuccess: (result) => toast(`Bot is now ${activityOf(result.bot)}`) },
   )
   const remove = useApiMutation(() => deleteBot(id!), ['bots', 'bot', 'dashboard'], {
     onSuccess: () => {
@@ -113,8 +113,12 @@ export function BotDetail() {
         />
 
         <div className="mt-3 flex flex-wrap items-center gap-2">
-          <Badge tone={bot.status === 'running' ? 'success' : bot.status === 'paused' ? 'warning' : 'neutral'} dot>
-            {bot.status}
+          <Badge
+            tone={bot.status === 'running' ? 'success' : bot.status === 'paused' ? 'warning' : 'neutral'}
+            dot
+            title="Active: trading · Inactive: holding only · Grounded: no trades, no positions"
+          >
+            {activityOf(bot)}
           </Badge>
           <Badge tone={bot.mode === 'live' ? 'success' : 'info'}>{bot.mode} mode</Badge>
           <Badge tone="accent">{bot.strategyName}</Badge>

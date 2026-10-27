@@ -105,7 +105,10 @@ workspace.get('/overview', async (c) => {
   )
   const realizedToday = Number((today.results[0] as { v: number }).v ?? 0)
 
-  const capitalDeployed = bots.reduce((sum, b) => sum + b.equity, 0)
+  // Deployed capital counts only live bots — paper bots and backtests play
+  // with the simulation pot, not the workspace's real(ish) money.
+  const liveBots = bots.filter((b) => b.mode === 'live')
+  const capitalDeployed = liveBots.reduce((sum, b) => sum + b.equity, 0)
   const wins = bots.reduce((sum, b) => sum + b.wins, 0)
   const roundTrips = bots.reduce((sum, b) => sum + b.roundTrips, 0)
   const stageRows = stages.results as { stage: Dashboard['stageTotals'][number]['stage']; n: number }[]
@@ -113,6 +116,7 @@ workspace.get('/overview', async (c) => {
   const body: Dashboard = {
     kpis: {
       capitalDeployed,
+      liveBots: liveBots.length,
       activeBots: bots.filter((b) => b.status === 'running').length,
       todayPnl: realizedToday + unrealized,
       winRate: roundTrips > 0 ? (wins / roundTrips) * 100 : null,
