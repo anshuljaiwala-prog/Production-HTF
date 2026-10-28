@@ -92,6 +92,105 @@ export interface CustomStrategySummary {
   createdAt: number
   /** Rule count across entry and exit lists — a rough size hint. */
   rules: number
+  /** Version of this strategy family (1 for the first upload; re-uploads of
+   * the same name store a new version alongside the old ones). */
+  version: number
+  /** Total stored versions in the family — how much history is retained. */
+  versions: number
+}
+
+// --- Uploaded (custom) rules ------------------------------------------------
+
+/** One testable condition, e.g. { metric: 'rsi', n: 14, op: '<', value: 30 }. */
+export interface CustomRule {
+  metric: 'rsi' | 'ema' | 'zscore' | 'donchianHigh' | 'donchianLow' | 'momentum'
+  /** Window for the metric (default per metric). */
+  n: number
+  /** ema only: second window for a fast/slow relationship. */
+  n2?: number
+  op: '>' | '<'
+  /** Threshold; unit depends on the metric (see METRIC_BOUNDS). */
+  value: number
+}
+
+export interface CustomRules {
+  name: string
+  entry: CustomRule[]
+  entryLogic: 'all' | 'any'
+  exit: CustomRule[]
+  exitLogic: 'all' | 'any'
+  stopLossPct: number
+  takeProfitPct: number
+}
+
+/** Per-metric bounds for validation (n window range, human hint) plus the
+ * sweep style the optimizer uses when a threshold becomes a tuning knob:
+ * an absolute range and a band around the current value for a sane default
+ * grid. One table, shared by the parser and the knob builder. */
+export const METRIC_BOUNDS: Record<CustomRule['metric'], {
+  nMin: number
+  nMax: number
+  valueHint: string
+  min: number
+  max: number
+  band: number
+  step: number
+  unit?: string
+}> = {
+  rsi: { nMin: 2, nMax: 100, valueHint: 'RSI level, 0–100', min: 0, max: 100, band: 20, step: 2 },
+  ema: { nMin: 2, nMax: 200, valueHint: 'gap of close vs EMA(n), in percent (n2 for a fast/slow pair)', min: -50, max: 50, band: 2, step: 0.1, unit: '%' },
+  zscore: { nMin: 2, nMax: 200, valueHint: 'z-score of close vs rolling mean(n)', min: -8, max: 8, band: 1, step: 0.1 },
+  donchianHigh: { nMin: 2, nMax: 400, valueHint: 'distance of close above the highest high of the last n bars, in percent (negative = below)', min: -50, max: 50, band: 5, step: 0.5, unit: '%' },
+  donchianLow: { nMin: 2, nMax: 400, valueHint: 'distance of close below the lowest low of the last n bars, in percent (negative = above)', min: -50, max: 50, band: 5, step: 0.5, unit: '%' },
+  momentum: { nMin: 2, nMax: 400, valueHint: 'return over n bars, in percent', min: -100, max: 100, band: 10, step: 0.5, unit: '%' },
+}
+
+const round4 = (v: number) => Math.round(v * 10_000) / 10_000
+
+/** Tunable knobs for an uploaded rules payload: every entry/exit threshold
+ * plus the stop and target, as ParamDefs the optimizer and the Training form
+ * both understand. A rule's default sweep is a band around its current value
+ * so a first grid starts near something meaningful. Knob keys for thresholds
+ * are dotted (`entry.0.value`) — the optimizer bakes them back into the
+ * rules blob before each run. */
+export function customKnobDefs(rules: CustomRules): ParamDef[] {
+  const ruleDef = (rule: CustomRule, key: string, label: string): ParamDef => {
+    const bounds = METRIC_BOUNDS[rule.metric]
+    return {
+      key,
+      label,
+      type: 'number',
+      default: rule.value,
+      min: round4(Math.max(bounds.min, rule.value - bounds.band)),
+      max: round4(Math.min(bounds.max, rule.value + bounds.band)),
+      step: bounds.step,
+      unit: bounds.unit,
+      hint: bounds.valueHint,
+    }
+  }
+  return [
+    ...rules.entry.map((rule, i) => ruleDef(rule, `entry.${i}.value`, `Entry ${i + 1} threshold (${rule.metric})`)),
+    ...rules.exit.map((rule, i) => ruleDef(rule, `exit.${i}.value`, `Exit ${i + 1} threshold (${rule.metric})`)),
+    { key: 'stopLossPct', label: 'Stop loss', type: 'number', default: rules.stopLossPct, min: 0, max: 90, step: 0.5, unit: '%', hint: '0 disables' },
+    { key: 'takeProfitPct', label: 'Take profit', type: 'number', default: rules.takeProfitPct, min: 0, max: 500, step: 1, unit: '%' },
+  ]
+}
+
+// --- Edge comparison --------------------------------------------------------
+
+/** One bot's row in the fleet-wide market-edge ranking: how well its
+ * strategy's entry signals predict the next bar, ranked best first. */
+export interface BotEdge {
+  rank: number
+  botId: string
+  name: string
+  strategyName: string
+  symbol: string | null
+  timeframe: Timeframe
+  status: BotStatus
+  stage: BotStage
+  accuracy: AccuracyStat
+  live: { wins: number; roundTrips: number; hitRate: number | null }
 }
 
 /** Drives both the launch wizard and the backtest form from one definition. */
@@ -221,6 +320,11 @@ export interface RunMetrics {
 /** Pot of made-up money backtests draw from. Backtests are hypotheticals:
  * they never touch workspace funding, only this simulation budget. */
 export const SIM_BUDGET = 1_000_000
+
+/** Cap on a training sweep's parameter combinations — enforced server-side
+ * and mirrored by the Training form so the button never promises a run the
+ * optimizer will reject. */
+export const TRAIN_MAX_COMBOS = 12
 
 export interface SimBudget {
   total: number

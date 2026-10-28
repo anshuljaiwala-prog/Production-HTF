@@ -186,7 +186,7 @@ export function LaunchWizard({
     setCapital('10000')
     setRiskPct('25')
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, catalogKey, connectionIds])
+  }, [open, catalogKey, connectionIds, strategy?.key ?? null])
 
   const launch = useApiMutation((input: LaunchInput) => launchBot(input), ['bots', 'bot', 'dashboard', 'search'], {
       onSuccess: (result) => {
@@ -356,6 +356,8 @@ export function BacktestDialog({
             lookback: Number((botRules.entry as { n?: number }[] | undefined)?.[0]?.n ?? 64) || 64,
             createdAt: 0,
             rules: (Array.isArray(botRules.entry) ? botRules.entry.length : 0) + (Array.isArray(botRules.exit) ? botRules.exit.length : 0),
+            version: 1,
+            versions: 1,
           },
           rules: botRules,
         })

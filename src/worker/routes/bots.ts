@@ -278,6 +278,55 @@ interface ValidateRowResult {
 
 const ACCURACY_WINDOW_BARS = 900
 
+/** Fleet-wide market-edge ranking: every bot scored with the same window,
+ * best directional accuracy first — the comparison view behind
+ * `GET /bots/accuracy`. Bars are cached per symbol+timeframe so a fleet
+ * sharing markets scores every strategy against identical data. */
+bots.get('/accuracy', async (c) => {
+  const db = c.get('db')
+  const owner = c.get('user').sub
+  const fleet = await loadBots(db, owner)
+  const to = now()
+  const barCache = new Map<string, ReturnType<typeof barsBetween>>()
+  const scored = fleet.map((bot) => {
+    const tfMs = TIMEFRAME_MS[bot.timeframe]
+    const symbol = bot.symbols[0] ?? 'BTC-USD'
+    const cacheKey = `${symbol}|${bot.timeframe}`
+    let bars = barCache.get(cacheKey)
+    if (!bars) {
+      bars = barsBetween(symbol, bot.timeframe, to - ACCURACY_WINDOW_BARS * tfMs, to + tfMs)
+      barCache.set(cacheKey, bars)
+    }
+    const accuracy = measureAccuracy(bot.strategyKey, bot.params, bars, tfMs)
+    return {
+      botId: bot.id,
+      name: bot.name,
+      strategyName: withStrategy(bot).strategyName,
+      symbol: bot.symbols[0] ?? null,
+      timeframe: bot.timeframe,
+      status: bot.status,
+      stage: bot.stage,
+      accuracy,
+      live: {
+        wins: bot.wins,
+        roundTrips: bot.roundTrips,
+        hitRate: bot.roundTrips > 0 ? (bot.wins / bot.roundTrips) * 100 : null,
+      },
+    }
+  })
+  // Highest directional accuracy first; bots whose rules never fire sink to
+  // the bottom instead of floating on a null.
+  scored.sort(
+    (a, b) =>
+      (b.accuracy.directionalAccuracy ?? -1) - (a.accuracy.directionalAccuracy ?? -1) ||
+      (b.accuracy.edgePct ?? Number.NEGATIVE_INFINITY) - (a.accuracy.edgePct ?? Number.NEGATIVE_INFINITY),
+  )
+  return privateJson(c, {
+    items: scored.map((row, index) => ({ ...row, rank: index + 1 })),
+    window: { bars: ACCURACY_WINDOW_BARS, to },
+  })
+})
+
 /** Prediction accuracy for one bot: how well its strategy's entry rules
  * forecast the next bar over a bounded recent window of the feed, plus the
  * realised hit rate of its actual round trips alongside it. Analytic and
@@ -397,8 +446,28 @@ bots.patch('/:id', async (c) => {
   if (symbols.length === 0) return c.json({ error: 'invalid_symbols', message: 'Keep at least one symbol.' }, 400)
   const timeframe = body.timeframe !== undefined && strategy?.timeframes.includes(body.timeframe) ? body.timeframe : bot.timeframe
   const riskPct = Number.isFinite(Number(body.riskPct)) && body.riskPct !== undefined ? Math.min(100, Math.max(1, Number(body.riskPct))) : bot.riskPct
-  // Custom bots keep their rules blob — the editor sends no schema params.
-  const params = body.params !== undefined && bot.strategyKey !== 'custom' ? sanitizeParams(bot.strategyKey, body.params) : bot.params
+  // Catalog strategies sanitize against their schema; a custom bot accepts a
+  // re-validated rules blob — that is how the trainer's baked thresholds land
+  // on an uploaded-rules bot. The editor itself sends no params for them, so
+  // an absent rules key keeps the stored blob untouched.
+  let params = bot.params
+  if (body.params !== undefined && bot.strategyKey !== 'custom') {
+    params = sanitizeParams(bot.strategyKey, body.params)
+  } else if (body.params !== undefined && body.params.rules !== undefined) {
+    try {
+      const raw = typeof body.params.rules === 'string' ? JSON.parse(body.params.rules) : body.params.rules
+      const parsed = parseRules(raw)
+      const stop = Number(body.params.stopLossPct)
+      const target = Number(body.params.takeProfitPct)
+      params = rulesToParams(
+        parsed.rules,
+        Number.isFinite(stop) ? stop : parsed.rules.stopLossPct,
+        Number.isFinite(target) ? target : parsed.rules.takeProfitPct,
+      )
+    } catch (error) {
+      return c.json({ error: 'invalid_rules', message: error instanceof Error ? error.message : 'Invalid rules payload.' }, 400)
+    }
+  }
   const connectionId = body.connectionId !== undefined ? (body.connectionId === null ? null : String(body.connectionId)) : bot.connectionId
 
   // Diff the applied settings against what was stored so the event stream
@@ -416,6 +485,12 @@ bots.patch('/:id', async (c) => {
       .filter((key) => JSON.stringify(params[key]) !== JSON.stringify(bot.params[key]))
       .map((key) => `${key} ${bot.params[key]} → ${params[key]}`)
     if (paramChanges.length) changes.push(`params: ${paramChanges.join(', ')}`)
+  } else if (JSON.stringify(params) !== JSON.stringify(bot.params)) {
+    const customChanges: string[] = []
+    if (params.stopLossPct !== bot.params.stopLossPct) customChanges.push(`stop ${bot.params.stopLossPct}% → ${params.stopLossPct}%`)
+    if (params.takeProfitPct !== bot.params.takeProfitPct) customChanges.push(`target ${bot.params.takeProfitPct}% → ${params.takeProfitPct}%`)
+    if (JSON.stringify(params.rules) !== JSON.stringify(bot.params.rules)) customChanges.push('rule thresholds retuned')
+    if (customChanges.length) changes.push(`params: ${customChanges.join(', ')}`)
   }
 
   await db
@@ -462,17 +537,23 @@ bots.post('/:id/control', async (c) => {
   // (it holds its book and opens nothing until resumed); resuming starts it
   // again. Aliases of stop/start with their own vocabulary in the event log.
   const status: BotStatus = action === 'start' || action === 'resume' ? 'running' : action === 'pause' ? 'paused' : 'stopped'
-  await db
-    .prepare(`UPDATE bots SET status = ?, started_at = COALESCE(started_at, ?), updated_at = ? WHERE id = ? AND owner_sub = ?`)
-    .bind(status, t, t, botId, owner)
+  // The transition guard lives in the WHERE clause, not in a comparison
+  // against the row we loaded above: a double-click races two requests that
+  // both read the old status, and only a conditional write tells us which
+  // one actually moved the row — so exactly one of them logs the event.
+  const moved = await db
+    .prepare(`UPDATE bots SET status = ?, started_at = COALESCE(started_at, ?), updated_at = ? WHERE id = ? AND owner_sub = ? AND status != ?`)
+    .bind(status, t, t, botId, owner, status)
     .run()
-  const controlEvent =
-    action === 'ground'
-      ? 'Grounded by operator — no new trades until resumed.'
-      : action === 'resume'
-        ? 'Resumed by operator — trading again.'
-        : `${status === 'running' ? 'Started' : status === 'paused' ? 'Paused' : 'Stopped'} by operator.`
-  await logEvent(db, owner, botId, 'info', controlEvent)
+  if (moved.meta.changes) {
+    const controlEvent =
+      action === 'ground'
+        ? 'Grounded by operator — no new trades until resumed.'
+        : action === 'resume'
+          ? 'Resumed by operator — trading again.'
+          : `${status === 'running' ? 'Started' : status === 'paused' ? 'Paused' : 'Stopped'} by operator.`
+    await logEvent(db, owner, botId, 'info', controlEvent)
+  }
 
   let updated = (await loadBot(db, owner, botId)) ?? bot
   if (status === 'running') {

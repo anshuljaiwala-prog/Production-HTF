@@ -6,9 +6,9 @@ import { id, mapBacktest, mapBot, now } from '../db'
 import type { AppContext } from '../env'
 import { HISTORY_YEARS, TIMEFRAME_MS, barsBetween, historyStart } from '../market'
 import type { CustomRules } from '../strategies'
-import { parseRules, rulesToParams, sanitizeParams, strategyBy } from '../strategies'
+import { applyCustomKnobs, parseRules, rulesToParams, sanitizeParams, strategyBy } from '../strategies'
 import type { AccuracyStat, Backtest, Candle, EquityPoint, ParamDef, ParamValue, RunMetrics, SimBudget, Timeframe } from '../../shared/types'
-import { SIM_BUDGET } from '../../shared/types'
+import { customKnobDefs, SIM_BUDGET, TRAIN_MAX_COMBOS } from '../../shared/types'
 
 type Row = Record<string, unknown>
 
@@ -139,7 +139,7 @@ backtests.get('/:id/market', async (c) => {
     .first<Row>()
   if (!row) return c.json({ error: 'not_found', message: 'Backtest not found.' }, 404)
   const backtest = mapBacktest(await resolveBacktest(c.get('db'), row))
-  const { from, to } = backtestWindow(backtest.timeframe, backtest.from, backtest.to)
+  const { from, to } = backtestWindow(backtest.timeframe, backtest.from, backtest.to, now())
   if (to <= from) return privateJson(c, { backtestId: backtest.id, bars: 0, candles: [] })
   const bars = barsBetween(backtest.symbol, backtest.timeframe, from, to + 1)
   return privateJson(c, {
@@ -208,19 +208,22 @@ backtests.post('/', async (c) => {
     )
   }
 
-  const to = Number(body.to) || now()
+  const clock = now()
+  const to = Number(body.to) || clock
   const requested = Number(body.from) || to - DEFAULTS[timeframe] * 86_400_000
   // The platform retains HISTORY_YEARS of stored history — a run entirely
   // outside that window has no data to replay.
-  if (to < historyStart(now())) {
+  if (to < historyStart(clock)) {
     return c.json(
       { error: 'outside_history', message: `Stored history covers the last ${HISTORY_YEARS} years — pick a period that reaches into it.` },
       400,
     )
   }
-  // Keep the run bounded: the engine caps a backtest at MAX_BARS bars and
-  // never replays earlier than the stored-history window.
-  const from = Math.max(requested, to - MAX_BARS * TIMEFRAME_MS[timeframe], historyStart(to))
+  // Keep the run bounded: the engine caps a backtest at MAX_BARS bars, and a
+  // user-entered range can never start before the retention edge as of now —
+  // rolling the window five years back from the run's end would otherwise
+  // replay data the market API reports as no longer stored.
+  const from = Math.max(requested, to - MAX_BARS * TIMEFRAME_MS[timeframe], historyStart(clock))
 
   const backtestId = id()
   const createdAt = now()
@@ -264,7 +267,7 @@ interface VaryParam {
   steps: number
 }
 
-const MAX_COMBOS = 12
+const MAX_COMBOS = TRAIN_MAX_COMBOS
 const MAX_VARY_STEPS = 6
 const OPTIMIZE_DAYS_MIN = 30
 const OPTIMIZE_DAYS_MAX = 5 * 365
@@ -296,6 +299,9 @@ backtests.post('/optimize', async (c) => {
     days?: number
     objective?: 'return' | 'sharpe'
     vary?: VaryParam[]
+    /** Upload a rules payload inline, pointing the run at the `custom`
+     * strategist with these rules instead of a catalog template. */
+    rules?: unknown
   }>()
 
   // A bot config seeds every field: pick "train this bot" and its strategy,
@@ -306,6 +312,20 @@ backtests.post('/optimize', async (c) => {
   let timeframe = body.timeframe
   let capital = Number(body.capital)
   let sourceName = 'new config'
+  // Uploaded rules train two ways: an inline payload (standalone) or any
+  // custom-rules bot. Either way the rules become the base params and their
+  // thresholds become sweepable knobs below.
+  let baseRules: CustomRules | null = null
+  if (body.rules !== undefined) {
+    try {
+      baseRules = parseRules(body.rules).rules
+    } catch (error) {
+      return c.json({ error: 'invalid_rules', message: error instanceof Error ? error.message : 'Invalid rules.' }, 400)
+    }
+    strategyKey = 'custom'
+    baseParams = rulesToParams(baseRules)
+    sourceName = baseRules.name
+  }
   if (body.botId) {
     const botRow = await db
       .prepare(`SELECT * FROM bots WHERE id = ? AND owner_sub = ?`)
@@ -314,13 +334,16 @@ backtests.post('/optimize', async (c) => {
     if (!botRow) return c.json({ error: 'not_found', message: 'Bot not found.' }, 404)
     const bot = mapBot(botRow)
     if (bot.strategyKey === 'custom') {
-      return c.json(
-        { error: 'custom_strategy', message: 'Uploaded-rules bots have no tunable parameters to train — backtest them from the Backtests tab instead.' },
-        400,
-      )
+      // Custom bots carry their rules inline — same training path as an
+      // inline payload, seeded with the bot's stored config.
+      try {
+        baseRules = parseRules(JSON.parse(String(bot.params.rules ?? ''))).rules
+      } catch (error) {
+        return c.json({ error: 'invalid_rules', message: error instanceof Error ? error.message : 'The bot\u2019s rules payload is unreadable.' }, 400)
+      }
     }
-    strategyKey = bot.strategyKey
     baseParams = bot.params
+    strategyKey = bot.strategyKey
     symbol = bot.symbols[0] ?? symbol
     timeframe = bot.timeframe
     capital = bot.capital
@@ -341,14 +364,16 @@ backtests.post('/optimize', async (c) => {
   const days = Math.min(OPTIMIZE_DAYS_MAX, Math.max(OPTIMIZE_DAYS_MIN, Math.round(Number(body.days) || DEFAULTS[tf] * 2)))
   const objective: 'return' | 'sharpe' = body.objective === 'return' ? 'return' : 'sharpe'
 
-  // Build the grid: 1–2 numeric knobs from the strategy's own param schema.
+  // Build the grid: 1–2 numeric knobs. Catalog strategies sweep their own
+  // param schema; uploaded rules sweep their thresholds and stop/target.
+  const knobDefs = strategy.key === 'custom' && baseRules ? customKnobDefs(baseRules) : strategy.params
   const vary = (Array.isArray(body.vary) ? body.vary : []).slice(0, 2)
   if (vary.length === 0) {
     return c.json({ error: 'nothing_to_train', message: 'Pick at least one parameter to sweep.' }, 400)
   }
   const knobs: { def: ParamDef; values: number[] }[] = []
   for (const knob of vary) {
-    const def = strategy.params.find((p) => p.key === knob.key)
+    const def = knobDefs.find((p) => p.key === knob.key)
     if (!def || def.type !== 'number') {
       return c.json({ error: 'unknown_param', message: `"${knob.key}" is not a tunable numeric parameter of ${strategy.name}.` }, 400)
     }
@@ -374,11 +399,18 @@ backtests.post('/optimize', async (c) => {
   for (let combo = 0; combo < combos; combo++) {
     let rest = combo
     const params: Record<string, ParamValue> = { ...baseParams }
+    const swept: Record<string, number> = {}
     for (const knob of [...knobs].reverse()) {
       const value = knob.values[rest % knob.values.length]
       rest = Math.floor(rest / knob.values.length)
-      params[knob.def.key] = Number.isInteger(value) ? value : Number(value.toFixed(4))
+      const clean = Number.isInteger(value) ? value : Number(value.toFixed(4))
+      params[knob.def.key] = clean
+      swept[knob.def.key] = clean
     }
+    // Uploaded rules: bake the swept thresholds back into the rules blob so
+    // the strategist runs this combination's levels (stop/target already
+    // ride as plain params). The raw keys stay on params for display.
+    if (baseRules) params.rules = JSON.stringify(applyCustomKnobs(baseRules, swept))
     try {
       const train = runBacktest({ strategyKey: strategy.key, symbol, timeframe: tf, params, capital, from, to: split })
       let test: RunMetrics | null = null
@@ -414,7 +446,7 @@ backtests.post('/optimize', async (c) => {
   }
 
   return privateJson(c, {
-    source: { strategyKey: strategy.key, strategyName: strategy.name, symbol, timeframe: tf, capital, days, from, to, split, label: sourceName },
+    source: { strategyKey: strategy.key, strategyName: strategy.key === 'custom' ? (baseRules?.name ?? strategy.name) : strategy.name, symbol, timeframe: tf, capital, days, from, to, split, label: sourceName },
     objective,
     history: { years: HISTORY_YEARS, from: historyStart(to) },
     runs: rows,

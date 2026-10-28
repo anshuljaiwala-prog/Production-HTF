@@ -145,6 +145,19 @@ const SCHEMA = [
   `DROP TABLE IF EXISTS deals`,
   `DROP TABLE IF EXISTS contacts`,
   `DROP TABLE IF EXISTS companies`,
+  // Uploaded strategies are durable and versioned: every upload of a name
+  // stores a new version beside its history, so a re-upload never destroys
+  // the previous rules (bots keep their own inline copies regardless).
+  `CREATE TABLE IF NOT EXISTS uploaded_strategies (
+    id TEXT PRIMARY KEY,
+    owner_sub TEXT NOT NULL,
+    name TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    rules TEXT NOT NULL,
+    lookback INTEGER NOT NULL,
+    created_at INTEGER NOT NULL
+  )`,
+  `CREATE INDEX IF NOT EXISTS uploaded_strategies_owner ON uploaded_strategies(owner_sub, name, version DESC)`,
 ]
 
 let ready: Promise<void> | undefined

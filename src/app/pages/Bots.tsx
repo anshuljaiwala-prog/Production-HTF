@@ -3,6 +3,7 @@ import { useMemo, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router'
 
 import { BoardPanel } from './Board'
+import { EdgePanel } from './Edge'
 import { BotImportDialog } from '../components/forms'
 import { CompareBars } from '../components/charts'
 import { Badge, Button, Card, EmptyState, PageHeader, Skeleton } from '../components/ui'
@@ -18,9 +19,10 @@ const FILTERS: { key: BotActivity | 'all'; label: string }[] = [
   { key: 'inactive', label: 'Inactive' },
   { key: 'grounded', label: 'Grounded' },
 ]
-const TABS: { key: 'list' | 'board'; label: string }[] = [
+const TABS: { key: 'list' | 'board' | 'edge'; label: string }[] = [
   { key: 'list', label: 'Bot list' },
   { key: 'board', label: 'Lifecycle board' },
+  { key: 'edge', label: 'Edge ranking' },
 ]
 
 export function Bots() {
@@ -29,7 +31,7 @@ export function Bots() {
   const [params, setParams] = useSearchParams()
   const [filter, setFilter] = useState<BotActivity | 'all'>('all')
   const [importing, setImporting] = useState(false)
-  const view = params.get('tab') === 'board' ? 'board' : 'list'
+  const view = params.get('tab') === 'board' ? 'board' : params.get('tab') === 'edge' ? 'edge' : 'list'
 
   const items = useMemo(() => data?.items ?? [], [data])
   const bots = useMemo(() => items.filter((bot) => filter === 'all' || activityOf(bot) === filter), [items, filter])
@@ -43,7 +45,9 @@ export function Bots() {
           data
             ? view === 'board'
               ? 'Drag bots across their lifecycle: draft → backtest → paper → live.'
-              : `${items.length} launched · ${active} active — each read fast-forwards the fleet`
+              : view === 'edge'
+                ? 'Ranked by market-edge accuracy — whose entry signals predict the next bar best.'
+                : `${items.length} launched · ${active} active — each read fast-forwards the fleet`
             : undefined
         }
         actions={
@@ -67,7 +71,7 @@ export function Bots() {
             type="button"
             role="tab"
             aria-selected={view === tab.key}
-            onClick={() => setParams(tab.key === 'board' ? { tab: 'board' } : {})}
+            onClick={() => setParams(tab.key === 'list' ? {} : { tab: tab.key })}
             className={cx(
               'h-8 rounded-[9px] px-3.5 text-[12.5px] font-medium transition-colors',
               view === tab.key ? 'bg-surface text-fg shadow-card' : 'text-muted hover:text-fg',
@@ -84,6 +88,8 @@ export function Bots() {
         <div className="mt-4">
           <BoardPanel />
         </div>
+      ) : view === 'edge' ? (
+        <EdgePanel />
       ) : (
         <>
           <BotCharts items={items} isLoading={isLoading} />

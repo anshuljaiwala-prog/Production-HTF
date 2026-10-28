@@ -6,10 +6,10 @@ import { AreaChart, BarChart } from '../components/charts'
 import { BacktestDialog } from '../components/forms'
 import { Backtests } from './Backtests'
 import { Badge, Button, Card, Field, Input, PageHeader, Select, Skeleton, useFieldId, useToast } from '../components/ui'
-import { optimizeTraining, patchBot, useApiMutation, useBots, useStrategies, type OptimizeResult, type OptimizeRunRow } from '../lib/api'
+import { optimizeTraining, patchBot, useApiMutation, useBots, useCustomStrategies, useCustomStrategy, useStrategies, type OptimizeResult, type OptimizeRunRow } from '../lib/api'
 import { cx } from '../lib/cx'
 import { money, shortDate } from '../lib/format'
-import type { ParamValue, Strategy, Timeframe } from '../../shared/types'
+import { customKnobDefs, TRAIN_MAX_COMBOS, TIMEFRAMES, type CustomRules, type ParamDef, type ParamValue, type Timeframe } from '../../shared/types'
 
 function TInput(props: React.ComponentPropsWithoutRef<typeof Input>) {
   const id = useFieldId()
@@ -32,8 +32,8 @@ const DAYS_OPTIONS = [90, 180, 365, 730]
 
 /** Sensible first sweep for a strategy: its first numeric param, min → max
  * (or a ±50% band around the default when the schema has no bounds). */
-function defaultKnobs(strategy: Strategy | undefined): KnobForm[] {
-  const first = strategy?.params.find((p) => p.type === 'number')
+function defaultKnobs(defs: ParamDef[] | undefined): KnobForm[] {
+  const first = defs?.find((p) => p.type === 'number')
   if (!first) return []
   const def = Number(first.default)
   const from = first.min ?? Math.max(0.01, def * 0.5)
@@ -116,8 +116,10 @@ function Optimizer() {
   const { data: catalog } = useStrategies()
   const { data: botList } = useBots()
 
-  // Source: compose a fresh config, or train an existing bot's config.
+  // Source: compose a fresh config, train an existing bot's config, or tune
+  // an uploaded rules strategy directly (its thresholds become the knobs).
   const [botId, setBotId] = useState('')
+  const [customId, setCustomId] = useState('')
   const [strategyKey, setStrategyKey] = useState('')
   const [symbol, setSymbol] = useState('')
   const [timeframe, setTimeframe] = useState<Timeframe>('1h')
@@ -126,21 +128,50 @@ function Optimizer() {
   const [objective, setObjective] = useState<'sharpe' | 'return'>('sharpe')
   const [knobs, setKnobs] = useState<KnobForm[]>([])
 
-  const strategy = catalog?.strategies.find((s) => s.key === strategyKey)
+  const { data: customList } = useCustomStrategies()
+  const { data: customDetail } = useCustomStrategy(customId || undefined)
+
   const bot = botList?.items.find((b) => b.id === botId)
+  const isCustomSource = bot?.strategyKey === 'custom'
+  // The sweep must train the strategy that will actually run: a picked bot's
+  // own strategy wins over the standalone picker (the server trains the bot's
+  // config, and rejects knobs from any other schema). Key-based so list
+  // refetches can't reset an in-progress edit.
+  const formStrategyKey = bot ? (isCustomSource ? null : bot.strategyKey) : customId ? 'custom' : strategyKey
+  const strategy = catalog?.strategies.find((s) => s.key === formStrategyKey)
+
+  // Rules behind the current source: an inline copy on a custom bot, or the
+  // fetched detail of a picked upload. Signature-keyed so effects stay stable.
+  const rulesSignature = isCustomSource
+    ? String(bot?.params.rules ?? '')
+    : customId
+      ? customDetail
+        ? JSON.stringify(customDetail.rules)
+        : ''
+      : ''
+  const customRules: CustomRules | null = rulesSignature ? (JSON.parse(rulesSignature) as CustomRules) : null
+  // Knobs: an uploaded strategy sweeps its rule thresholds + stop/target;
+  // a catalog strategy sweeps its own numeric param schema.
+  const numericParams: ParamDef[] = customRules
+    ? customKnobDefs(customRules)
+    : (strategy?.params ?? []).filter((p) => p.type === 'number')
 
   // First strategy by default; knobs follow the chosen strategy's schema.
   useEffect(() => {
-    if (catalog && !strategyKey) setStrategyKey(catalog.strategies[0]?.key ?? '')
-  }, [catalog, strategyKey])
+    if (catalog && !strategyKey && !customId && !botId) setStrategyKey(catalog.strategies[0]?.key ?? '')
+  }, [catalog, strategyKey, customId, botId])
   // The symbol select displays the first entry until state says otherwise —
   // initialize it for real so the run button isn't stuck disabled.
   useEffect(() => {
     if (catalog && !symbol) setSymbol(catalog.symbols[0]?.symbol ?? '')
   }, [catalog, symbol])
   useEffect(() => {
-    setKnobs(defaultKnobs(strategy))
-  }, [strategy])
+    const rules = rulesSignature ? (JSON.parse(rulesSignature) as CustomRules) : null
+    const defs = rules
+      ? customKnobDefs(rules)
+      : (catalog?.strategies.find((s) => s.key === formStrategyKey)?.params ?? []).filter((p) => p.type === 'number')
+    setKnobs(defaultKnobs(defs))
+  }, [formStrategyKey, catalog, rulesSignature])
 
   const train = useApiMutation(
     (input: Parameters<typeof optimizeTraining>[0]) => optimizeTraining(input),
@@ -162,15 +193,21 @@ function Optimizer() {
       .filter((knob) => knob.key)
       .map((knob) => ({ key: knob.key, from: Number(knob.from), to: Number(knob.to), steps: Number(knob.steps) }))
     train.mutate({
-      ...(botId ? { botId } : { strategyKey, symbol, timeframe, capital: Number(capital) }),
+      ...(botId
+        ? { botId }
+        : customId
+          ? { strategyKey: 'custom', rules: customRules }
+          : { strategyKey, symbol, timeframe, capital: Number(capital) }),
       days,
       objective,
       vary,
     })
   }
 
-  const numericParams = (strategy?.params ?? []).filter((p) => p.type === 'number')
   const gridRuns = knobs.filter((k) => k.key).reduce((n, k) => n * Math.max(2, Number(k.steps) || 2), 1)
+  // Mirror the server's cap up front — the button shouldn't promise a run
+  // the optimizer will always reject.
+  const gridTooBig = gridRuns > TRAIN_MAX_COMBOS
 
   return (
     <div className="mt-6 grid gap-3 lg:grid-cols-[minmax(0,340px)_minmax(0,1fr)] lg:items-start">
@@ -183,8 +220,29 @@ function Optimizer() {
 
         <div className="mt-4 grid gap-3">
           <Field label="Train from">
-            <TSelect value={botId} onChange={(e) => setBotId(e.target.value)}>
+            <TSelect
+              value={botId || customId}
+              onChange={(e) => {
+                const value = e.target.value
+                if (value.startsWith('custom:')) {
+                  setCustomId(value.slice('custom:'.length))
+                  setBotId('')
+                } else {
+                  setBotId(value)
+                  setCustomId('')
+                }
+              }}
+            >
               <option value="">New config — pick a strategy below</option>
+              {(customList?.items ?? []).length > 0 && (
+                <optgroup label="Uploaded strategies">
+                  {(customList?.items ?? []).map((s) => (
+                    <option key={s.id} value={`custom:${s.id}`}>
+                      {s.name} · v{s.version}
+                    </option>
+                  ))}
+                </optgroup>
+              )}
               {(botList?.items ?? []).map((b) => (
                 <option key={b.id} value={b.id}>
                   {b.name} · {b.strategyName}
@@ -200,20 +258,28 @@ function Optimizer() {
                 {bot.strategyName} · {bot.symbols.join(', ')} · {bot.timeframe} · {money(bot.capital)}
               </p>
               {bot.strategyKey === 'custom' && (
-                <p className="mt-1.5 text-warning">Uploaded-rules bots have no tunable parameters — backtest them from the Backtests tab.</p>
+                <p className="mt-1.5 text-muted">Uploaded rules — every threshold below sweeps like any parameter; Apply writes the tuned rules back.</p>
               )}
             </div>
           ) : (
             <>
-              <Field label="Strategy">
-                <TSelect value={strategyKey} onChange={(e) => setStrategyKey(e.target.value)}>
-                  {(catalog?.strategies ?? []).map((s) => (
-                    <option key={s.key} value={s.key}>
-                      {s.name}
-                    </option>
-                  ))}
-                </TSelect>
-              </Field>
+              {!customId && (
+                <Field label="Strategy">
+                  <TSelect value={strategyKey} onChange={(e) => setStrategyKey(e.target.value)}>
+                    {(catalog?.strategies ?? []).map((s) => (
+                      <option key={s.key} value={s.key}>
+                        {s.name}
+                      </option>
+                    ))}
+                  </TSelect>
+                </Field>
+              )}
+              {customId && (
+                <div className="rounded-card border border-line bg-bg/60 p-3 text-[12.5px] text-muted">
+                  <p className="font-medium text-fg">{customDetail?.strategy.name ?? 'Uploaded strategy'} · v{customDetail?.strategy.version ?? '…'}</p>
+                  <p className="mt-1">Uploaded rules — thresholds below sweep like any parameter.</p>
+                </div>
+              )}
               <div className="grid grid-cols-2 gap-3">
                 <Field label="Symbol">
                   <TSelect value={symbol} onChange={(e) => setSymbol(e.target.value)}>
@@ -226,7 +292,7 @@ function Optimizer() {
                 </Field>
                 <Field label="Timeframe">
                   <TSelect value={timeframe} onChange={(e) => setTimeframe(e.target.value as Timeframe)}>
-                    {(strategy?.timeframes ?? []).map((tf) => (
+                    {(customId ? TIMEFRAMES.map((t) => t.key) : (strategy?.timeframes ?? [])).map((tf) => (
                       <option key={tf} value={tf}>
                         {tf}
                       </option>
@@ -261,10 +327,9 @@ function Optimizer() {
             </Field>
           </div>
 
-          {/* Parameter sweep: 1–2 numeric knobs from the strategy schema. */}
-          {!bot && (
-            <div className="grid gap-2">
-              <span className="text-[13px] font-medium text-fg">Parameters to sweep</span>
+          {/* Parameter sweep: 1–2 knobs — catalog params or uploaded-rule thresholds. */}
+          <div className="grid gap-2">
+            <span className="text-[13px] font-medium text-fg">Parameters to sweep</span>
               {knobs.map((knob, index) => (
                 <div key={index} className="grid grid-cols-[minmax(0,1.4fr)_1fr_1fr_64px_28px] items-end gap-1.5">
                   <Field label={`Knob ${index + 1}`}>
@@ -313,19 +378,31 @@ function Optimizer() {
                   + Add second parameter
                 </Button>
               )}
-              {numericParams.length === 0 && <p className="text-[12.5px] text-warning">This strategy has no numeric parameters to sweep.</p>}
+              {numericParams.length === 0 && (
+                <p className="text-[12.5px] text-warning">
+                  {customId && !customDetail ? 'Loading uploaded rules…' : 'This strategy has no numeric parameters to sweep.'}
+                </p>
+              )}
             </div>
-          )}
 
           <Button
             variant="primary"
             loading={train.isPending}
-            disabled={!botId && (!strategyKey || !symbol || knobs.filter((k) => k.key).length === 0)}
+            disabled={
+              gridTooBig ||
+              knobs.filter((k) => k.key).length === 0 ||
+              (!botId && (!customId ? !strategyKey || !symbol : !symbol || !customRules))
+            }
             onClick={submit}
           >
             <Sparkles />
             Train {gridRuns} run{gridRuns === 1 ? '' : 's'}
           </Button>
+          {gridTooBig && (
+            <p className="text-[12.5px] text-warning">
+              A grid of {gridRuns} runs exceeds the {TRAIN_MAX_COMBOS}-run cap — use fewer steps or one parameter.
+            </p>
+          )}
           {train.error && <p className="text-[13px] text-danger">{train.error.message}</p>}
           {!result && !train.isPending && (
             <p className="text-[12px] leading-relaxed text-faint">
@@ -344,7 +421,14 @@ function Optimizer() {
             <p className="text-[13px] text-muted">Replaying stored history for every combination…</p>
           </Card>
         )}
-        {result && <OptimizerResults result={result} onApply={botId ? (params) => apply.mutate({ botId, params }) : undefined} applying={apply.isPending} />}
+        {result && (
+          <OptimizerResults
+            result={result}
+            onApply={botId ? (params) => apply.mutate({ botId, params }) : undefined}
+            applying={apply.isPending}
+            applyError={apply.error?.message}
+          />
+        )}
         {!result && !train.isPending && (
           <Card className="grid place-items-center gap-2 p-10 text-center">
             <GraduationCap className="size-8 text-faint" />
@@ -367,10 +451,12 @@ function OptimizerResults({
   result,
   onApply,
   applying,
+  applyError,
 }: {
   result: OptimizeResult
   onApply?: (params: Record<string, ParamValue>) => void
   applying: boolean
+  applyError?: string
 }) {
   const ranked = result.runs
     .map((row, index) => ({ row, index }))
@@ -484,6 +570,7 @@ function OptimizerResults({
               )}
             </div>
           </div>
+          {applyError && <p className="mt-2 text-[13px] text-danger">{applyError}</p>}
           <p className="mt-1 text-[12.5px] text-muted">{paramString(best)}</p>
 
           <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-5">

@@ -4,6 +4,7 @@ import type {
   AccuracyStat,
   Backtest,
   Bot,
+  BotEdge,
   BotEvent,
   BotStage,
   BotStatus,
@@ -112,12 +113,14 @@ export const useCustomStrategy = (id: string | undefined) =>
     staleTime: 60_000,
   })
 
-/** Upload a rules JSON payload to the in-memory strategy store. */
+/** Upload a rules JSON payload to the durable, versioned strategy store:
+ * the same name stores a new version beside its history. */
 export const uploadCustomStrategy = (rules: unknown) =>
   api<
     { strategy: CustomStrategySummary; detail: Record<string, unknown>; durable: boolean }
   >('/strategies/custom', { method: 'POST', json: { rules } })
-export const deleteCustomStrategy = (id: string) => api<{ ok: true }>(`/strategies/custom/${id}`, { method: 'DELETE' })
+/** Deletes the whole strategy family — every stored version. */
+export const deleteCustomStrategy = (id: string) => api<{ ok: true; removed: number }>(`/strategies/custom/${id}`, { method: 'DELETE' })
 
 export interface BotAccuracy {
   botId: string
@@ -134,6 +137,21 @@ export const useBotAccuracy = (botId: string | undefined) =>
     queryKey: ['bot-accuracy', botId],
     queryFn: () => api<BotAccuracy>(`/bots/${botId}/accuracy`),
     enabled: Boolean(botId),
+    refetchInterval: 30_000,
+    placeholderData: (p) => p,
+  })
+
+export interface BotEdgeRanking {
+  items: BotEdge[]
+  window: { bars: number; to: number }
+}
+
+/** Fleet-wide market-edge ranking: every bot scored on the same window,
+ * best directional accuracy first. */
+export const useBotEdge = () =>
+  useQuery({
+    queryKey: ['bot-edge'],
+    queryFn: () => api<BotEdgeRanking>('/bots/accuracy'),
     refetchInterval: 30_000,
     placeholderData: (p) => p,
   })
@@ -362,6 +380,9 @@ export interface OptimizeInput {
   strategyKey?: string
   /** Train an existing bot's config instead of composing one. */
   botId?: string
+  /** Uploaded rules payload: trains the custom strategist directly, with
+   * each threshold sweepable like any catalog parameter. */
+  rules?: unknown
   symbol?: string
   timeframe?: Timeframe
   capital?: number

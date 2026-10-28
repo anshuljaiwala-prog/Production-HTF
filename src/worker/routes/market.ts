@@ -41,7 +41,7 @@ market.get('/history', async (c) => {
   }
 
   const to = Math.min(requestedTo, clock)
-  const { from, to: clampedTo } = backtestWindow(timeframe, requestedFrom, to)
+  const { from, to: clampedTo } = backtestWindow(timeframe, requestedFrom, to, clock)
   const bars = barsBetween(symbol, timeframe, from, clampedTo + 1)
   return privateJson(c, {
     symbol,

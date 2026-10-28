@@ -38,14 +38,15 @@ export interface BacktestResult {
 
 /** The exact bar window a run replayed: `to` floored to the bar grid and
  * `from` capped so the run stays within MAX_BARS bars — and never earlier
- * than the platform's stored-history window (five years), so a replay only
+ * than the platform's stored-history window: five years back from `clock`
+ * (the retention edge as of now, not as of the run's end), so a replay only
  * ever consumes data the market API would serve. Shared with the
  * market-data route so charts show precisely the bars that were traded. */
-export function backtestWindow(timeframe: Timeframe, from: number, to: number): { from: number; to: number } {
+export function backtestWindow(timeframe: Timeframe, from: number, to: number, clock: number = Date.now()): { from: number; to: number } {
   const tfMs = TIMEFRAME_MS[timeframe]
   const toFloored = Math.floor(to / tfMs) * tfMs
   return {
-    from: Math.max(Math.floor(from / tfMs) * tfMs, toFloored - MAX_BARS * tfMs, historyStart(toFloored)),
+    from: Math.max(Math.floor(from / tfMs) * tfMs, toFloored - MAX_BARS * tfMs, historyStart(clock)),
     to: toFloored,
   }
 }

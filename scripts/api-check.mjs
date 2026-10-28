@@ -262,7 +262,7 @@ let customStrategyId
   customStrategyId = upload.payload?.strategy?.id
   check(
     'POST /strategies/custom uploads rules',
-    upload.status === 201 && Boolean(customStrategyId) && upload.payload.strategy?.rules === 2 && upload.payload.strategy?.lookback > 0 && upload.payload.durable === false,
+    upload.status === 201 && Boolean(customStrategyId) && upload.payload.strategy?.rules === 2 && upload.payload.strategy?.lookback > 0 && upload.payload.durable === true && upload.payload.strategy?.version >= 1 && upload.payload.strategy?.versions === upload.payload.strategy?.version,
     JSON.stringify(upload.payload?.strategy).slice(0, 160),
   )
 
@@ -405,6 +405,36 @@ let customStrategyId
     params: {},
   })
   check('POST /backtests outside stored history refused', oldRun.status === 400 && oldRun.payload?.error === 'outside_history', `got ${oldRun.status} ${oldRun.payload?.error ?? ''}`)
+
+  // A user-entered range that ends inside retention but starts long before it
+  // must clamp to the retention edge as of now — not roll the window five
+  // years back from its own end and replay data reported as no longer stored.
+  const nowTs = Date.now()
+  const retentionEdge = nowTs - 5 * 365 * 86_400_000
+  const wide = await call('POST', '/backtests', {
+    strategyKey: 'momentum',
+    symbol: 'EUR-USD',
+    timeframe: '1d',
+    capital: 1_000,
+    days: 365,
+    from: nowTs - 11 * 365 * 86_400_000,
+    to: nowTs - 4 * 365 * 86_400_000,
+    params: {},
+  })
+  check(
+    'user-entered backtest range clamped to the 5-year retention edge',
+    wide.status === 201 && wide.payload?.backtest?.from >= retentionEdge - 2 * 86_400_000,
+    `from=${wide.payload?.backtest?.from} edge=${retentionEdge}`,
+  )
+  if (wide.payload?.backtest?.id) await call('DELETE', `/backtests/${wide.payload.backtest.id}`)
+
+  const histWide = await call('GET', `/market/history?symbol=EUR-USD&timeframe=1d&from=${nowTs - 11 * 365 * 86_400_000}&to=${nowTs - 4 * 365 * 86_400_000}`)
+  const wideCandles = histWide.payload?.candles ?? []
+  check(
+    'market history serves no candles older than retention',
+    histWide.status === 200 && wideCandles.length > 0 && wideCandles.every((k) => k.t >= retentionEdge - 2 * 86_400_000),
+    `oldest=${wideCandles[0]?.t} edge=${retentionEdge}`,
+  )
 }
 
 // 9e. Training: grid search over stored history with a train/test split
@@ -452,6 +482,99 @@ let customStrategyId
     vary: [{ key: knob?.key, from, to, steps: 7 }],
   })
   check('optimize rejects out-of-range sweeps', tooBig.status === 400 && tooBig.payload?.error === 'bad_sweep', `got ${tooBig.status} ${tooBig.payload?.error ?? ''}`)
+
+  // Uploaded rules join the same sweep: rule thresholds act as knobs.
+  const rules = {
+    name: 'Check suite training rules',
+    entry: [{ metric: 'rsi', n: 14, op: '<', value: 30 }],
+    entryLogic: 'any',
+    exit: [{ metric: 'rsi', n: 14, op: '>', value: 60 }],
+    exitLogic: 'all',
+    stopLossPct: 4,
+    takeProfitPct: 8,
+  }
+  const rulesOpt = await call('POST', '/backtests/optimize', {
+    strategyKey: 'custom',
+    rules,
+    symbol: 'BTC-USD',
+    timeframe: '1h',
+    capital: 10_000,
+    days: 180,
+    objective: 'totalReturn',
+    vary: [
+      { key: 'entry.0.value', from: 25, to: 40, steps: 2 },
+      { key: 'stopLossPct', from: 3, to: 5, steps: 2 },
+    ],
+  })
+  check(
+    'optimize sweeps uploaded-rule thresholds',
+    rulesOpt.status === 200 && (rulesOpt.payload?.runs ?? []).length === 4 && rulesOpt.payload.runs.every((r) => !r.error),
+    `status=${rulesOpt.status} runs=${rulesOpt.payload?.runs?.length} ${JSON.stringify(rulesOpt.payload?.runs?.[0] ?? {}).slice(0, 110)}`,
+  )
+}
+
+// 9e2. Fleet edge ranking: every bot scored against the same window, ranked
+let fleetRankedAny = false
+{
+  const edge = await call('GET', '/bots/accuracy')
+  const items = edge.payload?.items ?? []
+  fleetRankedAny = items.length > 0
+  check(
+    'GET /bots/accuracy ranks the fleet by edge',
+    edge.status === 200 && items.length > 0 && edge.payload.window?.bars > 0 && items.every((item, i) => item.rank === i + 1) && items.every((item) => item.accuracy?.sample > 0),
+    `items=${items.length} window=${edge.payload?.window?.bars}`,
+  )
+  check(
+    'edge ranking orders by directional accuracy',
+    items.every((item, i) => i === 0 || ((items[i - 1].accuracy.directionalAccuracy ?? -1) >= (item.accuracy.directionalAccuracy ?? -1))),
+    items.map((i) => `${i.name}:${i.accuracy.directionalAccuracy ?? 'null'}`).slice(0, 4).join(' '),
+  )
+}
+
+// 9e3. Uploaded strategies are durable + versioned: re-uploading the same name bumps the version
+{
+  const bump = {
+    name: 'Check suite versioned',
+    entry: [{ metric: 'rsi', n: 14, op: '<', value: 35 }],
+    entryLogic: 'any',
+    exit: [{ metric: 'rsi', n: 14, op: '>', value: 60 }],
+    exitLogic: 'all',
+    stopLossPct: 4,
+    takeProfitPct: 8,
+  }
+  const v1 = await call('POST', '/strategies/custom', { rules: bump })
+  const v2 = await call('POST', '/strategies/custom', { rules: { ...bump, entry: [{ metric: 'rsi', n: 14, op: '<', value: 40 }] } })
+  const reserveIdV1 = v1.payload?.strategy
+  const reserveIdV2 = v2.payload?.strategy
+  check(
+    'same-name re-upload bumps the version and stays durable',
+    v1.status === 201 && v2.status === 201 && reserveIdV2 && reserveIdV2.version === reserveIdV1.version + 1 && v2.payload.durable === true,
+    `v1=${v1.payload?.strategy?.version} v2=${v2.payload?.strategy?.version} durable=${v2.payload?.durable}`,
+  )
+  const versions = await call('GET', `/strategies/custom/${reserveIdV2.id}/versions`)
+  check(
+    'GET /strategies/custom/:id/versions lists the family history',
+    versions.status === 200 && (versions.payload?.items ?? []).length >= 2 && versions.payload.items.some((s) => s.id === reserveIdV1.id) && versions.payload.items.some((s) => s.id === reserveIdV2.id),
+    `status=${versions.status} items=${versions.payload?.items?.length}`,
+  )
+  // Reach any past version by id: v1's detail must carry v1's own entry value.
+  const oldVersion = await call('GET', `/strategies/custom/${reserveIdV1.id}`)
+  check(
+    'past versions keep their own accepted rules',
+    oldVersion.status === 200 && oldVersion.payload.rules?.entry?.[0]?.value === 35,
+    `value=${oldVersion.payload?.rules?.entry?.[0]?.value}`,
+  )
+  await call('DELETE', `/strategies/custom/${reserveIdV2.id}`)
+}
+
+if (fleetRankedAny) {
+  const after = await call('GET', '/bots/accuracy')
+  const ranker = after.payload?.items ?? []
+  check(
+    'failing bots still appear in the edge ranking',
+    ranker.every((item) => Number.isFinite(item.accuracy?.entryBars)),
+    `items=${ranker.length}`,
+  )
 }
 
 // 9f. Ground/resume control + config-change events
@@ -491,6 +614,25 @@ let groundBotId
 
   const resumed = await call('POST', `/bots/${groundBotId}/control`, { action: 'resume' })
   check('POST control resume', resumed.status === 200 && resumed.payload.bot?.status === 'running', `got ${resumed.payload?.bot?.status}`)
+
+  // A double-click races two identical intents; the transition guard lives in
+  // the UPDATE itself so only the request that actually moved the row logs.
+  const groundCount = async () => {
+    const d = await call('GET', `/bots/${groundBotId}`)
+    return (d.payload?.events ?? []).filter((e) => e.message.includes('Grounded by operator')).length
+  }
+  const beforeRace = await groundCount()
+  const [r1, r2] = await Promise.all([
+    call('POST', `/bots/${groundBotId}/control`, { action: 'ground' }),
+    call('POST', `/bots/${groundBotId}/control`, { action: 'ground' }),
+  ])
+  const afterRace = await call('GET', `/bots/${groundBotId}`)
+  const added = (await groundCount()) - beforeRace
+  check(
+    'racing grounds log exactly one new event',
+    r1.status === 200 && r2.status === 200 && afterRace.payload?.bot?.status === 'stopped' && added === 1,
+    `status=${afterRace.payload?.bot?.status} added=${added}`,
+  )
 
   await call('DELETE', `/bots/${groundBotId}`)
 }

@@ -1,4 +1,5 @@
-import type { AccuracyStat, ParamValue, Strategy, Timeframe } from '../shared/types'
+import type { AccuracyStat, CustomRule, CustomRules, ParamValue, Strategy, Timeframe } from '../shared/types'
+import { METRIC_BOUNDS } from '../shared/types'
 import type { Bar } from './market'
 
 // Strategy templates. Each returns a signal for the current closed bar; the
@@ -271,36 +272,9 @@ export const strategyBy = (key: string): StrategyDef | undefined =>
 
 // --- Custom (uploaded) strategies ------------------------------------------
 
-/** One testable condition, e.g. { metric: 'rsi', n: 14, op: '<', value: 30 }. */
-export interface CustomRule {
-  metric: 'rsi' | 'ema' | 'zscore' | 'donchianHigh' | 'donchianLow' | 'momentum'
-  /** Window for the metric (default per metric). */
-  n: number
-  /** ema only: second window for a fast/slow relationship. */
-  n2?: number
-  op: '>' | '<'
-  /** Threshold; unit depends on the metric (see metricHint). */
-  value: number
-}
-
-export interface CustomRules {
-  name: string
-  entry: CustomRule[]
-  entryLogic: 'all' | 'any'
-  exit: CustomRule[]
-  exitLogic: 'all' | 'any'
-  stopLossPct: number
-  takeProfitPct: number
-}
-
-const METRIC_BOUNDS: Record<CustomRule['metric'], { nMin: number; nMax: number; valueHint: string }> = {
-  rsi: { nMin: 2, nMax: 100, valueHint: 'RSI level, 0–100' },
-  ema: { nMin: 2, nMax: 200, valueHint: 'gap of close vs EMA(n), in percent (n2 for a fast/slow pair)' },
-  zscore: { nMin: 2, nMax: 200, valueHint: 'z-score of close vs rolling mean(n)' },
-  donchianHigh: { nMin: 2, nMax: 400, valueHint: 'distance of close above the highest high of the last n bars, in percent (negative = below)' },
-  donchianLow: { nMin: 2, nMax: 400, valueHint: 'distance of close below the lowest low of the last n bars, in percent (negative = above)' },
-  momentum: { nMin: 2, nMax: 400, valueHint: 'return over n bars, in percent' },
-}
+// The rule shapes and their bounds live in shared/types.ts: the Training
+// form builds sweep knobs from the same tables the parser validates against.
+export type { CustomRule, CustomRules } from '../shared/types'
 
 function metricValue(metric: CustomRule['metric'], bars: Bar[], rule: CustomRule): number | null {
   const closes = bars.map((b) => b.c)
@@ -466,6 +440,25 @@ export const rulesToParams = (rules: CustomRules, stopLossPct?: number, takeProf
   stopLossPct: stopLossPct ?? rules.stopLossPct,
   takeProfitPct: takeProfitPct ?? rules.takeProfitPct,
 })
+
+/** Bake swept threshold values (`entry.0.value` keys) back into a rules
+ * payload so the custom strategist runs the tuned thresholds. Stop/target
+ * knobs ride as plain params — the signal reads them from there. */
+export function applyCustomKnobs(rules: CustomRules, swept: Record<string, number>): CustomRules {
+  const out: CustomRules = {
+    ...rules,
+    entry: rules.entry.map((rule) => ({ ...rule })),
+    exit: rules.exit.map((rule) => ({ ...rule })),
+  }
+  for (const [key, value] of Object.entries(swept)) {
+    const match = /^(entry|exit)\.(\d+)\.value$/.exec(key)
+    if (!match || !Number.isFinite(value)) continue
+    const list = match[1] === 'entry' ? out.entry : out.exit
+    const rule = list[Number(match[2])]
+    if (rule) rule.value = value
+  }
+  return out
+}
 
 // --- Accuracy ------------------------------------------------------------
 
