@@ -1,7 +1,7 @@
 import { Hono } from 'hono'
 
 import { privateJson } from '../auth'
-import { id, mapConnection, now } from '../db'
+import { id, logEvent, mapConnection, now } from '../db'
 import type { AppContext } from '../env'
 import type { Connection } from '../../shared/types'
 
@@ -124,13 +124,73 @@ connections.post('/', async (c) => {
   return privateJson(c, { connection: row ? mapConnection(row) : null }, 201)
 })
 
-connections.delete('/:id', async (c) => {
+connections.patch('/:id', async (c) => {
+  const db = c.get('db')
+  const owner = c.get('user').sub
   const connId = c.req.param('id')
-  const result = await c
-    .get('db')
-    .prepare(`DELETE FROM connections WHERE id = ? AND owner_sub = ?`)
-    .bind(connId, c.get('user').sub)
+  const body = await c.req.json<{
+    name?: string
+    exchange?: string
+    /** Paper ↔ live default for bots that route through this account. */
+    mode?: string
+    /** Optional credential rotation — blank fields keep the stored pair. */
+    apiKey?: string
+    apiSecret?: string
+  }>()
+
+  const row = await db.prepare(`SELECT * FROM connections WHERE id = ? AND owner_sub = ?`).bind(connId, owner).first<Row>()
+  if (!row) return c.json({ error: 'not_found', message: 'Connection not found.' }, 404)
+
+  const name = body.name !== undefined ? body.name.trim().slice(0, 60) : String(row.name)
+  if (!name) return c.json({ error: 'name_required', message: 'Give the connection a name.' }, 400)
+  const exchange = body.exchange !== undefined ? body.exchange.trim().slice(0, 40) || String(row.exchange) : String(row.exchange)
+  const mode = body.mode === 'live' || body.mode === 'paper' ? body.mode : String(row.mode)
+  const apiKey = body.apiKey?.trim() || null
+  const apiSecret = body.apiSecret?.trim() || null
+  if ((apiKey && !apiSecret) || (!apiKey && apiSecret)) {
+    return c.json({ error: 'credentials_required', message: 'Rotate both the API key and the API secret together.' }, 400)
+  }
+
+  await db
+    .prepare(
+      `UPDATE connections SET name = ?, exchange = ?, mode = ?, api_key = COALESCE(?, api_key), api_secret = COALESCE(?, api_secret) WHERE id = ? AND owner_sub = ?`,
+    )
+    .bind(name, exchange, mode, apiKey, apiSecret, connId, owner)
     .run()
+
+  // Bots route through this account by id — renaming or re-keying keeps them
+  // attached to the same connection, so no bot table churn is needed.
+  const updated = await db.prepare(`SELECT * FROM connections WHERE id = ?`).bind(connId).first<Row>()
+  return privateJson(c, { connection: updated ? mapConnection(updated) : null })
+})
+
+connections.delete('/:id', async (c) => {
+  const db = c.get('db')
+  const owner = c.get('user').sub
+  const connId = c.req.param('id')
+
+  // Bots still referencing this connection first: a live bot left attached to
+  // a deleted account would hold a dangling reference and carry a mode the
+  // venue no longer honors. Ground them back to paper with an audit note.
+  const attached = await db
+    .prepare(`SELECT id, name, mode FROM bots WHERE owner_sub = ? AND connection_id = ?`)
+    .bind(owner, connId)
+    .all<{ id: string; name: string; mode: string }>()
+  const demoted = ((attached.results ?? []) as Row[]).filter((bot) => String(bot.mode) === 'live')
+
+  const statements = [
+    db.prepare(`DELETE FROM connections WHERE id = ? AND owner_sub = ?`).bind(connId, owner),
+    db
+      .prepare(
+        `UPDATE bots SET connection_id = NULL, mode = 'paper', stage = CASE WHEN stage = 'live' THEN 'paper' ELSE stage END, updated_at = ?
+         WHERE owner_sub = ? AND connection_id = ?`,
+      )
+      .bind(now(), owner, connId),
+  ]
+  const result = (await db.batch(statements))[0]
   if (!result.meta.changes) return c.json({ error: 'not_found', message: 'Connection not found.' }, 404)
-  return privateJson(c, { ok: true })
+  for (const bot of demoted) {
+    await logEvent(db, owner, String(bot.id), 'warn', `Connection deleted — bot grounded from live to paper mode until a new exchange API is attached.`)
+  }
+  return privateJson(c, { ok: true, detached: ((attached.results ?? []) as Row[]).length, grounded: demoted.length })
 })

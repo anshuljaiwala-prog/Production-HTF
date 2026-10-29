@@ -51,8 +51,13 @@ function check(label, ok, detail = '') {
   const s = payload?.summary
   check(
     'GET /portfolio',
-    status === 200 && typeof s?.startingCapital === 'number' && typeof s?.currentEquity === 'number' && Array.isArray(payload.bots) && s.bots === payload.bots.length,
+    status === 200 && typeof s?.startingCapital === 'number' && typeof s?.currentEquity === 'number' && Array.isArray(payload.bots) && s.bots === payload.bots.filter((b) => b.mode === 'live').length,
     JSON.stringify(s).slice(0, 200),
+  )
+  check(
+    'paper bots are counted beside, not inside, the actual portfolio',
+    typeof s.paperBots === 'number' && s.paperCapital >= 0 && s.paperEquity >= 0 && payload.bots.filter((b) => b.mode === 'paper').length === s.paperBots,
+    `paperBots=${s.paperBots} paperEquity=${s.paperEquity}`,
   )
   check(
     'GET /portfolio per-bot audit is consistent',
@@ -238,8 +243,27 @@ let connectionId
   const list = await call('GET', '/connections')
   check('GET /connections never returns secrets', list.status === 200 && !JSON.stringify(list.payload).includes('super-secret-value'))
 
+  // Edit: rename + flip the default mode. Blank credentials keep the saved
+  // pair; a half rotation is refused so a stale secret can't survive a new key.
+  const edited = await call('PATCH', `/connections/${connectionId}`, { name: 'Test account v2', mode: 'live' })
+  check('PATCH /connections/:id edits name and mode', edited.status === 200 && edited.payload?.connection?.name === 'Test account v2' && edited.payload?.connection?.mode === 'live', `got ${edited.status}`)
+  check('PATCH keeps the saved secret masked', !JSON.stringify(edited.payload).includes('super-secret-value'))
+  const halfRotate = await call('PATCH', `/connections/${connectionId}`, { apiKey: 'NEWKEY999' })
+  check('PATCH refuses a half credential rotation', halfRotate.status === 400 && halfRotate.payload?.error === 'credentials_required', `got ${halfRotate.status}`)
+  const ghostConnEdit = await call('PATCH', '/connections/00000000-0000-4000-8000-000000000000', { name: 'ghost' })
+  check('PATCH unknown connection is 404', ghostConnEdit.status === 404, `got ${ghostConnEdit.status}`)
+
+  // Deleting a connection detaches bots that used it and grounds the live
+  // ones back to paper — a live bot must never outlive its key.
+  const botFor = await call('POST', '/bots', { strategyKey: 'dca', symbols: ['BTC-USD'], timeframe: '1h', capital: 500, status: 'stopped', mode: 'live', connectionId })
+  check('bot attached to a live-default connection', botFor.status === 201 && botFor.payload?.bot?.mode === 'live', `got ${botFor.status}`)
   const removed = await call('DELETE', `/connections/${connectionId}`)
-  check('DELETE /connections/:id', removed.status === 200, `got ${removed.status}`)
+  check('DELETE /connections/:id', removed.status === 200 && removed.payload?.grounded === 1, `got ${removed.status} grounded=${removed.payload?.grounded}`)
+  const afterDelete = await call('GET', `/bots/${botFor.payload?.bot?.id}`)
+  check('attached bot grounded to paper after delete', afterDelete.status === 200 && afterDelete.payload?.bot?.mode === 'paper' && afterDelete.payload?.bot?.connectionId === null, `mode=${afterDelete.payload?.bot?.mode} conn=${afterDelete.payload?.bot?.connectionId}`)
+  const demotedDetail = await call('GET', '/bots/' + botFor.payload?.bot?.id)
+  check('grounding logged an audit event', JSON.stringify(demotedDetail.payload?.events ?? []).includes('grounded from live to paper'), '')
+  await call('DELETE', `/bots/${botFor.payload?.bot?.id}`)
 }
 
 // 9b. Uploaded rules strategy: POST -> list -> GET detail -> backtest with
@@ -635,6 +659,101 @@ let groundBotId
   )
 
   await call('DELETE', `/bots/${groundBotId}`)
+}
+
+// 9g. Symbol normalization at every ingress + paper→live venue switch
+let modeBotId
+{
+  // Noisy alias resolves to the canonical pair; duplicates fold to one.
+  const noisy = await call('POST', '/bots', {
+    strategyKey: 'dca',
+    symbols: ['btcusdt', 'BTC-USD '],
+    timeframe: '1h',
+    capital: 1_000,
+    mode: 'paper',
+    status: 'paused',
+  })
+  modeBotId = noisy.payload?.bot?.id
+  check(
+    "POST /bots normalizes 'btcusdt' to BTC-USD",
+    noisy.status === 201 && JSON.stringify(noisy.payload.bot?.symbols) === JSON.stringify(['BTC-USD']),
+    JSON.stringify(noisy.payload?.bot?.symbols).slice(0, 120),
+  )
+
+  const bt = await call('POST', '/backtests', {
+    strategyKey: 'dca',
+    symbol: 'BTCUSDT',
+    timeframe: '1d',
+    capital: 10_000,
+    days: 30,
+    name: 'Normalization probe',
+  })
+  check(
+    "POST /backtests accepts 'BTCUSDT' and stores BTC-USD",
+    bt.status === 201 && bt.payload?.backtest?.symbol === 'BTC-USD',
+    `got ${bt.status} ${bt.payload?.backtest?.symbol ?? ''}`,
+  )
+  await call('DELETE', `/backtests/${bt.payload?.backtest?.id}`)
+
+  const junk = await call('POST', '/bots', {
+    strategyKey: 'dca',
+    symbols: ['NO-COIN-ASDF'],
+    timeframe: '1h',
+    capital: 1_000,
+  })
+  check('POST /bots rejects unknown symbols by name', junk.status === 400 && junk.payload?.error === 'unknown_symbols' && junk.payload?.message?.includes('NO-COIN-ASDF'), `got ${junk.status} ${junk.payload?.error}`)
+
+  const junkPatch = await call('PATCH', `/bots/${modeBotId}`, { symbols: ['QUNT-NOPE'] })
+  check('PATCH keeps unknown symbols out', junkPatch.status === 400 && junkPatch.payload?.error === 'unknown_symbols', `got ${junkPatch.status}`)
+
+  // Venue switch: a connectionless paper bot is refused before it flips.
+  const noConn = await call('PATCH', `/bots/${modeBotId}`, { mode: 'live' })
+  check('paper→live without an exchange connection is refused', noConn.status === 400 && noConn.payload?.error === 'connection_required', `got ${noConn.status} ${noConn.payload?.error}`)
+  const refusedDetail = await call('GET', `/bots/${modeBotId}`)
+  check('refused switch leaves the bot in paper mode', refusedDetail.payload?.bot?.mode === 'paper', `mode=${refusedDetail.payload?.bot?.mode}`)
+
+  const conn = await call('POST', '/connections', {
+    name: 'Mode switch account',
+    exchange: 'Alpaca',
+    apiKey: 'MODESWITCH1234',
+    apiSecret: 'mode-switch-secret-value',
+    mode: 'live',
+  })
+  const modeConnId = conn.payload?.connection?.id
+  const toLive = await call('PATCH', `/bots/${modeBotId}`, { mode: 'live', connectionId: modeConnId })
+  check(
+    'paper→live switch succeeds with a connection',
+    toLive.status === 200 && toLive.payload.bot?.mode === 'live' && !['paper'].includes(toLive.payload.bot?.stage),
+    `mode=${toLive.payload?.bot?.mode} stage=${toLive.payload?.bot?.stage}`,
+  )
+  check(
+    'venue switch leaves a hand-set lifecycle stage untouched',
+    toLive.payload.bot?.stage === 'draft',
+    `stage=${toLive.payload?.bot?.stage}`,
+  )
+  const liveDetail = await call('GET', `/bots/${modeBotId}`)
+  check(
+    'venue switch logs a config-change event',
+    (liveDetail.payload?.events ?? []).some((e) => e.message.includes('trading mode paper → live')),
+    `events=${liveDetail.payload?.events?.length}`,
+  )
+
+  // The venue is locked while the bot runs.
+  await call('POST', `/bots/${modeBotId}/control`, { action: 'start' })
+  const liveLocked = await call('PATCH', `/bots/${modeBotId}`, { mode: 'paper' })
+  check('venue locked while the bot runs', liveLocked.status === 409 && liveLocked.payload?.error === 'bot_active', `got ${liveLocked.status} ${liveLocked.payload?.error}`)
+  await call('POST', `/bots/${modeBotId}/control`, { action: 'stop' })
+
+  // Back to paper — the reverse switch also logs.
+  const toPaper = await call('PATCH', `/bots/${modeBotId}`, { mode: 'paper' })
+  check('live→paper switch works', toPaper.status === 200 && toPaper.payload.bot?.mode === 'paper', `got ${toPaper.status} mode=${toPaper.payload?.bot?.mode}`)
+
+  // Pointing a bot at a connection that doesn't exist (expired id, another
+  // workspace's id) is refused instead of routing live orders into a void.
+  const ghostConn = await call('PATCH', `/bots/${modeBotId}`, { connectionId: '00000000-0000-4000-8000-000000000000' })
+  check('ghost connection rejected', ghostConn.status === 400 && ghostConn.payload?.error === 'connection_missing', `got ${ghostConn.status} ${ghostConn.payload?.error}`)
+  await call('DELETE', `/connections/${modeConnId}`)
+  await call('DELETE', `/bots/${modeBotId}`)
 }
 
 // 10. Search + me + same-origin refusal

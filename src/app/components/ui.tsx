@@ -492,3 +492,95 @@ export function PageHeader({ title, subtitle, actions }: { title: string; subtit
     </div>
   )
 }
+
+/** A consistent data table: sticky labelled header, aligned numeric
+ * columns, row hover and state slot. Every page-level table composes from
+ * this so density, alignment and hover behavior stay uniform. */
+export interface DataColumn<T> {
+  key: string
+  header: string
+  /** Column width classes, e.g. `w-[18%]` or `w-[220px]`. */
+  width?: string
+  align?: 'left' | 'right'
+  /** Should the body cell render with tabular (fixed-width) digits? */
+  numeric?: boolean
+  cell: (row: T, index: number) => ReactNode
+  headerTitle?: string
+}
+
+export function DataTable<T>({
+  columns,
+  rows,
+  rowKey,
+  onRowClick,
+  dense = false,
+  empty,
+  footer,
+  className,
+  highlightFirst = false,
+}: {
+  columns: DataColumn<T>[]
+  rows: T[]
+  rowKey: (row: T) => string
+  onRowClick?: (row: T) => void
+  /** Tight rows for big ledgers (the trade log uses this). */
+  dense?: boolean
+  /** Rendered when rows is empty — a <tr> wrapper the page fills in. */
+  empty?: ReactNode
+  footer?: ReactNode
+  className?: string
+  /** Soft accent background on the leading row (leaderboards). */
+  highlightFirst?: boolean
+}) {
+  const align = (a: 'left' | 'right' | undefined) => (a === 'right' ? 'text-right' : 'text-left')
+  return (
+    <div className={cx('overflow-hidden rounded-card border border-line', className)}>
+      <table className={cx('w-full table-fixed text-left text-[13px]', dense ? 'text-[12.5px]' : '')}>
+        <thead>
+          <tr className="border-b border-line bg-surface-2/70">
+            {columns.map((col) => (
+              <th
+                key={col.key}
+                className={cx(
+                  'h-10 px-4 text-[12px] font-medium text-muted',
+                  col.width,
+                  align(col.align),
+                )}
+                title={col.headerTitle}
+              >
+                {col.header}
+              </th>
+            ))}
+          </tr>
+        </thead>
+        <tbody className="divide-y divide-line">
+          {rows.length === 0
+            ? empty
+            : rows.map((row, index) => (
+                <tr
+                  key={rowKey(row)}
+                  onClick={onRowClick ? () => onRowClick(row) : undefined}
+                  className={cx(
+                    onRowClick && 'cursor-pointer transition-colors hover:bg-surface-2/60',
+                    dense ? 'h-9' : 'h-12',
+                    highlightFirst && index === 0 && 'bg-accent-soft/40',
+                  )}
+                >
+                  {columns.map((col) => (
+                    <td
+                      key={col.key}
+                      className={cx('px-4 align-middle', align(col.align), col.numeric && 't-num')}
+                    >
+                      {col.cell(row, index)}
+                    </td>
+                  ))}
+                </tr>
+              ))}
+          {footer && (
+            <tr className="border-t border-line bg-surface-2/60 font-medium">{footer}</tr>
+          )}
+        </tbody>
+      </table>
+    </div>
+  )
+}

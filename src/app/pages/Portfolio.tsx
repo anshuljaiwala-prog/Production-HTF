@@ -1,12 +1,13 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query'
-import { ArrowDownRight, ArrowUpRight, FileSearch, Plus, Minus, Settings2, Wallet, X } from 'lucide-react'
+import { ArrowDownRight, ArrowUpRight, Download, FileSearch, Minus, Plus, Settings2, Wallet, X } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { Link } from 'react-router'
 
-import { AreaChart, BarChart, CompareBars, DrawdownChart } from '../components/charts'
+import { AreaChart, BarChart, CompareBars, DrawdownChart, PairedBarChart } from '../components/charts'
 import { ParamFields, SymbolPicker } from '../components/forms'
 import { Badge, Button, Card, EmptyState, Field, Input, Live, PageHeader, Skeleton, useToast } from '../components/ui'
 import { adjustFunding, ApiError, controlBot, patchBot, useApiMutation, useBot, usePortfolio, useStrategies, type BotPatch } from '../lib/api'
+import { downloadCsv } from '../lib/csv'
 import { cx } from '../lib/cx'
 import { money, moneyExact, moneyExactPlain, relativeTime, shortDate } from '../lib/format'
 import { TIMEFRAMES, activityOf, type CashFlow, type EquityPoint, type ParamValue, type Portfolio, type PortfolioBotAudit, type PortfolioPosition, type PortfolioTransaction, type Timeframe } from '../../shared/types'
@@ -19,30 +20,53 @@ const statusDot: Record<PortfolioBotAudit['status'], string> = {
   paused: 'bg-warning',
   stopped: 'bg-line-strong',
 }
-const activityTone: Record<ReturnType<typeof activityOf>, 'success' | 'warning' | 'neutral'> = {
+const activityTone: Record<ReturnType<typeof activityOf>, 'success' | 'warning' | 'neutral' | 'info'> = {
   active: 'success',
   inactive: 'warning',
   grounded: 'neutral',
+  training: 'info',
+  hangar: 'neutral',
 }
 
 export function Portfolio() {
   const { data, isLoading } = usePortfolio()
-  const [selected, setSelected] = useState<string>('fleet')
+  const [analysis, setAnalysis] = useState<'money' | 'paper'>('money')
+  const [selected, setSelected] = useState<string>('money-fleet')
 
   const isLive = (data?.summary.activeBots ?? 0) > 0
   const bots = data?.bots ?? []
-  const selectedBot = bots.find((bot) => bot.id === selected) ?? null
+  // The two books never mix: the Money tab audits live-routed bots only, the
+  // Paper tab audits the simulated wallet. Selecting a bot always lands in
+  // the matching tab.
+  const tabBots = bots.filter((bot) => (analysis === 'paper' ? bot.mode === 'paper' : bot.mode === 'live'))
+  const selectedBot = (() => {
+    const bot = bots.find((bot) => bot.id === selected) ?? null
+    if (bot && bot.mode !== (analysis === 'paper' ? 'paper' : 'live')) return null
+    return bot
+  })()
+
+  const switchAnalysis = (next: 'money' | 'paper') => {
+    setAnalysis(next)
+    setSelected(`${next}-fleet`)
+  }
 
   return (
     <div className="mx-auto max-w-[1200px] p-5 sm:p-8">
       <PageHeader title="Portfolio" subtitle="Financial audit of the fleet: every dollar in, every dollar out, per bot." />
 
       <div className="mt-6 flex flex-wrap items-center gap-1.5">
-        <TabButton active={selected === 'fleet'} onMouseDown={() => setSelected('fleet')}>
-          Fleet overview
-          {isLive && <span className="ml-1 inline-block size-1.5 animate-pulse rounded-full bg-success" />}
+        <TabButton active={analysis === 'money'} onMouseDown={() => switchAnalysis('money')}>
+          Money book
+          {isLive && analysis === 'money' && <span className="ml-1 inline-block size-1.5 animate-pulse rounded-full bg-success" />}
         </TabButton>
-        {bots.map((bot) => (
+        <TabButton active={analysis === 'paper'} onMouseDown={() => switchAnalysis('paper')}>
+          Paper book
+          {(data?.summary.paperBots ?? 0) > 0 && (
+            <span className="ml-1.5 rounded-[6px] bg-surface-2 px-1 text-[10.5px] text-faint">{data?.summary.paperBots}</span>
+          )}
+        </TabButton>
+        <span className="mx-1 h-5 w-px bg-line" />
+        {tabBots.map((bot) => (
           <TabButton
             key={bot.id}
             active={selected === bot.id}
@@ -56,12 +80,15 @@ export function Portfolio() {
 
       {isLoading && <Skeleton className="mt-3 h-8" />}
 
-      {data && !selectedBot && <FleetAudit data={data} live={isLive} />}
+      {data && !selectedBot && analysis === 'money' && <FleetAudit data={data} live={isLive} />}
+      {data && !selectedBot && analysis === 'paper' && (
+        <PaperBook data={data} onOpen={(id) => setSelected(id)} />
+      )}
       {data && selectedBot && (
         <BotPerformance
           audit={data.bots.find((bot) => bot.id === selectedBot.id)!}
           flows={data.funding.filter((flow) => flow.botId === selectedBot.id)}
-          onBack={() => setSelected('fleet')}
+          onBack={() => setSelected(`${analysis}-fleet`)}
         />
       )}
     </div>
@@ -94,7 +121,7 @@ function TabButton({
 /** Fleet-wide audit: KPI surge, equity curve, trade quality, per-bot table, positions, ledger. */
 function FleetAudit({ data, live }: { data: Portfolio; live: boolean }) {
   const kpis = [
-    { label: 'Starting capital', value: money(data.summary.startingCapital), hint: `${data.summary.bots} bots seeded` },
+    { label: 'Starting capital', value: money(data.summary.startingCapital), hint: `${data.summary.bots} live bots seeded` },
     { label: 'Current equity', value: money(data.summary.currentEquity), hint: 'cash + open marks' },
     {
       label: 'Net P&L',
@@ -120,6 +147,14 @@ function FleetAudit({ data, live }: { data: Portfolio; live: boolean }) {
           </Card>
         ))}
       </div>
+
+      {data.summary.paperBots > 0 && (
+        <p className="mt-3 rounded-tile border border-line bg-surface-2/60 px-3 py-2 text-[12.5px] text-muted">
+          {data.summary.paperBots} paper bot{data.summary.paperBots === 1 ? '' : 's'} (simulated wallet equity{' '}
+          <span className="font-medium text-fg">{money(data.summary.paperEquity)}</span>) trade beside this book but are
+          excluded from every figure above — the actual portfolio measures live-routed capital only.
+        </p>
+      )}
 
       <div className="mt-3 grid gap-3 lg:grid-cols-3">
         <div className="grid gap-3 lg:col-span-2">
@@ -185,9 +220,22 @@ function FleetAudit({ data, live }: { data: Portfolio; live: boolean }) {
       </div>
 
       <Card className="mt-3 overflow-hidden">
-        <div className="flex items-center justify-between px-5 pt-5">
-          <h2 className="text-[14px] font-semibold">Per-bot audit</h2>
-          {live ? <Live active label="live · 4s" /> : <span className="text-[12.5px] text-faint">{data.summary.bots} bots</span>}
+        <div className="flex flex-wrap items-center justify-between gap-2 px-5 pt-5">
+          <div>
+            <h2 className="text-[14px] font-semibold">Per-bot audit</h2>
+            <p className="mt-0.5 text-[12px] text-faint">Every account: capital in, equity now, P&L, fees — the ledger's bot-level roll-up.</p>
+          </div>
+          <div className="flex items-center gap-2">
+            {live ? <Live active label="live · 4s" /> : <span className="text-[12.5px] text-faint">{data.summary.bots} bots</span>}
+            <Button
+              size="sm"
+              title="Download the full per-bot audit as a CSV file"
+              onClick={() => exportBotsCsv(data)}
+            >
+              <Download className="size-3.5" />
+              Export CSV
+            </Button>
+          </div>
         </div>
         <div className="mt-3 overflow-x-auto">
           <table className="w-full table-fixed text-left text-[13.5px]">
@@ -305,6 +353,25 @@ export function FundingCard({ data, flows, title = 'Funding & reconciliation' }:
           </div>
         </div>
       </div>
+
+      {data.weekly.length > 0 && (
+        <div className="border-t border-line px-5 pt-4">
+          <div className="flex items-center justify-between">
+            <p className="text-[12.5px] font-medium text-muted">Funding vs P&L per week</p>
+            <span className="text-[11.5px] text-faint">net deposits against realized P&L · oldest {data.weekly[0]?.label}</span>
+          </div>
+          <div className="mt-2">
+            <PairedBarChart
+              data={data.weekly.map((week) => ({ label: week.label, a: week.funding, b: week.pnl }))}
+              aLabel="Funding"
+              bLabel="Realized P&L"
+              format={moneyExact}
+              height={170}
+            />
+          </div>
+          <p className="mt-1 text-[11.5px] text-faint">A healthy week pairs big positive funding with positive P&L; sustained negative P&L weeks that still take deposits are the pattern worth questioning.</p>
+        </div>
+      )}
 
       {dailySeries.length > 0 && (
         <div className="mt-4 px-5">
@@ -425,8 +492,10 @@ function BotPerformance({ audit, flows, onBack }: { audit: PortfolioBotAudit; fl
     return points
   })()
 
+  const isPaperBook = audit.mode === 'paper'
   const kpis = [
-    { label: 'Capital', value: moneyExact(audit.capital), hint: `deployed on ${audit.timeframe} bars` },
+    // Paper bots are judged on what they hold right now, not what they started with.
+    { label: isPaperBook ? 'Total money held' : 'Capital', value: moneyExact(isPaperBook ? audit.equity : audit.capital), hint: isPaperBook ? 'cash + open marks held right now' : `deployed on ${audit.timeframe} bars` },
     { label: 'Current equity', value: moneyExact(audit.equity), hint: `${audit.roundTrips} round trips`, tone: undefined },
     { label: 'Net P&L', value: moneyExactPlain(net), hint: pct(net / (audit.capital || 1) * 100), tone: mark(net) },
     { label: 'Realized', value: moneyExactPlain(audit.realizedPnl), hint: `${audit.wins} wins`, tone: mark(audit.realizedPnl) },
@@ -804,10 +873,12 @@ function SettingsPanel({ audit }: { audit: PortfolioBotAudit }) {
  * positions and how much is idle liquidity, with a stacked bar, a per-symbol
  * invested chart and the reconciliation style rows. */
 function AllocationCard({ data }: { data: Portfolio }) {
-  const bySymbol = new Map<string, { invested: number; positions: number }>()
+  const bySymbol = new Map<string, { invested: number; held: number; positions: number }>()
   for (const position of data.positions) {
-    const entry = bySymbol.get(position.symbol) ?? { invested: 0, positions: 0 }
+    const entry = bySymbol.get(position.symbol) ?? { invested: 0, held: 0, positions: 0 }
     entry.invested += position.costBasis
+    // Equity actually held right now: the position at its current mark.
+    entry.held += position.qty * position.markPrice
     entry.positions += 1
     bySymbol.set(position.symbol, entry)
   }
@@ -819,6 +890,7 @@ function AllocationCard({ data }: { data: Portfolio }) {
   const stocksInvested = symbols.filter(([symbol]) => !isCrypto(symbol)).reduce((sum, [, e]) => sum + e.invested, 0)
   const cryptoInvested = symbols.filter(([symbol]) => isCrypto(symbol)).reduce((sum, [, e]) => sum + e.invested, 0)
   const invested = stocksInvested + cryptoInvested
+  const heldTotal = symbols.reduce((sum, [, e]) => sum + e.held, 0)
   const cash = data.bots.reduce((sum, bot) => sum + bot.cash, 0)
   const deployed = invested + cash
   const share = (value: number) => (deployed > 0 ? `${((value / deployed) * 100).toFixed(1)}%` : '—')
@@ -868,6 +940,7 @@ function AllocationCard({ data }: { data: Portfolio }) {
                 { label: 'Invested — stocks', value: moneyExact(stocksInvested), detail: 'open stock positions at cost', tone: 'text-fg' },
                 { label: 'Invested — crypto', value: moneyExact(cryptoInvested), detail: 'open crypto positions at cost', tone: 'text-fg' },
                 { label: 'Total invested', value: moneyExact(invested), detail: `of ${moneyExact(data.summary.currentEquity)} fleet equity`, tone: 'text-fg' },
+                { label: 'Held equity at mark', value: moneyExact(heldTotal), detail: 'open holdings valued at the current price', tone: 'text-fg' },
               ].map((row) => (
                 <div key={row.label} className="flex items-center justify-between py-2">
                   <dt>
@@ -894,15 +967,16 @@ function AllocationCard({ data }: { data: Portfolio }) {
             </dl>
 
             <div>
-              <p className="text-[12.5px] font-medium text-muted">Invested by symbol</p>
+              <p className="text-[12.5px] font-medium text-muted">Equity held per holding</p>
               <div className="mt-3">
-                <p className="mb-3 text-[12px] text-faint">Amount committed per symbol at cost basis · share of {moneyExact(invested)} invested</p>
+                <p className="mb-3 text-[12px] text-faint">What each holding is worth at the current mark · cost basis and P&L alongside · share of {moneyExact(heldTotal)} held</p>
                 <CompareBars
+                  signed
                   format={(v) => moneyExact(v)}
                   items={symbols.map(([symbol, entry]) => ({
                     label: symbol,
-                    caption: `${entry.positions} position${entry.positions === 1 ? '' : 's'} · ${invested > 0 ? pct((entry.invested / invested) * 100) : '—'} of invested`,
-                    value: entry.invested,
+                    caption: `cost ${moneyExact(entry.invested)} · P&L ${pct(entry.invested > 0 ? ((entry.held - entry.invested) / entry.invested) * 100 : 0)}`,
+                    value: entry.held,
                   }))}
                 />
               </div>
@@ -916,13 +990,214 @@ function AllocationCard({ data }: { data: Portfolio }) {
   )
 }
 
+/** The simulated wallet's own book: every paper-mode bot, what it holds right
+ * now, its P&L and its curve — audited here precisely because none of it
+ * enters the money book above. */
+function PaperBook({ data, onOpen }: { data: Portfolio; onOpen: (botId: string) => void }) {
+  const paperBots = data.bots.filter((bot) => bot.mode === 'paper')
+  const heldNow = paperBots.reduce((sum, bot) => sum + bot.equity, 0)
+  const pilot = paperBots.reduce((sum, bot) => sum + (bot.capital - bot.netDeposits), 0)
+  const paperPnl = heldNow - pilot
+  const realized = paperBots.reduce((sum, bot) => sum + bot.realizedPnl, 0)
+  const unrealized = paperBots.reduce((sum, bot) => sum + bot.unrealizedPnl, 0)
+  const paperWinRate = (() => {
+    const trips = paperBots.reduce((sum, bot) => sum + bot.roundTrips, 0)
+    const wins = paperBots.reduce((sum, bot) => sum + bot.wins, 0)
+    return trips > 0 ? (wins / trips) * 100 : null
+  })()
+
+  const paperIds = new Set(paperBots.map((bot) => bot.id))
+  const flows = data.funding.filter((flow) => paperIds.has(flow.botId))
+  const deposits = flows.filter((flow) => flow.amount > 0).reduce((sum, flow) => sum + flow.amount, 0)
+  const withdrawals = flows.filter((flow) => flow.amount < 0).reduce((sum, flow) => sum - flow.amount, 0)
+
+  const kpis = [
+    { label: 'Money held now', value: moneyExact(heldNow), hint: 'cash + open marks across paper bots' },
+    { label: 'Paper P&L', value: pnlText(paperPnl), hint: `${pct(pilot > 0 ? (paperPnl / pilot) * 100 : 0)} on committed funding`, tone: mark(paperPnl) },
+    { label: 'Realized', value: pnlText(realized), tone: mark(realized), hint: '', },
+    { label: 'Unrealized', value: pnlText(unrealized), tone: mark(unrealized), hint: '', },
+    { label: 'Win rate', value: paperWinRate === null ? '—' : `${paperWinRate.toFixed(0)}%`, hint: '', },
+  ]
+
+  return (
+    <>
+      <p className="mt-3 rounded-tile border border-line bg-surface-2/60 px-3 py-2 text-[12.5px] text-muted">
+        Paper bots trade the simulation wallet. This tab audits them, but their equity and P&L are
+        <span className="font-medium text-fg"> never blended into</span> the money book — that stays live-routed capital only.
+      </p>
+
+      <div className="mt-3 grid grid-cols-2 gap-3 lg:grid-cols-5">
+        {kpis.map((kpi) => (
+          <Card key={kpi.label} className="flex h-[104px] flex-col justify-between p-4">
+            <p className="text-[13px] text-muted">{kpi.label}</p>
+            <div>
+              <p className={cx('text-[19px] font-semibold tracking-[-0.02em] tabular-nums', kpi.tone)}>{kpi.value}</p>
+              {kpi.hint && <p className="mt-0.5 text-[12px] text-faint">{kpi.hint}</p>}
+            </div>
+          </Card>
+        ))}
+      </div>
+
+      <div className="mt-3 grid gap-3 lg:grid-cols-3">
+        <Card className="p-5 lg:col-span-2">
+          <h2 className="text-[14px] font-semibold">Simulated wallet equity</h2>
+          <p className="mt-0.5 text-[12px] text-faint">Daily close across every paper bot · last 30 days</p>
+          <div className="mt-4">
+            {data.paperEquityCurve.length > 0 ? (
+              <AreaChart data={data.paperEquityCurve} format={money} />
+            ) : (
+              <EmptyState icon={<Wallet />} title="No paper history yet" description="Run a paper bot and this wallet curve builds daily." />
+            )}
+          </div>
+        </Card>
+        <Card className="p-5">
+          <h2 className="text-[14px] font-semibold">Funding &amp; reconciliation</h2>
+          <p className="mt-0.5 text-[12px] text-faint">Paper cash flows against the simulated wallet — the paper twin of the money book's ledger.</p>
+          <p className="mt-1 text-[11.5px] text-faint">deposits − withdrawals · {flows.length} flows on paper bots</p>
+          <p className="mt-1 text-[11.5px] text-faint">deposits {moneyExact(deposits)} · withdrawals {moneyExact(withdrawals)} · net {moneyExact(deposits - withdrawals)}</p>
+          <div className="mt-3 flex flex-col gap-1.5 text-[13px] tabular-nums">
+            <div className="flex items-center justify-between"><span className="text-muted">Committed funding</span><span>{moneyExact(deposits - withdrawals)}</span></div>
+            <div className="flex items-center justify-between"><span className="text-muted">Committed pilot funding</span><span>{moneyExact(pilot)}</span></div>
+            <div className="flex items-center justify-between border-t border-line pt-2"><span className="text-muted">+ Paper P&amp;L</span><span className={mark(paperPnl)}>{pnlText(paperPnl)}</span></div>
+            <div className="flex items-center justify-between border-t border-line pt-2 text-[13.5px] font-semibold"><span>= Money held now</span><span>{moneyExact(heldNow)}</span></div>
+          </div>
+        </Card>
+      </div>
+
+      <Card className="mt-3 overflow-hidden">
+        <div className="flex flex-wrap items-center justify-between gap-2 px-5 pt-5">
+          <div>
+            <h2 className="text-[14px] font-semibold">Paper bots — money held per bot</h2>
+            <p className="mt-0.5 text-[12px] text-faint">Total money each bot holds right now: idle cash plus its open positions at the mark.</p>
+          </div>
+          <Button size="sm" onClick={() => exportBotsCsv(data)}>
+            <Download className="size-3.5" />
+            Export CSV
+          </Button>
+        </div>
+        <div className="mt-3 overflow-x-auto">
+          <table className="w-full table-fixed text-left text-[13px]">
+            <thead>
+              <tr className="h-9 border-y border-line bg-bg/60 text-[12px] text-muted">
+                <th className="w-[24%] px-5 font-medium">Bot</th>
+                <th className="w-[9%] px-2 font-medium">State</th>
+                <th className="w-[9%] px-2 font-medium">Market</th>
+                <th className="w-[13%] px-2 text-right font-medium">Money held</th>
+                <th className="w-[11%] px-2 text-right font-medium">Idle cash</th>
+                <th className="w-[11%] px-2 text-right font-medium">Net P&L</th>
+                <th className="w-[9%] px-2 text-right font-medium">Win rate</th>
+                <th className="w-[8%] px-2 text-right font-medium">Fees</th>
+                <th className="w-[6%] px-2 text-right font-medium">Fills</th>
+                <th className="w-[10%] px-5 text-right font-medium" />
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-line">
+              {paperBots.map((bot) => {
+                const botPnl = bot.equity - (bot.capital - bot.netDeposits)
+                return (
+                  <tr key={bot.id} className="h-11 transition-colors hover:bg-surface-2/50">
+                    <td className="px-5">
+                      <button type="button" onClick={() => onOpen(bot.id)} className="block max-w-full truncate text-left font-medium transition-colors hover:text-accent">
+                        {bot.name}
+                      </button>
+                      <span className="block truncate text-[11.5px] text-faint">{bot.strategyName} · {bot.timeframe}</span>
+                    </td>
+                    <td className="px-2" title="Training: actively paper trading · Hangar: parked (backtesting or idle)">
+                      <Badge tone={activityTone[activityOf(bot)]} dot>
+                        {activityOf(bot)}
+                      </Badge>
+                    </td>
+                    <td className="px-2 text-muted">{bot.mode === 'paper' ? 'paper' : bot.mode}</td>
+                    <td className="px-2 text-right font-semibold tabular-nums">{moneyExact(bot.equity)}</td>
+                    <td className="px-2 text-right tabular-nums text-muted">{moneyExact(bot.cash)}</td>
+                    <td className={cx('px-2 text-right tabular-nums font-medium', mark(botPnl))}>{moneyExactPlain(botPnl)}</td>
+                    <td className="px-2 text-right tabular-nums text-muted">{bot.winRate === null ? '—' : `${bot.winRate.toFixed(0)}%`}</td>
+                    <td className="px-2 text-right tabular-nums text-faint">{moneyExactPlain(bot.fees)}</td>
+                    <td className="px-2 text-right tabular-nums text-muted">{bot.fills}</td>
+                    <td className="px-5 text-right">
+                      <Button size="sm" onClick={() => onOpen(bot.id)}>
+                        Analyze
+                      </Button>
+                    </td>
+                  </tr>
+                )
+              })}
+            </tbody>
+          </table>
+          {paperBots.length === 0 && (
+            <EmptyState icon={<Wallet />} title="No paper bots" description="Launch a bot in paper mode and it audits here without touching the money book." />
+          )}
+        </div>
+      </Card>
+    </>
+  )
+}
+
+/** Per-bot audit card → audit.csv: one row per bot plus a totals row, with
+ * the funding reconciliation columns the screen reconciles against. */
+function exportBotsCsv(data: Portfolio) {
+  downloadCsv(
+    'htf-bot-audit.csv',
+    ['Bot', 'Strategy', 'Mode', 'Status', 'Capital', 'Equity', 'Net P&L', 'Realized P&L', 'Unrealized P&L', 'Fees', 'Fills', 'Round trips', 'Wins', 'Win rate %', 'Net deposits', 'Last activity'],
+    [
+      ...data.bots.map((bot) => [
+        bot.name,
+        bot.strategyName,
+        bot.mode,
+        activityOf(bot),
+        bot.capital.toFixed(2),
+        bot.equity.toFixed(2),
+        (bot.equity - bot.capital).toFixed(2),
+        bot.realizedPnl.toFixed(2),
+        bot.unrealizedPnl.toFixed(2),
+        bot.fees.toFixed(2),
+        bot.fills,
+        bot.roundTrips,
+        bot.wins,
+        bot.winRate === null ? '' : bot.winRate.toFixed(2),
+        bot.netDeposits.toFixed(2),
+        new Date(bot.lastActivityAt).toISOString(),
+      ]),
+      [
+        'TOTAL (live book)',
+        '',
+        '',
+        '',
+        data.summary.startingCapital.toFixed(2),
+        data.summary.currentEquity.toFixed(2),
+        data.summary.netPnl.toFixed(2),
+        data.summary.realizedPnl.toFixed(2),
+        data.summary.unrealizedPnl.toFixed(2),
+        data.summary.fees.toFixed(2),
+        data.summary.fills,
+        data.summary.roundTrips,
+        data.summary.wins,
+        data.summary.expectedWinRate === null ? '' : data.summary.expectedWinRate.toFixed(2),
+        data.summary.netFunding.toFixed(2),
+        '',
+      ],
+    ],
+  )
+}
+
 /** Shared: live positions table for the fleet tab or one bot's tab. */
 function PositionsCard({ positions, title, countLabel }: { positions: PortfolioPosition[]; title: string; countLabel: number }) {
   return (
     <Card className="overflow-hidden">
       <div className="flex items-center justify-between px-5 pt-5">
-        <h2 className="text-[14px] font-semibold">{title}</h2>
-        <span className="text-[12.5px] text-faint">{countLabel}</span>
+        <div>
+          <h2 className="text-[14px] font-semibold">{title}</h2>
+          <p className="mt-0.5 text-[12px] text-faint">Fills with price, fee and realized P&L — the raw audit trail.</p>
+        </div>
+        <div className="flex items-center gap-2">
+          <span className="text-[12.5px] text-faint">{countLabel}</span>
+          {positions.length > 0 && (
+            <Button size="sm" title="Download the visible position book as a CSV file" onClick={() => exportPositionsCsv(positions)}>
+              <Download className="size-3.5" />
+              Export CSV
+            </Button>
+          )}
+        </div>
       </div>
       <div className="mt-3 overflow-x-auto">
         <table className="w-full table-fixed text-left text-[13px]">
@@ -961,7 +1236,15 @@ function LedgerCard({ transactions, countLabel }: { transactions: PortfolioTrans
     <Card className="overflow-hidden">
       <div className="flex items-center justify-between px-5 pt-5">
         <h2 className="text-[14px] font-semibold">Transaction ledger</h2>
-        <span className="text-[12.5px] text-faint">{countLabel}</span>
+        <div className="flex items-center gap-2">
+          <span className="text-[12.5px] text-faint">{countLabel}</span>
+          {transactions.length > 0 && (
+            <Button size="sm" title="Download the transaction ledger as a CSV file" onClick={() => exportLedgerCsv(transactions)}>
+              <Download className="size-3.5" />
+              Export CSV
+            </Button>
+          )}
+        </div>
       </div>
       <div className="mt-3 overflow-x-auto">
         <table className="w-full table-fixed text-left text-[13px]">
@@ -997,6 +1280,44 @@ function LedgerCard({ transactions, countLabel }: { transactions: PortfolioTrans
         {transactions.length === 0 && <EmptyState title="Ledger empty" description="Fills land here the moment a bot trades." />}
       </div>
     </Card>
+  )
+}
+
+/** Open-position book → positions.csv — one row exactly as shown plus cost
+ * basis and mark timestamps aren't needed (positions always price "now"). */
+function exportPositionsCsv(positions: PortfolioPosition[]) {
+  downloadCsv(
+    'htf-positions.csv',
+    ['Bot', 'Symbol', 'Qty', 'Avg cost', 'Mark', 'Cost basis', 'Unrealised P&L'],
+    positions.map((p) => [
+      p.botName,
+      p.symbol,
+      p.qty.toFixed(6),
+      p.avgPrice.toFixed(2),
+      p.markPrice.toFixed(2),
+      p.costBasis.toFixed(2),
+      p.unrealizedPnl.toFixed(2),
+    ]),
+  )
+}
+
+/** Transaction ledger card → transactions.csv, exactly the rows shown plus
+ * quantity (the table hides it to stay narrow). */
+function exportLedgerCsv(transactions: PortfolioTransaction[]) {
+  downloadCsv(
+    'htf-transactions.csv',
+    ['Time', 'Bot', 'Symbol', 'Side', 'Qty', 'Price', 'Fee', 'Realized P&L', 'Fill time (UTC)'],
+    transactions.map((tx) => [
+      relativeTime(tx.at),
+      tx.botName ?? '',
+      tx.symbol,
+      tx.side,
+      tx.qty.toFixed(6),
+      tx.price.toFixed(2),
+      tx.fee.toFixed(2),
+      tx.pnl === null ? '' : tx.pnl.toFixed(2),
+      new Date(tx.at).toISOString(),
+    ]),
   )
 }
 

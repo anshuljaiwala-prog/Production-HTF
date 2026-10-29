@@ -1,8 +1,10 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { useEffect } from 'react'
 import { BrowserRouter, Navigate, Route, Routes, useLocation } from 'react-router'
 
 import { Shell } from './components/Shell'
 import { Spinner, ToastProvider } from './components/ui'
+import { capturePageview, identifyUser } from './lib/analytics'
 import { ApiError, useMe } from './lib/api'
 import { BotDetail } from './pages/BotDetail'
 import { Bots } from './pages/Bots'
@@ -18,6 +20,14 @@ const client = new QueryClient({
   defaultOptions: { queries: { retry: 1, refetchOnWindowFocus: false, staleTime: 15_000 } },
 })
 
+/** Every SPA navigation is a PostHog pageview — pageviews plus the events the
+ * flows capture are what make funnels and retention readable. */
+function Pageviews() {
+  const { pathname } = useLocation()
+  useEffect(() => capturePageview(pathname), [pathname])
+  return null
+}
+
 /** Backtests now live on the Training page — forward old links with
  * their drawer id intact. */
 function BacktestsRedirect() {
@@ -29,6 +39,10 @@ function BacktestsRedirect() {
 
 function Gate() {
   const me = useMe()
+  // Once the Worker says who this is, bind every event to that person.
+  useEffect(() => {
+    if (me.data) identifyUser(me.data)
+  }, [me.data])
   if (me.isLoading) {
     return (
       <div className="grid h-full place-items-center">
@@ -65,6 +79,7 @@ export function App() {
     <QueryClientProvider client={client}>
       <ToastProvider>
         <BrowserRouter>
+          <Pageviews />
           <Gate />
         </BrowserRouter>
       </ToastProvider>

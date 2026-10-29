@@ -1,6 +1,6 @@
 import type { Bot } from '../shared/types'
 import { createBroker, LiveBrokerError, type Broker } from './broker'
-import { id } from './db'
+import { BOT_SELECT, id, mapBot } from './db'
 import { TIMEFRAME_MS, barIndexAt, lastClosedIndex, type Bar } from './market'
 import { strategyBy } from './strategies'
 
@@ -18,6 +18,14 @@ const MIN_NOTIONAL = 1
 const QTY_STEP = 1e6
 /** Fee+slippage head-room when sizing a buy against available cash. */
 const COST_BUFFER = 1.003
+
+/** Bots (per workspace) whose simulation is currently writing. The engine is
+ * lazy — every read/write route advances running bots — so two parallel HTTP
+ * reads of the same bot would both replay the same bars and interleave their
+ * D1 statements: filled buys without their cash debits, clobbered `cash`,
+ * vanished position rows. The lock collapses those to one writer; a skipped
+ * advance simply hasn't caught up yet and the next read does it. */
+const advancingBots = new Set<string>()
 
 type Row = Record<string, unknown>
 
@@ -47,7 +55,24 @@ export interface AdvanceOptions {
  */
 export async function advanceBot(db: D1Database, owner: string, bot: Bot, options: AdvanceOptions = {}): Promise<void> {
   if (bot.status !== 'running') return
+  const lockKey = `${owner}:${bot.id}`
+  if (advancingBots.has(lockKey)) return
+  advancingBots.add(lockKey)
+  try {
+    await advanceLocked(db, owner, bot, options)
+  } finally {
+    advancingBots.delete(lockKey)
+  }
+}
 
+async function advanceLocked(db: D1Database, owner: string, bot: Bot, options: AdvanceOptions): Promise<void> {
+  // The caller's snapshot can already be a bar (or three) behind — routes load
+  // bots beforeserialising their advance work. Re-read the live row so the
+  // simulation and its trailing write always agree on one state.
+  const freshRow = await db.prepare(`${BOT_SELECT} WHERE b.id = ? AND b.owner_sub = ?`).bind(bot.id, owner).first<Row>()
+  if (!freshRow) return
+  bot = mapBot(freshRow)
+  if (bot.status !== 'running') return
   const strategy = strategyBy(bot.strategyKey)
   if (!strategy) {
     await write(db, bot.id, owner, [
@@ -148,7 +173,10 @@ export async function advanceBot(db: D1Database, owner: string, bot: Bot, option
               const total = position.qty + fill.qty
               position.avgPrice = (position.avgPrice * position.qty + fill.price * fill.qty) / total
               position.qty = total
-              position.dirty = 'update'
+              // Keep 'insert' when the book entry was created this pass: flaging
+              // it 'update' would emit an UPDATE for a row this pass never
+              // INSERTed, and the position would vanish from the store.
+              if (position.dirty !== 'insert') position.dirty = 'update'
             } else {
               positions.set(symbol, {
                 id: id(),
@@ -166,7 +194,7 @@ export async function advanceBot(db: D1Database, owner: string, bot: Bot, option
             events.push({
               id: id(),
               level: 'fill',
-              message: `Bought ${trim(fill.qty)} ${symbol} @ ${fill.price} — ${signal.reason ?? 'entry'}.`,
+              message: `Bought ${trim(fill.qty)} ${symbol} @ ${trim(fill.price)} — ${signal.reason ?? 'entry'}.`,
               at: barClose,
             })
           } catch (error) {
@@ -188,8 +216,7 @@ export async function advanceBot(db: D1Database, owner: string, bot: Bot, option
           })
           events.push({
             id: id(),
-            level: 'fill',
-            message: `Sold ${trim(fill.qty)} ${symbol} @ ${fill.price} — ${signal.reason ?? 'exit'} (P&L ${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)}).`,
+            level: 'fill',              message: `Sold ${trim(fill.qty)} ${symbol} @ ${trim(fill.price)} — ${signal.reason ?? 'exit'} (P&L ${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)}).`,
             at: barClose,
           })
           positions.set(symbol, { ...position, qty: 0, dirty: 'delete' })

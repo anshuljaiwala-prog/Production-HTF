@@ -12,11 +12,19 @@ import { cx } from '../lib/cx'
 import { money, relativeTime } from '../lib/format'
 import { ACTIVITIES, BOT_STAGES, activityOf, type Bot, type BotActivity } from '../../shared/types'
 
-const activityTone: Record<BotActivity, 'success' | 'warning' | 'neutral'> = { active: 'success', inactive: 'warning', grounded: 'neutral' }
+const activityTone: Record<BotActivity, 'success' | 'warning' | 'neutral' | 'info'> = {
+  active: 'success',
+  inactive: 'warning',
+  grounded: 'neutral',
+  training: 'info',
+  hangar: 'neutral',
+}
 const FILTERS: { key: BotActivity | 'all'; label: string }[] = [
   { key: 'all', label: 'All' },
   { key: 'active', label: 'Active' },
+  { key: 'training', label: 'Training' },
   { key: 'inactive', label: 'Inactive' },
+  { key: 'hangar', label: 'In hangar' },
   { key: 'grounded', label: 'Grounded' },
 ]
 const TABS: { key: 'list' | 'board' | 'edge'; label: string }[] = [
@@ -146,7 +154,7 @@ export function Bots() {
                       {BOT_STAGES.find((s) => s.key === bot.stage)?.label}
                     </Badge>
                   </td>
-                  <td className="px-4" title="Active: trading · Inactive: holding only · Grounded: not trading or holding">
+                  <td className="px-4" title="Active: live trading · Training: paper trading / being backtested · Inactive: holding only · Hangar: parked paper bot · Grounded: not trading or holding">
                     <Badge tone={activityTone[activityOf(bot)]} dot>
                       {activityOf(bot)}
                     </Badge>

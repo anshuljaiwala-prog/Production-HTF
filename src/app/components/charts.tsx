@@ -8,6 +8,52 @@ import { moneyCompact } from '../lib/format'
 
 export type ChartFormatter = (value: number) => string
 
+/** A caption line that sits directly under a chart: what the series is and
+ * where the data comes from. Charts stop being anonymous images. */
+export function ChartNote({ value, source }: { value: string; source: string }) {
+  return (
+    <p className="mt-2 text-[11.5px] text-faint">
+      <span className="font-medium text-muted">{value}</span>
+      {' · '}
+      {source}
+    </p>
+  )
+}
+
+/** Tiny unlabelled line for embedding in KPI tiles and table rows — no axes,
+ * no hover, just the shape of the last N values at a glance. */
+export function Sparkline({
+  data,
+  width = 96,
+  height = 28,
+  positive,
+  className,
+}: {
+  data: number[]
+  width?: number
+  height?: number
+  /** Force success/danger coloring; defaults to the accent color. */
+  positive?: boolean
+  className?: string
+}) {
+  if (data.length < 2) return null
+  const lo = Math.min(...data)
+  const hi = Math.max(...data)
+  const span = hi - lo || 1
+  const pad = 2
+  const x = (i: number) => pad + (i / (data.length - 1)) * (width - pad * 2)
+  const y = (v: number) => pad + (1 - (v - lo) / span) * (height - pad * 2)
+  const line = data.map((v, i) => `${i === 0 ? 'M' : 'L'}${x(i).toFixed(1)},${y(v).toFixed(1)}`).join(' ')
+  const color = positive === undefined ? 'var(--color-accent)' : positive ? 'var(--color-success)' : 'var(--color-danger)'
+  return (
+    <svg width={width} height={height} viewBox={`0 0 ${width} ${height}`} className={className} aria-hidden>
+      <line x1={pad} x2={width - pad} y1={y(0)} y2={y(0)} stroke="var(--color-line)" strokeDasharray="2 3" />
+      <path d={line} fill="none" stroke={color} strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round" />
+      <circle cx={x(data.length - 1)} cy={y(data[data.length - 1])} r="2.4" fill={color} />
+    </svg>
+  )
+}
+
 /** Area chart of a single series. `zeroBaseline` anchors the fill to the domain
  * minimum so negative-moving series render honestly. Callers pass `format`
  * when the series isn't money (e.g. percentages). */
@@ -293,6 +339,108 @@ export function BarChart({
         >
           trade {hover + 1}{data[hover].label ? ` · ${data[hover].label}` : ''} · {format(data[hover].value)}
           {data[hover].note ? ` · ${data[hover].note}` : ''}
+        </div>
+      )}
+    </div>
+  )
+}
+
+/** Paired weekly bars around a zero baseline: two series per slot side by
+ * side (e.g. net funding vs realized P&L), one labelled y-axis, week labels
+ * under the axis, hover reading both values. */
+export function PairedBarChart({
+  data,
+  height = 180,
+  className,
+  format = moneyCompact,
+  aLabel,
+  bLabel,
+  aColor = 'var(--color-info)',
+  bColor = 'var(--color-accent)',
+}: {
+  data: { label: string; a: number; b: number }[]
+  height?: number
+  className?: string
+  format?: ChartFormatter
+  aLabel: string
+  bLabel: string
+  aColor?: string
+  bColor?: string
+}) {
+  const [hover, setHover] = useState<number | null>(null)
+  const w = 600
+  const h = height
+  const padLeft = 60
+  const padRight = 10
+  const padTop = 12
+  const padBottom = 22
+  const innerW = w - padLeft - padRight
+  const maxAbs = Math.max(1e-9, ...data.flatMap((d) => [Math.abs(d.a), Math.abs(d.b)]))
+  const lo = Math.min(0, ...data.map((d) => Math.min(d.a, d.b))) - maxAbs * 0.12
+  const hi = Math.max(0, ...data.map((d) => Math.max(d.a, d.b))) + maxAbs * 0.12
+  const y = (v: number) => padTop + (h - padTop - padBottom) * (1 - (v - lo) / (hi - lo))
+  const zeroY = y(0)
+  const slot = data.length > 0 ? innerW / data.length : innerW
+  const barW = Math.max(2, Math.min(16, slot * 0.32))
+  const ticks = [0, (lo + hi) / 2, hi].filter((t, i, arr) => arr.findIndex((x) => Math.abs(x - t) < 1e-9) === i)
+  const labelEvery = Math.max(1, Math.ceil(data.length / 8))
+
+  return (
+    <div className={cx('relative', className)}>
+      <div className="flex items-center gap-4 pb-1 text-[11.5px]">
+        <span className="inline-flex items-center gap-1.5 text-muted">
+          <span className="inline-block size-2 rounded-[3px]" style={{ background: aColor }} /> {aLabel}
+        </span>
+        <span className="inline-flex items-center gap-1.5 text-muted">
+          <span className="inline-block size-2 rounded-[3px]" style={{ background: bColor }} /> {bLabel}
+        </span>
+      </div>
+      <svg viewBox={`0 0 ${w} ${h}`} className="h-auto w-full" preserveAspectRatio="none" onMouseLeave={() => setHover(null)}>
+        {ticks.map((t) => (
+          <g key={t}>
+            <line x1={padLeft} x2={w - padRight} y1={y(t)} y2={y(t)} stroke={t === 0 ? 'var(--color-line-strong)' : 'var(--color-line)'} strokeDasharray={t === 0 ? undefined : '2 4'} />
+            <text x={padLeft - 6} y={y(t)} textAnchor="end" dominantBaseline="central" fontSize="10.5" fill="var(--color-faint)">
+              {format(t)}
+            </text>
+          </g>
+        ))}
+        {data.map((d, i) => (
+          <g key={i} onMouseEnter={() => setHover(i)}>
+            <rect x={padLeft + i * slot} y={padTop} width={slot} height={h - padTop - padBottom} fill="transparent" />
+            {[d.a, d.b].map((value, k) =>
+              value === 0 ? null : (
+                <motion.rect
+                  key={k}
+                  x={padLeft + i * slot + (k === 0 ? slot * 0.16 : slot * 0.52)}
+                  y={value >= 0 ? y(value) : zeroY}
+                  width={barW}
+                  height={Math.max(1, value >= 0 ? zeroY - y(value) : y(value) - zeroY)}
+                  rx="2"
+                  fill={k === 0 ? aColor : bColor}
+                  fillOpacity={hover === null || hover === i ? 1 : 0.4}
+                  initial={{ opacity: 0 }}
+                  animate={{ opacity: 1 }}
+                  transition={{ duration: 0.4, delay: Math.min(0.5, i * 0.02) }}
+                />
+              ),
+            )}
+            {hover === i && <line x1={padLeft + i * slot} x2={padLeft + (i + 1) * slot} y1={padTop} y2={h - padBottom} stroke="var(--color-line-strong)" strokeDasharray="3 3" />}
+          </g>
+        ))}
+        {data.map((d, i) =>
+          i % labelEvery === 0 || i === data.length - 1 ? (
+            <text key={`l-${i}`} x={padLeft + i * slot + slot / 2} y={h - 6} textAnchor="middle" fontSize="10.5" fill="var(--color-faint)">
+              {d.label}
+            </text>
+          ) : null,
+        )}
+      </svg>
+      {hover !== null && (
+        <div
+          className="pointer-events-none absolute top-1 z-10 -translate-x-1/2 rounded-tile bg-fg px-2.5 py-1.5 text-[12px] font-medium text-bg shadow-pop"
+          style={{ left: `${((padLeft + hover * slot + slot / 2) / w) * 100}%` }}
+        >
+          week of {data[hover].label} · {aLabel} {format(data[hover].a)} · {bLabel} {format(data[hover].b)}
         </div>
       )}
     </div>

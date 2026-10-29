@@ -80,10 +80,11 @@ function liveInterval<T>(fast: number, slow: number | false, hasActivity: (data:
 }
 
 export const useMe = () => useQuery({ queryKey: ['me'], queryFn: () => api<Me>('/me'), retry: false, staleTime: 60_000 })
-export const useDashboard = () =>
+/** Workspace overview; `days` selects the equity window (7 / 30 / 365). */
+export const useDashboard = (days = 30) =>
   useQuery({
-    queryKey: ['dashboard'],
-    queryFn: () => api<Dashboard>('/overview'),
+    queryKey: ['dashboard', days],
+    queryFn: () => api<Dashboard>(`/overview?days=${days}`),
     refetchInterval: liveInterval<Dashboard>(4_000, 20_000, (d) => d.kpis.activeBots > 0),
     placeholderData: (p) => p,
   })
@@ -333,6 +334,8 @@ export interface BotPatch {
   riskPct?: number
   params?: Record<string, ParamValue>
   connectionId?: string | null
+  /** Paper ↔ live venue switch — blocked by the server while the bot runs. */
+  mode?: 'paper' | 'live'
 }
 export const patchBot = (botId: string, patch: BotPatch) =>
   api<{ bot: Bot }>(`/bots/${botId}`, { method: 'PATCH', json: patch })
@@ -436,5 +439,17 @@ export const fetchMarketHistory = (symbol: string, timeframe: Timeframe, days = 
 
 export const createConnection = (input: { name: string; exchange: string; apiKey: string; apiSecret: string; mode: 'paper' | 'live' }) =>
   api<{ connection: Connection }>('/connections', { method: 'POST', json: input })
-export const deleteConnection = (connectionId: string) => api<{ ok: true }>(`/connections/${connectionId}`, { method: 'DELETE' })
+/** Credential edits. Rotating the key requires rotating the secret too; other
+ * fields edit independently. Deleting a connection detaches its bots. */
+export interface ConnectionPatch {
+  name?: string
+  exchange?: string
+  mode?: 'paper' | 'live'
+  apiKey?: string
+  apiSecret?: string
+}
+export const updateConnection = (connectionId: string, patch: ConnectionPatch) =>
+  api<{ connection: Connection }>(`/connections/${connectionId}`, { method: 'PATCH', json: patch })
+export const deleteConnection = (connectionId: string) =>
+  api<{ ok: true; detached: number; grounded: number }>(`/connections/${connectionId}`, { method: 'DELETE' })
 export const addDemoConnections = () => api<{ added: number }>('/connections/demo', { method: 'POST' })

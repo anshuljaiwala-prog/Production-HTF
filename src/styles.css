@@ -138,3 +138,39 @@ html[data-theme='dark'] {
 @utility text-balance {
   text-wrap: balance;
 }
+
+/* Typography scale — the three named styles every page composes from, so
+ * titles, body copy and numeric reads stay consistent across surfaces:
+ *
+ *  .t-display  page figures / hero KPI numbers (dense tabular reads)
+ *  .t-title    card and section titles
+ *  .t-label    small caps labels (chart captions, table headers)
+ *  .t-num      numeric emphasis with fixed-width digits + tabular spacing
+ */
+@utility t-display {
+  font-size: 20px;
+  line-height: 1.2;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  font-variant-numeric: tabular-nums;
+}
+
+@utility t-title {
+  font-size: 14px;
+  line-height: 1.3;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+@utility t-label {
+  font-size: 11.5px;
+  line-height: 1.4;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+@utility t-num {
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.015em;
+}

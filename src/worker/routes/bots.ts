@@ -1,10 +1,10 @@
 import { Hono } from 'hono'
 
 import { privateJson } from '../auth'
-import { BOT_SELECT, id, mapBot, mapEvent, mapPosition, mapTrade, now } from '../db'
+import { BOT_SELECT, id, logEvent, mapBot, mapEvent, mapPosition, mapTrade, now } from '../db'
 import type { AppContext } from '../env'
 import { advanceBot } from '../engine'
-import { TIMEFRAME_MS, barsBetween, quote } from '../market'
+import { TIMEFRAME_MS, barsBetween, normalizeSymbol, quote } from '../market'
 import { STRATEGIES, measureAccuracy, parseRules, rulesToParams, sanitizeParams, strategyBy } from '../strategies'
 import type { Bot, BotStage, BotStatus, ParamValue, Timeframe } from '../../shared/types'
 
@@ -46,13 +46,6 @@ async function advanceRunning(db: D1Database, owner: string, items: Bot[]): Prom
   const running = items.filter((b) => b.status === 'running').slice(0, MAX_ADVANCE_PER_REQUEST)
   for (const bot of running) await advanceBot(db, owner, bot)
   return running.length > 0
-}
-
-async function logEvent(db: D1Database, owner: string, botId: string, level: string, message: string) {
-  await db
-    .prepare(`INSERT INTO bot_events (id, owner_sub, bot_id, level, message, created_at) VALUES (?, ?, ?, ?, ?, ?)`)
-    .bind(id(), owner, botId, level, message, now())
-    .run()
 }
 
 bots.get('/', async (c) => {
@@ -119,11 +112,30 @@ async function validateSpec(db: D1Database, owner: string, body: CreateBody): Pr
   const strategy = strategyBy(isCustom ? 'custom' : String(body.strategyKey ?? ''))
   if (!strategy) return { error: 'unknown_strategy', message: 'Pick a strategy from the catalog.' }
 
-  const symbols = [...new Set((body.symbols ?? []).map((s) => String(s).trim().toUpperCase()).filter(Boolean))].slice(
-    0,
-    MAX_SYMBOLS,
-  )
-  if (symbols.length === 0) return { error: 'symbols_required', message: 'Choose at least one symbol.' }
+  // Ingress filtering: every candidate symbol is normalized (btcusdt →
+  // BTC-USD) and must resolve to a catalog entry. Unknown inputs are pulled
+  // out and named in the rejection — they never reach the synthetic feed,
+  // where an unknown symbol would silently mint a plausible-looking series.
+  const rejected = new Set<string>()
+  const seen = new Set<string>()
+  const symbols: string[] = []
+  for (const entry of body.symbols ?? []) {
+    const normalized = normalizeSymbol(String(entry))
+    if (!normalized) {
+      const text = String(entry).trim()
+      if (text) rejected.add(text)
+      continue
+    }
+    if (!seen.has(normalized)) {
+      seen.add(normalized)
+      symbols.push(normalized)
+    }
+  }
+  if (symbols.length === 0) {
+    return rejected.size > 0
+      ? { error: 'unknown_symbols', message: `No tradeable symbols in this row: ${[...rejected].slice(0, 4).join(', ')} — try catalog entries like BTC-USD or EUR-USD.` }
+      : { error: 'symbols_required', message: 'Choose at least one symbol.' }
+  }
 
   const timeframe = (body.timeframe ?? strategy.timeframes[Math.floor(strategy.timeframes.length / 2)]) as Timeframe
   if (!strategy.timeframes.includes(timeframe)) {
@@ -425,25 +437,47 @@ bots.patch('/:id', async (c) => {
     riskPct?: number
     params?: Record<string, unknown>
     connectionId?: string | null
+    /** Switch execution venue: paper (simulated wallet) ↔ live (exchange APIs). */
+    mode?: 'paper' | 'live'
   }>()
   const bot = await loadBot(db, owner, botId)
   if (!bot) return c.json({ error: 'not_found', message: 'Bot not found.' }, 404)
 
-  // Trading settings are only editable while the bot is not active — pause or
-  // stop it first so what it decides on never changes mid-run.
-  const wantsTradingSettings = body.symbols !== undefined || body.timeframe !== undefined || body.riskPct !== undefined || body.params !== undefined || body.connectionId !== undefined
+  // Trading settings — and a paper↔live venue switch — are only editable
+  // while the bot is not active: pause or stop it first so what it decides on
+  // never changes mid-run and a trade is never split across venues.
+  const modeChange = body.mode !== undefined && body.mode !== bot.mode ? (body.mode === 'live' ? 'live' : 'paper') : null
+  const wantsTradingSettings =
+    body.symbols !== undefined || body.timeframe !== undefined || body.riskPct !== undefined || body.params !== undefined || body.connectionId !== undefined || modeChange !== null
   if (wantsTradingSettings && bot.status === 'running') {
-    return c.json({ error: 'bot_active', message: 'Pause or stop this bot before editing its trading settings.' }, 409)
+    return c.json({ error: 'bot_active', message: 'Pause or ground this bot before changing its trading settings or venue.' }, 409)
   }
 
-  const stage = body.stage && ['draft', 'backtest', 'paper', 'live'].includes(body.stage) ? body.stage : bot.stage
+  const stage =
+    modeChange
+      ? // A venue switch keeps the lifecycle convention: stage follows the
+        // mode while it is one of the auto-assigned ones, but an operator's
+        // hand-set draft/backtest stage is preserved.
+        bot.stage === 'paper' || bot.stage === 'live'
+        ? modeChange
+        : bot.stage
+      : body.stage && ['draft', 'backtest', 'paper', 'live'].includes(body.stage)
+        ? body.stage
+        : bot.stage
   const name = body.name ? body.name.trim().slice(0, 90) || bot.name : bot.name
   const position = Number.isFinite(body.position) ? Number(body.position) : bot.position
 
   // Trading settings: each falls back to the stored value when absent.
   const strategy = strategyBy(bot.strategyKey)
-  const symbols = body.symbols !== undefined ? body.symbols.map((s) => String(s).trim().toUpperCase()).filter(Boolean).slice(0, MAX_SYMBOLS) : bot.symbols
-  if (symbols.length === 0) return c.json({ error: 'invalid_symbols', message: 'Keep at least one symbol.' }, 400)
+  // Same ingress filter as creation: normalize, then refuse a payload whose
+  // symbols all fail to resolve instead of parking garbage on the bot.
+  let patchedSymbols = bot.symbols
+  if (body.symbols !== undefined) {
+    const normalized = [...new Set((body.symbols ?? []).map((s) => normalizeSymbol(String(s))).filter((s): s is string => Boolean(s)))].slice(0, MAX_SYMBOLS)
+    if (normalized.length === 0) return c.json({ error: 'unknown_symbols', message: 'None of these symbols resolve to a catalog entry — try BTC-USD or EUR-USD.' }, 400)
+    patchedSymbols = normalized
+  }
+  const symbols = patchedSymbols
   const timeframe = body.timeframe !== undefined && strategy?.timeframes.includes(body.timeframe) ? body.timeframe : bot.timeframe
   const riskPct = Number.isFinite(Number(body.riskPct)) && body.riskPct !== undefined ? Math.min(100, Math.max(1, Number(body.riskPct))) : bot.riskPct
   // Catalog strategies sanitize against their schema; a custom bot accepts a
@@ -469,6 +503,25 @@ bots.patch('/:id', async (c) => {
     }
   }
   const connectionId = body.connectionId !== undefined ? (body.connectionId === null ? null : String(body.connectionId)) : bot.connectionId
+  // Going live requires an exchange API: refuse to flip a connectionless bot
+  // into venue execution where it would have nowhere to route orders.
+  if (modeChange === 'live' && !connectionId) {
+    return c.json({ error: 'connection_required', message: 'Connect an exchange API to this bot before switching it to live trading.' }, 400)
+  }
+  // And it must be a real connection the operator owns: a bot that survives
+  // a connection deletion (or receives a forged id from another workspace)
+  // must be caught here instead of routing live orders into a void.
+  const switchingConnection = (body.connectionId !== undefined && body.connectionId !== null) || modeChange === 'live'
+  if (switchingConnection && connectionId) {
+    const conn = await db
+      .prepare(`SELECT id FROM connections WHERE id = ? AND owner_sub = ?`)
+      .bind(connectionId, owner)
+      .first<Row>()
+    if (!conn) {
+      return c.json({ error: 'connection_missing', message: 'That exchange connection no longer exists in this workspace — reconnect the bot on the Connections page.' }, 400)
+    }
+  }
+  const mode: 'paper' | 'live' = modeChange ?? bot.mode
 
   // Diff the applied settings against what was stored so the event stream
   // shows config changes — "timeframe 1h → 4h, risk 25% → 30%" — not just
@@ -476,6 +529,7 @@ bots.patch('/:id', async (c) => {
   const changes: string[] = []
   if (name !== bot.name) changes.push(`name → "${name}"`)
   if (stage !== bot.stage) changes.push(`stage ${bot.stage} → ${stage}`)
+  if (mode !== bot.mode) changes.push(`trading mode ${bot.mode} → ${mode} — order routing now ${mode === 'live' ? 'the exchange API' : 'the simulated wallet'}`)
   if (timeframe !== bot.timeframe) changes.push(`timeframe ${bot.timeframe} → ${timeframe}`)
   if (riskPct !== bot.riskPct) changes.push(`risk ${bot.riskPct}% → ${riskPct}%`)
   if (JSON.stringify(symbols) !== JSON.stringify(bot.symbols)) changes.push(`symbols ${bot.symbols.join(', ')} → ${symbols.join(', ')}`)
@@ -495,7 +549,7 @@ bots.patch('/:id', async (c) => {
 
   await db
     .prepare(
-      `UPDATE bots SET name = ?, stage = ?, position = ?, symbols = ?, timeframe = ?, risk_pct = ?, params = ?, connection_id = ?, updated_at = ?
+      `UPDATE bots SET name = ?, stage = ?, position = ?, symbols = ?, timeframe = ?, risk_pct = ?, params = ?, connection_id = ?, mode = ?, updated_at = ?
        WHERE id = ? AND owner_sub = ?`,
     )
     .bind(
@@ -507,6 +561,7 @@ bots.patch('/:id', async (c) => {
       riskPct,
       JSON.stringify(params),
       connectionId,
+      mode,
       now(),
       botId,
       owner,

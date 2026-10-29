@@ -148,6 +148,34 @@ export function isOptionSymbol(symbol: string): boolean {
 
 export const SYMBOL_LIST = [...Object.keys(UNIVERSE), ...OPTION_SYMBOLS]
 
+/**
+ * Symbol normalization: operator input ("btcusdt", "Btc/Usd", "btc-usd ",
+ * "BTCUSDT.P") arrives in whatever dialect its source uses. Everything
+ * entering the platform funnels through here so noisy payloads can't fall
+ * through to the feed's stable-fallback series and silently become fiction:
+ * a symbol is accepted only if it resolves to a catalog entry, otherwise the
+ * caller rejects the payload with the offending value in the error text.
+ */
+export function normalizeSymbol(raw: string): string | null {
+  const cleaned = raw.trim().toUpperCase().replace(/[\s./_]+/g, '-').replace(/-+/g, '-')
+  if (!cleaned) return null
+  // Exact catalog entry wins — covers every canonical symbol plus options.
+  if (SYMBOL_LIST.includes(cleaned)) return cleaned
+  // Exchange-style packed pairs: 'BTCUSDT'/'ETHUSDC' → BASE-USD.
+  const packed = /^(XBT|BTC|ETH|SOL)(?:USDT|USDC|USD|PERP)\.?P?$/.exec(cleaned)
+  if (packed) {
+    const base = packed[1] === 'XBT' ? 'BTC' : packed[1]
+    const canonical = `${base}-USD`
+    if (SYMBOL_LIST.includes(canonical)) return canonical
+  }
+  return null
+}
+
+/** Only symbols that resolve to the catalog are tradeable — unknown inputs
+ * are rejected at ingress instead of minting a fake series. */
+export const isKnownSymbol = (symbol: string): boolean =>
+  SYMBOL_LIST.includes(symbol)
+
 /** How far back the platform retains (and serves) historical bars through
  * the market-data API: five years of stored history per symbol/timeframe.
  * Backtests and training windows are clamped to this same window, so what

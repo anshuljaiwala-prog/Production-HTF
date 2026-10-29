@@ -290,6 +290,15 @@ export function mapTrade(r: Row): Trade {
   }
 }
 
+/** Append a run-event row for one bot. Shared by every route that mutates
+ * bot state — controls, settings edits, funding, connection lifecycle. */
+export function logEvent(db: D1Database, owner: string, botId: string, level: string, message: string) {
+  return db
+    .prepare(`INSERT INTO bot_events (id, owner_sub, bot_id, level, message, created_at) VALUES (?, ?, ?, ?, ?, ?)`)
+    .bind(id(), owner, botId, level, message, now())
+    .run()
+}
+
 export function mapEvent(r: Row): BotEvent {
   return {
     id: r.id as string,

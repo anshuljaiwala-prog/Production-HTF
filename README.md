@@ -18,6 +18,13 @@ bun run typecheck      # tsc --noEmit
 bun run build          # dist/client (assets) + dist/crm/index.js (Worker)
 ```
 
+Product analytics (PostHog) is off unless the build carries a project key: copy
+`.env.example` to `.env` and set `VITE_POSTHOG_KEY`. The SDK is imported
+lazily, identifies the signed-in operator, and records pageviews plus the
+launch / backtest / training / upload events (`src/app/lib/analytics.ts`).
+Settings → Privacy switches it off per browser, and no event carries exchange
+credentials, holdings or trade contents.
+
 On localhost without a `FREEBUFF_CLIENT_ID`, the app signs you in as a local
 development user so everything works before auth is provisioned. A new
 workspace is seeded with sample bots, backtests and a demo connection;

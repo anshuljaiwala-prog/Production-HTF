@@ -77,8 +77,8 @@ export function Strategies() {
           {customList.length > 0 && (
             <section className="mt-6">
               <div className="mb-3 flex items-baseline justify-between">
-                <h2 className="text-[14px] font-semibold">Uploaded strategies (rules DSL · in-memory)</h2>
-                <span className="text-[12px] text-faint">held in worker memory until a restart — backtest with historical data before launching</span>
+                <h2 className="text-[14px] font-semibold">Uploaded strategies (rules DSL · durable)</h2>
+                <span className="text-[12px] text-faint">stored in D1 with version history — backtest with historical data before launching</span>
               </div>
               <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
                 {customList.map((entry) => (

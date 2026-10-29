@@ -23,18 +23,24 @@ export type BotStatus = 'running' | 'paused' | 'stopped'
 export type BotMode = 'paper' | 'live'
 
 /** What a bot is doing right now, in the operator's vocabulary.
- * Running bots are actively trading; a bot that is not running but still
- * holds open positions is inactive (holds its book, opens nothing new); a
- * flat, non-running bot is grounded (no trades, no positions). */
-export type BotActivity = 'active' | 'inactive' | 'grounded'
+ * Live-running bots are actively trading; a live bot that is not running but
+ * still holds open positions is inactive (holds its book, opens nothing
+ * new); a flat, non-running bot is grounded (no trades, no positions).
+ * Paper-mode bots sit in the training hangar: a running one is training
+ * (serving paper trades / being backtested), a stopped one is parked in the
+ * hangar (backtesting or holding its paper wallet offline). */
+export type BotActivity = 'active' | 'inactive' | 'grounded' | 'training' | 'hangar'
 
 export const ACTIVITIES: { key: BotActivity; label: string; hint: string }[] = [
-  { key: 'active', label: 'Active', hint: 'actively trading' },
+  { key: 'active', label: 'Active', hint: 'actively trading (live)' },
   { key: 'inactive', label: 'Inactive', hint: 'holding positions, opening none' },
   { key: 'grounded', label: 'Grounded', hint: 'not trading, not holding' },
+  { key: 'training', label: 'Training', hint: 'paper trading / being backtested' },
+  { key: 'hangar', label: 'In hangar', hint: 'parked paper bot — backtesting or idle' },
 ]
 
-export function activityOf(bot: Pick<Bot, 'status' | 'openPositions'>): BotActivity {
+export function activityOf(bot: Pick<Bot, 'status' | 'openPositions' | 'mode'>): BotActivity {
+  if (bot.mode === 'paper') return bot.status === 'running' ? 'training' : 'hangar'
   if (bot.status === 'running') return 'active'
   return bot.openPositions > 0 ? 'inactive' : 'grounded'
 }
@@ -365,6 +371,8 @@ export interface Dashboard {
   }
   equity: { label: string; value: number }[]
   stageTotals: { stage: BotStage; count: number }[]
+  /** Whole-fleet counts in the operator's vocabulary, for the status strip. */
+  fleet: { running: number; paused: number; grounded: number; training: number; hangar: number; paper: number; live: number; total: number }
   attention: Bot[]
   events: BotEvent[]
 }
@@ -457,8 +465,21 @@ export interface Portfolio {
     bots: number
     activeBots: number
     openPositions: number
+    /** Paper-mode bots sit beside the real book: their simulated wallet
+     * performance must not distort actual portfolio metrics, so they're
+     * counted here instead of in the totals above. */
+    paperBots: number
+    paperCapital: number
+    paperEquity: number
   }
   equity: { label: string; value: number }[]
+  /** Aggregate daily equity of paper-mode bots only — the simulated wallet
+   * ledger that sits beside the actual book. Empty when no paper bots exist. */
+  paperEquityCurve: { label: string; value: number }[]
+  /** One row per ISO week covered by the stored flows/trades: net funding
+   * (deposits − withdrawals) against realized P&L for the same week, so the
+   * fleet overview can reconcile cash movement against trading results. */
+  weekly: { label: string; funding: number; pnl: number }[]
   bots: PortfolioBotAudit[]
   positions: PortfolioPosition[]
   transactions: PortfolioTransaction[]

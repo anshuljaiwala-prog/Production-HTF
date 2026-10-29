@@ -1,15 +1,17 @@
-import { FlaskConical, GraduationCap, Play, Rocket, SlidersHorizontal, Sparkles } from 'lucide-react'
+import { useMutation, useQueryClient } from '@tanstack/react-query'
+import { ArrowUpRight, FlaskConical, GraduationCap, Play, Rocket, SlidersHorizontal, Sparkles, Wallet } from 'lucide-react'
 import { useEffect, useState } from 'react'
-import { useSearchParams } from 'react-router'
+import { Link, useSearchParams } from 'react-router'
 
 import { AreaChart, BarChart } from '../components/charts'
 import { BacktestDialog } from '../components/forms'
 import { Backtests } from './Backtests'
-import { Badge, Button, Card, Field, Input, PageHeader, Select, Skeleton, useFieldId, useToast } from '../components/ui'
-import { optimizeTraining, patchBot, useApiMutation, useBots, useCustomStrategies, useCustomStrategy, useStrategies, type OptimizeResult, type OptimizeRunRow } from '../lib/api'
+import { Badge, Button, Card, EmptyState, Field, Input, PageHeader, Select, Skeleton, useFieldId, useToast } from '../components/ui'
+import { ApiError, optimizeTraining, patchBot, useApiMutation, useBots, useCustomStrategies, useCustomStrategy, usePortfolio, useStrategies, type OptimizeResult, type OptimizeRunRow } from '../lib/api'
+import { capture } from '../lib/analytics'
 import { cx } from '../lib/cx'
-import { money, shortDate } from '../lib/format'
-import { customKnobDefs, TRAIN_MAX_COMBOS, TIMEFRAMES, type CustomRules, type ParamDef, type ParamValue, type Timeframe } from '../../shared/types'
+import { money, relativeTime, shortDate } from '../lib/format'
+import { activityOf, customKnobDefs, TRAIN_MAX_COMBOS, TIMEFRAMES, type CustomRules, type ParamDef, type ParamValue, type PortfolioBotAudit, type Timeframe } from '../../shared/types'
 
 function TInput(props: React.ComponentPropsWithoutRef<typeof Input>) {
   const id = useFieldId()
@@ -29,6 +31,11 @@ interface KnobForm {
 }
 
 const DAYS_OPTIONS = [90, 180, 365, 730]
+const statusTone: Record<PortfolioBotAudit['status'], 'success' | 'warning' | 'neutral'> = {
+  running: 'success',
+  paused: 'warning',
+  stopped: 'neutral',
+}
 
 /** Sensible first sweep for a strategy: its first numeric param, min → max
  * (or a ±50% band around the default when the schema has no bounds). */
@@ -50,13 +57,14 @@ function defaultKnobs(defs: ParamDef[] | undefined): KnobForm[] {
  */
 export function Training() {
   const [params, setParams] = useSearchParams()
-  const tab = params.get('tab') === 'backtests' ? 'backtests' : 'optimize'
+  const raw = params.get('tab')
+  const tab: 'optimize' | 'backtests' | 'paper' = raw === 'backtests' || raw === 'paper' ? raw : 'optimize'
 
   return (
     <div className="mx-auto max-w-[1200px] p-5 sm:p-8">
       <PageHeader
         title="Training"
-        subtitle="Train and optimize bots against five years of stored market history, then backtest them — train/test split included."
+        subtitle="Train and optimize bots against five years of stored market history, then backtest them and watch them trade in the paper lab — train/test split included."
       />
 
       <div className="mt-4 flex items-center gap-1.5" role="tablist" aria-label="Training sections">
@@ -68,10 +76,176 @@ export function Training() {
           <FlaskConical className="mr-1 inline size-3.5" />
           Backtests
         </TabButton>
+        <TabButton active={tab === 'paper'} onClick={() => setParams({ tab: 'paper' })}>
+          <Wallet className="mr-1 inline size-3.5" />
+          Paper portfolio
+        </TabButton>
         {tab === 'backtests' && <NewBacktestButton />}
       </div>
 
-      {tab === 'backtests' ? <Backtests embedded /> : <Optimizer />}
+      {tab === 'backtests' ? <Backtests embedded /> : tab === 'paper' ? <PaperLab /> : <Optimizer />}
+    </div>
+  )
+}
+
+// --- Paper portfolio -------------------------------------------------------
+
+/** The simulated wallet beside the actual book: every paper-mode bot, its
+ * running equity, and a one-click promotion to live trading. Paper proceeds
+ * never blend into the real portfolio — the Portfolio page enforces that
+ * split server-side; this tab is the lab where paper results are reviewed. */
+function PaperLab() {
+  const toast = useToast()
+  const [, setParams] = useSearchParams()
+  const { data, isLoading } = usePortfolio()
+  const paperBots = (data?.bots ?? []).filter((bot) => bot.mode === 'paper')
+  const invalidate = useQueryClient()
+
+  const goLive = useMutation({
+    mutationFn: (botId: string) => patchBot(botId, { mode: 'live' }),
+    onSuccess: async (bot) => {
+      await invalidate.invalidateQueries({ queryKey: ['portfolio'] })
+      await invalidate.invalidateQueries({ queryKey: ['bots'] })
+      toast(`"${bot.bot.name}" now trades live through its exchange connection`)
+    },
+    onError: (error) => toast(error instanceof ApiError ? error.message : 'Switch to live failed', 'danger'),
+  })
+
+  const paperPnl = (data?.summary.paperEquity ?? 0) - (data?.summary.paperCapital ?? 0)
+  return (
+    <div className="mt-6 flex flex-col gap-3">
+      <Card className="p-5">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div>
+            <h2 className="text-[14px] font-semibold">Paper trading portfolio</h2>
+            <p className="mt-1 text-[12.5px] leading-relaxed text-muted">
+              The simulated wallet every paper bot trades against. These numbers are carried
+              <span className="font-medium text-fg"> beside</span> the actual portfolio — they never enter its equity, P&L or audit,
+              so a training run can prove itself without pretending at real money.
+            </p>
+          </div>
+          <Link to="/portfolio" className="text-[12.5px] font-medium text-accent hover:underline">Actual portfolio →</Link>
+        </div>
+
+        {isLoading && <Skeleton className="mt-4 h-16" />}
+        {data && (
+          <div className="mt-4 grid grid-cols-2 gap-2 sm:grid-cols-5">
+            {([
+              { label: 'Paper bots', value: String(data.summary.paperBots) },
+              { label: 'Paper capital', value: money(data.summary.paperCapital) },
+              { label: 'Paper equity', value: money(data.summary.paperEquity) },
+              { label: 'Paper P&L', value: `${paperPnl >= 0 ? '+' : ''}${money(paperPnl)}`, tone: paperPnl >= 0 ? 'text-success' : 'text-danger' },
+              { label: 'Since launch', value: data.summary.paperCapital > 0 ? `${(paperPnl / data.summary.paperCapital * 100).toFixed(1)}%` : '—' },
+            ] as const).map((tile) => (
+              <div key={tile.label} className="rounded-card border border-line p-3">
+                <p className="text-[12px] text-muted">{tile.label}</p>
+                <p className={cx('mt-0.5 text-[16px] font-semibold tabular-nums', 'tone' in tile ? tile.tone : '')}>{tile.value}</p>
+              </div>
+            ))}
+          </div>
+        )}
+      </Card>
+
+      {data && data.paperEquityCurve.length > 1 && (
+        <Card className="p-5">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <h2 className="text-[14px] font-semibold">Simulated wallet equity</h2>
+            <span className="text-[12.5px] text-faint">
+              daily close across every paper bot · {data.paperEquityCurve.length} days · updates as running paper bots progress
+            </span>
+          </div>
+          <div className="mt-3">
+            <AreaChart data={data.paperEquityCurve} height={190} format={money} />
+          </div>
+        </Card>
+      )}
+
+      <Card className="p-5">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <h2 className="text-[14px] font-semibold">Paper bots</h2>
+          <span className="text-[12.5px] text-faint">promote a bot when its paper record proves the strategy</span>
+        </div>
+
+        {isLoading && <Skeleton className="mt-4 h-24" />}
+
+        {data && paperBots.length === 0 && (
+          <EmptyState
+            icon={<Wallet />}
+            title="No paper bots yet"
+            description="Launch a bot in paper mode (the launch wizard's default) and it appears here with its simulated wallet. Train first if you want tested parameters."
+            action={
+              <div className="flex gap-2">
+                <Link to="/strategies"><Button size="sm">Launch a bot</Button></Link>
+                <Button size="sm" variant="ghost" onClick={() => setParams({ tab: 'optimize' })}>Train & optimize</Button>
+              </div>
+            }
+          />
+        )}
+
+        {paperBots.length > 0 && (
+          <div className="mt-4 overflow-x-auto rounded-card border border-line">
+            <table className="w-full min-w-[880px] text-left text-[13px]">
+              <thead>
+                <tr className="h-9 border-b border-line bg-bg/60 text-[12px] text-muted">
+                  <th className="px-3 font-medium">Bot</th>
+                  <th className="px-3 font-medium">Status</th>
+                  <th className="px-3 font-medium">Market</th>
+                  <th className="px-3 text-right font-medium">Cash</th>
+                  <th className="px-3 text-right font-medium">Equity</th>
+                  <th className="px-3 text-right font-medium">Net P&L</th>
+                  <th className="px-3 text-right font-medium">Win rate</th>
+                  <th className="px-3 text-right font-medium">Last activity</th>
+                  <th className="px-3 text-right font-medium" />
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-line">
+                {paperBots.map((bot) => {
+                  // Honest P&L: equity minus launch funding (capital − net deposits),
+                  // the same reconciliation the actual portfolio uses.
+                  const botPnl = bot.equity - (bot.capital - bot.netDeposits)
+                  const activity = activityOf(bot)
+                  return (
+                    <tr key={bot.id} className="h-12">
+                      <td className="max-w-[220px] truncate px-3 font-medium">
+                        <Link to={`/bots/${bot.id}`} className="hover:underline">{bot.name}</Link>
+                      </td>
+                      <td className="px-3">
+                        <Badge tone={statusTone[bot.status]}>{bot.status}</Badge>
+                        {activity === 'hangar' && <Badge tone="neutral" className="ml-1">in hangar</Badge>}
+                      </td>
+                      <td className="max-w-[150px] px-3 truncate text-muted">{bot.strategyName} · {bot.timeframe}</td>
+                      <td className="px-3 text-right tabular-nums">{money(bot.cash)}</td>
+                      <td className="px-3 text-right font-semibold tabular-nums">{money(bot.equity)}</td>
+                      <td className={cx('px-3 text-right tabular-nums', botPnl >= 0 ? 'text-success' : 'text-danger')}>
+                        {botPnl >= 0 ? '+' : ''}{money(botPnl)}
+                      </td>
+                      <td className="px-3 text-right tabular-nums text-muted">{bot.winRate === null ? '—' : `${bot.winRate.toFixed(0)}%`}</td>
+                      <td className="px-3 text-right text-muted">{relativeTime(bot.lastActivityAt)}</td>
+                      <td className="px-3 text-right">
+                        <Button
+                          size="sm"
+                          variant="primary"
+                          loading={goLive.isPending && goLive.variables === bot.id}
+                          onClick={() => goLive.mutate(bot.id)}
+                          title="Switch this bot to live trading through its exchange connection"
+                        >
+                          <ArrowUpRight className="size-3.5" />
+                          Go live
+                        </Button>
+                      </td>
+                    </tr>
+                  )
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+        {paperBots.length > 0 && (
+          <p className="mt-2 text-[11.5px] text-faint">
+            Going live requires an exchange connection on the bot — switching a connectionless bot fails with a message to connect it first.
+          </p>
+        )}
+      </Card>
     </div>
   )
 }
@@ -176,7 +350,14 @@ function Optimizer() {
   const train = useApiMutation(
     (input: Parameters<typeof optimizeTraining>[0]) => optimizeTraining(input),
     [],
-    { onSuccess: (result) => {
+    { onSuccess: (result, input) => {
+        // Feature adoption: how many grid runs, how wide the sweep.
+        capture('training_run', {
+          strategy: result.source.strategyKey,
+          objective: result.objective,
+          runs: result.runs.length,
+          knobs: input.vary.length,
+        })
         const best = result.runs[result.bestIndex]
         if (best && !best.error) toast(`Trained ${result.runs.length} runs · best ${result.objective === 'sharpe' ? 'Sharpe' : 'return'} ${(result.objective === 'sharpe' ? best.train.sharpe : best.train.totalReturn).toFixed(2)}`)
       },

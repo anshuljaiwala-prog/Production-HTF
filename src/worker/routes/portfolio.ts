@@ -18,10 +18,34 @@ import { buildEquitySeries, loadBots } from './workspace'
 type Row = Record<string, unknown>
 
 const DAY = 86_400_000
+const WEEK_MS = 7 * DAY
 const EQUITY_WINDOW_DAYS = 30
 const MAX_LEDGER_ROWS = 40
 
 export const portfolio = new Hono<AppContext>()
+
+/** Merge the weekly cashflow and realized-P&L buckets into one series.
+ * Weeks with neither show as flat zero so the bars keep a common axis. */
+function mergeWeekly(fundingRows: Row[], pnlRows: Row[]): Portfolio['weekly'] {
+  const funding = new Map<number, number>()
+  for (const row of fundingRows) funding.set(Number(row.wk), Number(row.v ?? 0))
+  const pnl = new Map<number, number>()
+  for (const row of pnlRows) pnl.set(Number(row.wk), Number(row.v ?? 0))
+  if (funding.size === 0 && pnl.size === 0) return []
+  const weeks = [...new Set([...funding.keys(), ...pnl.keys()])].sort((a, b) => a - b)
+  const first = weeks[0]
+  const last = weeks.at(-1)!
+  const rows: Portfolio['weekly'] = []
+  for (let wk = first; wk <= last; wk += WEEK_MS) {
+    rows.push({
+      label: new Date(wk).toLocaleDateString('en-US', { month: 'short', day: 'numeric' }),
+      funding: funding.get(wk) ?? 0,
+      pnl: pnl.get(wk) ?? 0,
+    })
+  }
+  // Cap the chart: the most recent 26 weeks keep the axis readable.
+  return rows.slice(-26)
+}
 
 portfolio.get('/', async (c) => {
   const db = c.get('db')
@@ -36,7 +60,7 @@ portfolio.get('/', async (c) => {
   for (const bot of running) await advanceBot(db, owner, bot)
   if (running.length) bots = await loadBots(db, owner)
 
-  const [perBotTrades, positions, ledger, points, fundingTotals, fundingRows] = await db.batch([
+  const [perBotTrades, positions, ledger, points, fundingTotals, fundingRows, weeklyFunding, weeklyPnl] = await db.batch([
     db
       .prepare(
         `SELECT bot_id,
@@ -71,23 +95,49 @@ portfolio.get('/', async (c) => {
          WHERE cf.owner_sub = ? ORDER BY cf.created_at DESC, cf.id DESC LIMIT 50`,
       )
       .bind(owner),
+    // Weekly buckets for the funding-vs-P&L chart: net funding and realized
+    // P&L per ISO week over everything ever recorded, oldest last.
+    db
+      .prepare(`SELECT (created_at / ${WEEK_MS}) * ${WEEK_MS} AS wk, COALESCE(SUM(amount), 0) AS v FROM cashflows WHERE owner_sub = ? GROUP BY wk ORDER BY wk`)
+      .bind(owner),
+    db
+      .prepare(
+        `SELECT (created_at / ${WEEK_MS}) * ${WEEK_MS} AS wk, COALESCE(SUM(pnl), 0) AS v FROM trades WHERE owner_sub = ? AND pnl IS NOT NULL GROUP BY wk ORDER BY wk`,
+      )
+      .bind(owner),
   ])
 
-  const botIds = new Set(bots.map((b) => b.id))
+  // The actual portfolio is the live book only: paper-mode bots run in the
+  // simulated wallet, so their equity/metrics are carried separately under
+  // `paper*` summary fields instead of being mixed into the operator's real
+  // capital. Audit rows keep every bot visible with its mode badge.
+  const liveBots = bots.filter((b) => b.mode === 'live')
+  const paperBots = bots.filter((b) => b.mode === 'paper')
+
+  const botIds = new Set(liveBots.map((b) => b.id))
   const tradeRows = ((perBotTrades.results ?? []) as Row[]).filter((row) => botIds.has(String(row.bot_id)))
   const feesByBot = new Map(tradeRows.map((row) => [String(row.bot_id), row]))
-  const positionRows = ((positions.results ?? []) as Row[]).filter((row) => botIds.has(String(row.bot_id)))
+  // Fees/fills are also needed for the paper audit rows — same stats over
+  // the full fleet.
+  const feesByBotAll = new Map(((perBotTrades.results ?? []) as Row[]).map((row) => [String(row.bot_id), row]))
+  const positionRowsAll = ((positions.results ?? []) as Row[]).filter((row) => bots.some((b) => b.id === String(row.bot_id)))
+  const positionRows = positionRowsAll.filter((row) => botIds.has(String(row.bot_id)))
   const positionsByBot = new Map<string, { mark: number; cost: number }>()
+  for (const row of positionRowsAll) {
+    const botId = String(row.bot_id)
+    const entry = positionsByBot.get(botId) ?? { mark: 0, cost: 0 }
+    entry.mark += Number(row.qty) * quote(String(row.symbol), t)
+    entry.cost += Number(row.qty) * Number(row.avg_price)
+    positionsByBot.set(botId, entry)
+  }
+  // The exposed open-position book is the live book; paper positions stay
+  // inside their bots' audit rows.
   const auditPositions: PortfolioPosition[] = positionRows.map((row) => {
     const mark = quote(String(row.symbol), t)
     const qty = Number(row.qty)
     const avgPrice = Number(row.avg_price)
     const unrealized = (mark - avgPrice) * qty
     const botId = String(row.bot_id)
-    const entry = positionsByBot.get(botId) ?? { mark: 0, cost: 0 }
-    entry.mark += qty * mark
-    entry.cost += qty * avgPrice
-    positionsByBot.set(botId, entry)
     return {
       botId,
       botName: bots.find((b) => b.id === botId)?.name ?? 'Unknown bot',
@@ -101,7 +151,7 @@ portfolio.get('/', async (c) => {
   })
 
   const auditBots: PortfolioBotAudit[] = bots.map((bot) => {
-    const stats = feesByBot.get(bot.id)
+    const stats = (bot.mode === 'live' ? feesByBot : feesByBotAll).get(bot.id)
     const fills = Number(stats?.fills ?? 0)
     const fees = Number(stats?.fees ?? 0)
     // Trade-table realized is authoritative for completed buys/sells; a bot
@@ -128,7 +178,7 @@ portfolio.get('/', async (c) => {
       roundTrips: bot.roundTrips,
       wins: bot.wins,
       winRate: bot.roundTrips > 0 ? (bot.wins / bot.roundTrips) * 100 : null,
-      openPositions: positionRows.filter((row) => String(row.bot_id) === bot.id).length,
+      openPositions: positionRowsAll.filter((row) => String(row.bot_id) === bot.id).length,
       lastActivityAt: Math.max(Number(stats?.last_trade ?? 0), bot.updatedAt),
     }
   })
@@ -144,7 +194,11 @@ portfolio.get('/', async (c) => {
   const deposits = Number((fundingTotals.results[0] as Row | undefined)?.deposits ?? 0)
   const withdrawals = Number((fundingTotals.results[0] as Row | undefined)?.withdrawals ?? 0)
 
-  const totals = auditBots.reduce(
+  // Actual-portfolio totals: live bots only — the simulated wallet's
+  // performance is carried beside it so it can't distort real P&L.
+  const totals = auditBots
+    .filter((bot) => bot.mode === 'live')
+    .reduce(
     (acc, bot) => {
       acc.startingCapital += bot.capital
       acc.launchCapital += bot.capital - bot.netDeposits
@@ -202,15 +256,25 @@ portfolio.get('/', async (c) => {
       roundTrips: totals.roundTrips,
       wins: totals.wins,
       fills: totals.fills,
-      bots: bots.length,
-      activeBots: bots.filter((b) => b.status === 'running').length,
+      bots: liveBots.length,
+      activeBots: liveBots.filter((b) => b.status === 'running').length,
       openPositions: auditPositions.length,
+      // The simulated book, kept out of the actual metrics: count, capital
+      // and current equity of every paper-mode bot beside it.
+      paperBots: paperBots.length,
+      paperCapital: paperBots.reduce((n, b) => n + b.capital, 0),
+      // Same definition as live equity: cash plus open marks, not cash alone.
+      paperEquity: paperBots.reduce((n, b) => n + b.equity, 0),
     },
-    equity: buildEquitySeries(bots, points.results as Row[], windowStart, t),
+    equity: buildEquitySeries(liveBots, points.results as Row[], windowStart, t),
+    // The simulated wallet's own daily ledger — kept out of `equity` above so
+    // paper performance can never masquerade as portfolio performance.
+    paperEquityCurve: paperBots.length > 0 ? buildEquitySeries(paperBots, points.results as Row[], windowStart, t) : [],
     bots: auditBots,
     positions: auditPositions,
     transactions,
     funding,
+    weekly: mergeWeekly(weeklyFunding.results as Row[], weeklyPnl.results as Row[]),
   }
   return privateJson(c, body)
 })

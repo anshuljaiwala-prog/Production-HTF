@@ -7,7 +7,7 @@ import { advanceBot } from '../engine'
 import { quote } from '../market'
 import { STRATEGIES, strategyBy } from '../strategies'
 import { clearWorkspace, seedWorkspace } from '../seed'
-import type { Bot, Dashboard, Me, SearchResults } from '../../shared/types'
+import { activityOf, type Bot, type Dashboard, type Me, type SearchResults } from '../../shared/types'
 
 type Row = Record<string, unknown>
 
@@ -77,13 +77,17 @@ workspace.get('/overview', async (c) => {
   const startOfDay = new Date(t)
   startOfDay.setHours(0, 0, 0, 0)
   const dayStart = startOfDay.getTime()
+  // The equity window is client-selected: 7d / 30d / 1y. Points are stored at
+  // bar cadence, so long windows need a bigger read cap to survive.
+  const requested = Number(c.req.query('days') ?? EQUITY_WINDOW_DAYS)
+  const windowDays = Math.min(730, Math.max(7, Math.round(Number.isFinite(requested) && requested > 0 ? requested : EQUITY_WINDOW_DAYS)))
 
   let bots = await loadBots(db, owner)
   const running = bots.filter((b) => b.status === 'running').slice(0, 12)
   for (const bot of running) await advanceBot(db, owner, bot)
   if (running.length) bots = await loadBots(db, owner)
 
-  const windowStart = startOfDay.getTime() - (EQUITY_WINDOW_DAYS - 1) * DAY
+  const windowStart = startOfDay.getTime() - (windowDays - 1) * DAY
   const [today, positions, stages, events, points] = await db.batch([
     db.prepare(`SELECT COALESCE(SUM(pnl), 0) AS v FROM trades WHERE owner_sub = ? AND pnl IS NOT NULL AND created_at >= ?`).bind(owner, dayStart),
     db.prepare(`SELECT symbol, qty, avg_price FROM positions WHERE owner_sub = ?`).bind(owner),
@@ -94,7 +98,9 @@ workspace.get('/overview', async (c) => {
          WHERE e.owner_sub = ? ORDER BY e.created_at DESC, e.id DESC LIMIT 12`,
       )
       .bind(owner),
-    db.prepare(`SELECT bot_id, at, value FROM equity_points WHERE owner_sub = ? AND at >= ? ORDER BY at ASC LIMIT 4000`).bind(owner, windowStart),
+    db
+      .prepare(`SELECT bot_id, at, value FROM equity_points WHERE owner_sub = ? AND at >= ? ORDER BY at ASC LIMIT ${windowDays > EQUITY_WINDOW_DAYS ? 12_000 : 4_000}`)
+      .bind(owner, windowStart),
   ])
 
   const positionRows = (positions.results ?? []) as Row[]
@@ -127,6 +133,18 @@ workspace.get('/overview', async (c) => {
       stage,
       count: stageRows.find((r) => r.stage === stage)?.n ?? 0,
     })),
+    // Operator vocabulary for the whole fleet, not just the attention slice.
+    // Paper bots live in the training hangar: running = training, parked = hangar.
+    fleet: {
+      running: bots.filter((b) => b.mode === 'live' && b.status === 'running').length,
+      paused: bots.filter((b) => b.mode === 'live' && b.status !== 'running' && activityOf(b) === 'inactive').length,
+      grounded: bots.filter((b) => b.mode === 'live' && b.status !== 'running' && activityOf(b) === 'grounded').length,
+      training: bots.filter((b) => b.mode === 'paper' && b.status === 'running').length,
+      hangar: bots.filter((b) => b.mode === 'paper' && b.status !== 'running').length,
+      paper: bots.filter((b) => b.mode === 'paper').length,
+      live: liveBots.length,
+      total: bots.length,
+    },
     attention: bots
       .filter((b) => b.status === 'paused' || (b.status === 'running' && b.initialEquity > 0 && b.equity < b.initialEquity * 0.92))
       .slice(0, 5),

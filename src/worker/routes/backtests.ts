@@ -4,7 +4,7 @@ import { privateJson } from '../auth'
 import { backtestWindow, runBacktest } from '../backtest'
 import { id, mapBacktest, mapBot, now } from '../db'
 import type { AppContext } from '../env'
-import { HISTORY_YEARS, TIMEFRAME_MS, barsBetween, historyStart } from '../market'
+import { HISTORY_YEARS, TIMEFRAME_MS, barsBetween, historyStart, normalizeSymbol } from '../market'
 import type { CustomRules } from '../strategies'
 import { applyCustomKnobs, parseRules, rulesToParams, sanitizeParams, strategyBy } from '../strategies'
 import type { AccuracyStat, Backtest, Candle, EquityPoint, ParamDef, ParamValue, RunMetrics, SimBudget, Timeframe } from '../../shared/types'
@@ -192,8 +192,14 @@ backtests.post('/', async (c) => {
     return c.json({ error: 'timeframe_unsupported', message: `${strategy.name} does not run on the ${timeframe} timeframe.` }, 400)
   }
 
-  const symbol = String(body.symbol ?? '').trim().toUpperCase()
-  if (!symbol) return c.json({ error: 'symbol_required', message: 'Choose a symbol.' }, 400)
+  const symbol = normalizeSymbol(String(body.symbol ?? ''))
+  if (!symbol) {
+    const given = String(body.symbol ?? '').trim()
+    return c.json(
+      { error: 'unknown_symbols', message: given ? `"${given}" is not a tradeable symbol here — try catalog entries like BTC-USD or EUR-USD.` : 'Choose a symbol.' },
+      400,
+    )
+  }
 
   const capital = Number(body.capital)
   if (!Number.isFinite(capital) || capital < 100) {
@@ -308,7 +314,7 @@ backtests.post('/optimize', async (c) => {
   // market, timeframe, capital and params come straight off the bot.
   let strategyKey = String(body.strategyKey ?? '')
   let baseParams: Record<string, ParamValue> = sanitizeParams(strategyKey, body.params)
-  let symbol = String(body.symbol ?? '').trim().toUpperCase()
+  let symbol = normalizeSymbol(String(body.symbol ?? ''))?.trim().toUpperCase() ?? ''
   let timeframe = body.timeframe
   let capital = Number(body.capital)
   let sourceName = 'new config'
