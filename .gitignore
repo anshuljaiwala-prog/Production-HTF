@@ -7,3 +7,25 @@ dist
 .DS_Store
 *.log
 /freebuff-sites-build/
+
+# Agent skills installed at project scope with `npx skills add <repo>`. A full
+# install is ~21 MB and mostly unrelated vendor material (GKE, BigQuery, Ads),
+# so it stays local and is reinstalled on demand. Only the workflow skills that
+# apply to this codebase are committed.
+.agents/skills/*
+!.agents/skills/tdd/
+!.agents/skills/tdd/**
+!.agents/skills/diagnosing-bugs/
+!.agents/skills/diagnosing-bugs/**
+!.agents/skills/code-review/
+!.agents/skills/code-review/**
+!.agents/skills/implement/
+!.agents/skills/implement/**
+!.agents/skills/codebase-design/
+!.agents/skills/codebase-design/**
+!.agents/skills/improve-codebase-architecture/
+!.agents/skills/improve-codebase-architecture/**
+!.agents/skills/writing-for-agents/
+!.agents/skills/writing-for-agents/**
+!.agents/skills/improve/
+!.agents/skills/improve/**
