@@ -7,7 +7,7 @@ import { AreaChart, BarChart } from '../components/charts'
 import { BacktestDialog } from '../components/forms'
 import { Backtests } from './Backtests'
 import { Badge, Button, Card, EmptyState, Field, Input, PageHeader, Select, Skeleton, useFieldId, useToast } from '../components/ui'
-import { ApiError, optimizeTraining, patchBot, useApiMutation, useBots, useCustomStrategies, useCustomStrategy, usePortfolio, useStrategies, type OptimizeResult, type OptimizeRunRow } from '../lib/api'
+import { ApiError, optimizeTraining, patchBot, useApiMutation, useBots, useCustomStrategies, useCustomStrategy, usePaperBook, useStrategies, type OptimizeResult, type OptimizeRunRow } from '../lib/api'
 import { capture } from '../lib/analytics'
 import { cx } from '../lib/cx'
 import { money, relativeTime, shortDate } from '../lib/format'
@@ -97,8 +97,8 @@ export function Training() {
 function PaperLab() {
   const toast = useToast()
   const [, setParams] = useSearchParams()
-  const { data, isLoading } = usePortfolio()
-  const paperBots = (data?.bots ?? []).filter((bot) => bot.mode === 'paper')
+  const { data, isLoading } = usePaperBook()
+  const paperBots = data?.bots ?? []
   const invalidate = useQueryClient()
 
   const goLive = useMutation({
@@ -111,7 +111,7 @@ function PaperLab() {
     onError: (error) => toast(error instanceof ApiError ? error.message : 'Switch to live failed', 'danger'),
   })
 
-  const paperPnl = (data?.summary.paperEquity ?? 0) - (data?.summary.paperCapital ?? 0)
+  const paperPnl = data?.summary.pnl ?? 0
   return (
     <div className="mt-6 flex flex-col gap-3">
       <Card className="p-5">
@@ -131,11 +131,11 @@ function PaperLab() {
         {data && (
           <div className="mt-4 grid grid-cols-2 gap-2 sm:grid-cols-5">
             {([
-              { label: 'Paper bots', value: String(data.summary.paperBots) },
-              { label: 'Paper capital', value: money(data.summary.paperCapital) },
-              { label: 'Paper equity', value: money(data.summary.paperEquity) },
+              { label: 'Paper bots', value: String(data.summary.bots) },
+              { label: 'Paper capital', value: money(data.summary.capital) },
+              { label: 'Paper equity', value: money(data.summary.equity) },
               { label: 'Paper P&L', value: `${paperPnl >= 0 ? '+' : ''}${money(paperPnl)}`, tone: paperPnl >= 0 ? 'text-success' : 'text-danger' },
-              { label: 'Since launch', value: data.summary.paperCapital > 0 ? `${(paperPnl / data.summary.paperCapital * 100).toFixed(1)}%` : '—' },
+              { label: 'Since launch', value: data.summary.capital > 0 ? `${(paperPnl / data.summary.capital * 100).toFixed(1)}%` : '—' },
             ] as const).map((tile) => (
               <div key={tile.label} className="rounded-card border border-line p-3">
                 <p className="text-[12px] text-muted">{tile.label}</p>
@@ -146,16 +146,16 @@ function PaperLab() {
         )}
       </Card>
 
-      {data && data.paperEquityCurve.length > 1 && (
+      {data && data.equity.length > 1 && (
         <Card className="p-5">
           <div className="flex flex-wrap items-center justify-between gap-2">
             <h2 className="text-[14px] font-semibold">Simulated wallet equity</h2>
             <span className="text-[12.5px] text-faint">
-              daily close across every paper bot · {data.paperEquityCurve.length} days · updates as running paper bots progress
+              daily close across every paper bot · {data.equity.length} days · updates as running paper bots progress
             </span>
           </div>
           <div className="mt-3">
-            <AreaChart data={data.paperEquityCurve} height={190} format={money} />
+            <AreaChart data={data.equity} height={190} format={money} />
           </div>
         </Card>
       )}
@@ -187,22 +187,22 @@ function PaperLab() {
             <table className="w-full min-w-[880px] text-left text-[13px]">
               <thead>
                 <tr className="h-9 border-b border-line bg-bg/60 text-[12px] text-muted">
-                  <th className="px-3 font-medium">Bot</th>
-                  <th className="px-3 font-medium">Status</th>
-                  <th className="px-3 font-medium">Market</th>
-                  <th className="px-3 text-right font-medium">Cash</th>
-                  <th className="px-3 text-right font-medium">Equity</th>
-                  <th className="px-3 text-right font-medium">Net P&L</th>
-                  <th className="px-3 text-right font-medium">Win rate</th>
-                  <th className="px-3 text-right font-medium">Last activity</th>
-                  <th className="px-3 text-right font-medium" />
+                  <th scope="col" className="px-3 font-medium">Bot</th>
+                  <th scope="col" className="px-3 font-medium">Status</th>
+                  <th scope="col" className="px-3 font-medium">Market</th>
+                  <th scope="col" className="px-3 text-right font-medium">Cash</th>
+                  <th scope="col" className="px-3 text-right font-medium">Equity</th>
+                  <th scope="col" className="px-3 text-right font-medium">Net P&L</th>
+                  <th scope="col" className="px-3 text-right font-medium">Win rate</th>
+                  <th scope="col" className="px-3 text-right font-medium">Last activity</th>
+                  <th scope="col" className="px-3 text-right font-medium" />
                 </tr>
               </thead>
               <tbody className="divide-y divide-line">
                 {paperBots.map((bot) => {
-                  // Honest P&L: equity minus launch funding (capital − net deposits),
-                  // the same reconciliation the actual portfolio uses.
-                  const botPnl = bot.equity - (bot.capital - bot.netDeposits)
+                  // Honest P&L: funding moves equity and capital together, so the
+                  // difference isolates trading results — the portfolio's own basis.
+                  const botPnl = bot.equity - bot.capital
                   const activity = activityOf(bot)
                   return (
                     <tr key={bot.id} className="h-12">
@@ -363,6 +363,12 @@ function Optimizer() {
       },
     },
   )
+  // The results panel sits below the fold: a rejected sweep (from > to,
+  // oversized grid…) must toast up front or the operator sees nothing happen.
+  useEffect(() => {
+    if (train.isError && train.error) toast(train.error instanceof ApiError ? train.error.message : 'Training run failed', 'danger')
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [train.isError, train.error])
   const result = train.data
 
   const apply = useApiMutation((input: { botId: string; params: Record<string, ParamValue> }) => patchBot(input.botId, { params: input.params }), ['bot', 'bots'], {
@@ -374,10 +380,13 @@ function Optimizer() {
       .filter((knob) => knob.key)
       .map((knob) => ({ key: knob.key, from: Number(knob.from), to: Number(knob.to), steps: Number(knob.steps) }))
     train.mutate({
+      // Uploaded rules trade a chosen market like any strategy: market,
+      // timeframe and starting capital travel along with the rules payload
+      // (the optimizer validates all three for every non-bot source).
       ...(botId
         ? { botId }
         : customId
-          ? { strategyKey: 'custom', rules: customRules }
+          ? { strategyKey: 'custom', rules: customRules, symbol, timeframe, capital: Number(capital) }
           : { strategyKey, symbol, timeframe, capital: Number(capital) }),
       days,
       objective,
@@ -685,13 +694,13 @@ function OptimizerResults({
           <table className="w-full min-w-[720px] table-fixed text-left text-[13px]">
             <thead>
               <tr className="h-9 border-b border-line bg-bg/60 text-[12px] text-muted">
-                <th className="w-[6%] px-3 font-medium">#</th>
-                <th className="w-[30%] px-3 font-medium">Parameters</th>
-                <th className="w-[16%] px-3 text-right font-medium">Train return</th>
-                <th className="w-[12%] px-3 text-right font-medium">Train Sharpe</th>
-                <th className="w-[16%] px-3 text-right font-medium">Test return</th>
-                <th className="w-[12%] px-3 text-right font-medium">Test Sharpe</th>
-                <th className="w-[8%] px-3 text-right font-medium">Test DD</th>
+                <th scope="col" className="w-[6%] px-3 font-medium">#</th>
+                <th scope="col" className="w-[30%] px-3 font-medium">Parameters</th>
+                <th scope="col" className="w-[16%] px-3 text-right font-medium">Train return</th>
+                <th scope="col" className="w-[12%] px-3 text-right font-medium">Train Sharpe</th>
+                <th scope="col" className="w-[16%] px-3 text-right font-medium">Test return</th>
+                <th scope="col" className="w-[12%] px-3 text-right font-medium">Test Sharpe</th>
+                <th scope="col" className="w-[8%] px-3 text-right font-medium">Test DD</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-line">
@@ -726,7 +735,9 @@ function OptimizerResults({
         </div>
         <div className="mt-3">
           {testChart.length > 0 ? (
-            <BarChart data={testChart} height={150} />
+            // Returns arrive as percent values, not dollars — the axis and
+            // hover must say "−1.5%", not "−$1.50".
+            <BarChart data={testChart} height={150} format={pct} />
           ) : (
             <p className="py-4 text-center text-[13px] text-muted">No runs to chart</p>
           )}

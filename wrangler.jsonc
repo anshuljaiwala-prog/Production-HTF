@@ -14,5 +14,11 @@
     { "binding": "DB", "database_name": "crm", "database_id": "00000000-0000-0000-0000-000000000000" }
   ],
   "r2_buckets": [{ "binding": "FILES", "bucket_name": "crm-files" }],
+  // The live agent environment: one Durable Object per workspace holding pins,
+  // operator kill-switches and the last world snapshot.
+  "durable_objects": {
+    "bindings": [{ "name": "ENVIRONMENT", "class_name": "EnvironmentDurableObject" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["EnvironmentDurableObject"] }],
   "observability": { "enabled": true }
 }

@@ -61,6 +61,7 @@ const SCHEMA = [
     realized_pnl REAL NOT NULL DEFAULT 0,
     round_trips INTEGER NOT NULL DEFAULT 0,
     wins INTEGER NOT NULL DEFAULT 0,
+    risk_off_streak INTEGER NOT NULL DEFAULT 0,
     created_at INTEGER NOT NULL,
     started_at INTEGER,
     last_tick_at INTEGER,
@@ -158,6 +159,114 @@ const SCHEMA = [
     created_at INTEGER NOT NULL
   )`,
   `CREATE INDEX IF NOT EXISTS uploaded_strategies_owner ON uploaded_strategies(owner_sub, name, version DESC)`,
+  // Imported market history lives in the API database, keyed by the exact
+  // (symbol, timeframe, bar time) bucket, so re-importing the same feed is
+  // idempotent: a second upload UPSERTS over the same rows instead of
+  // duplicating them. Shared across the workspace's needs — not per-owner —
+  // because a market's price is not operator-private data.
+  `CREATE TABLE IF NOT EXISTS market_bars (
+    symbol TEXT NOT NULL,
+    timeframe TEXT NOT NULL,
+    t INTEGER NOT NULL,
+    o REAL NOT NULL,
+    h REAL NOT NULL,
+    l REAL NOT NULL,
+    c REAL NOT NULL,
+    v REAL NOT NULL DEFAULT 0,
+    source TEXT,
+    imported_at INTEGER NOT NULL,
+    PRIMARY KEY (symbol, timeframe, t)
+  )`,
+  `CREATE INDEX IF NOT EXISTS market_bars_window ON market_bars(symbol, timeframe, t DESC)`,
+  // Custom execution plans (the tool box): operator-drafted responses to a
+  // recognised regime, stored per workspace. Builtin plans live in code
+  // (plans.ts) and are merged beside these at read time.
+  `CREATE TABLE IF NOT EXISTS custom_playbooks (` +
+    `id TEXT PRIMARY KEY, owner_sub TEXT NOT NULL, name TEXT NOT NULL, regime TEXT NOT NULL,` +
+    `strategy_key TEXT NOT NULL, params TEXT NOT NULL DEFAULT '{}', timeframe TEXT,` +
+    `risk_pct REAL NOT NULL DEFAULT 25, note TEXT, created_at INTEGER NOT NULL)`,
+  `CREATE INDEX IF NOT EXISTS custom_playbooks_owner ON custom_playbooks(owner_sub, created_at DESC)`,
+  // Strategy book assignments: one plan per regime per workspace (replacing
+  // a regime's plan upserts this row; deleting it falls back to the builtin
+  // default this table mirrors in plans.ts DEFAULT_BOOK).
+  `CREATE TABLE IF NOT EXISTS book_entries (
+    owner_sub TEXT NOT NULL,
+    regime TEXT NOT NULL,
+    playbook_id TEXT NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (owner_sub, regime)
+  )`,
+  // Operator kill-switches for the agent environment. The Durable Object owns
+  // the live copy; this row is its projection, because the request-scoped
+  // engine only has a database handle and must not pay an RPC per pass.
+  `CREATE TABLE IF NOT EXISTS environment_controls (
+    owner_sub TEXT PRIMARY KEY,
+    paused INTEGER NOT NULL DEFAULT 0,
+    pause_buys INTEGER NOT NULL DEFAULT 0,
+    updated_at INTEGER NOT NULL
+  )`,
+  // Per-workspace key for the AES encryption of connection API secrets at
+  // rest. Created lazily on first use; a deployment key from the environment
+  // (SECRETS_KEY) takes precedence for writes when it is set.
+  `CREATE TABLE IF NOT EXISTS connection_keys (
+    owner_sub TEXT PRIMARY KEY,
+    key_b64 TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+  )`,
+  // Exchange instrument master, as loaded from the venue (see instruments.ts).
+  // BSE keys every derivative contract by expiry and strike, so a live order
+  // cannot be placed from a ticker alone: this table is what turns
+  // `SENSEX-940-CE` into BSE_FO|<token> plus its lot size. Kept whole-workspace
+  // (not per owner) — it is public exchange reference data, and refreshing it
+  // is idempotent.
+  `CREATE TABLE IF NOT EXISTS bse_contracts (
+    instrument_key TEXT PRIMARY KEY,
+    underlying TEXT NOT NULL,
+    instrument_type TEXT NOT NULL,
+    expiry INTEGER NOT NULL,
+    strike REAL NOT NULL DEFAULT 0,
+    lot_size INTEGER NOT NULL DEFAULT 1,
+    tick_size REAL,
+    trading_symbol TEXT,
+    updated_at INTEGER NOT NULL
+  )`,
+  `CREATE INDEX IF NOT EXISTS bse_contracts_lookup ON bse_contracts(underlying, instrument_type, expiry)`,
+  // One row per closed bar per bot: the gate, every specialist proposal with
+  // the fact ids behind it, the arbitration result and what each symbol did
+  // (fill with size, or the typed reason nothing was placed). Written by the
+  // engine's replay loop, pruned to a trailing window per bot.
+  `CREATE TABLE IF NOT EXISTS decision_traces (
+    bot_id TEXT NOT NULL,
+    owner_sub TEXT NOT NULL,
+    at INTEGER NOT NULL,
+    gate_blocked INTEGER NOT NULL,
+    gate_reason TEXT,
+    risk_off_streak INTEGER NOT NULL,
+    proposals TEXT NOT NULL,
+    verdict TEXT NOT NULL,
+    decisions TEXT NOT NULL,
+    PRIMARY KEY (bot_id, at)
+  )`,
+  `CREATE INDEX IF NOT EXISTS decision_traces_owner ON decision_traces(owner_sub, at DESC)`,
+  // Every move prediction the engine saw, scored against the move that
+  // actually followed on the next closed bar. One row per (symbol, timeframe,
+  // bar) — two bots reading the same bar record the same forecast.
+  `CREATE TABLE IF NOT EXISTS move_predictions (
+    owner_sub TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    timeframe TEXT NOT NULL,
+    at INTEGER NOT NULL,
+    move TEXT NOT NULL,
+    probability REAL NOT NULL,
+    facts_available INTEGER NOT NULL,
+    direction INTEGER NOT NULL,
+    price REAL NOT NULL,
+    next_close REAL,
+    return_pct REAL,
+    outcome INTEGER,
+    PRIMARY KEY (owner_sub, symbol, timeframe, at)
+  )`,
+  `CREATE INDEX IF NOT EXISTS move_predictions_owner ON move_predictions(owner_sub, at DESC)`,
 ]
 
 let ready: Promise<void> | undefined
@@ -169,6 +278,47 @@ export function ensureSchema(db: D1Database): Promise<void> {
     // ADD COLUMN on a fresh copy fails harmlessly as a duplicate column.
     try {
       await db.prepare(`ALTER TABLE bots ADD COLUMN net_deposits REAL NOT NULL DEFAULT 0`).run()
+    } catch {
+      /* already present */
+    }
+    // Advance lease for the paper engine: a compare-and-set token that makes
+    // bar replay single-writer across every isolate (see engine.ts). Fresh
+    // databases miss the column too, so it is added here after the CREATEs.
+    try {
+      await db.prepare(`ALTER TABLE bots ADD COLUMN lease_token TEXT`).run()
+    } catch {
+      /* already present */
+    }
+    // Agent gate damping: consecutive risk-off reads. Fresh databases get it
+    // from the CREATE above; existing local ones need the ALTER.
+    try {
+      await db.prepare(`ALTER TABLE bots ADD COLUMN risk_off_streak INTEGER NOT NULL DEFAULT 0`).run()
+    } catch {
+      /* already present */
+    }
+    // Multi-venue routing: the ordered connection ids a live bot may fill on.
+    // NULL means the legacy single `connection_id`.
+    try {
+      await db.prepare(`ALTER TABLE bots ADD COLUMN venue_ids TEXT`).run()
+    } catch {
+      /* already present */
+    }
+    // Exchange sandbox vs production order API, per saved connection.
+    try {
+      await db.prepare(`ALTER TABLE connections ADD COLUMN environment TEXT NOT NULL DEFAULT 'production'`).run()
+    } catch {
+      /* already present */
+    }
+    // Last venue mark per open position. Live books are marked from the venue
+    // the engine quoted, so read paths never price real fills off the
+    // synthetic feed. Paper positions leave these NULL.
+    try {
+      await db.prepare(`ALTER TABLE positions ADD COLUMN mark_price REAL`).run()
+    } catch {
+      /* already present */
+    }
+    try {
+      await db.prepare(`ALTER TABLE positions ADD COLUMN mark_at INTEGER`).run()
     } catch {
       /* already present */
     }
@@ -218,6 +368,7 @@ export function mapConnection(r: Row): Connection {
     exchange: r.exchange as string,
     keyMasked: key.length > 4 ? `••••${key.slice(-4)}` : '••••',
     mode: r.mode as BotMode,
+    environment: String(r.environment ?? '') === 'sandbox' ? 'sandbox' : 'production',
     createdAt: Number(r.created_at),
   }
 }
@@ -239,6 +390,9 @@ export function mapBot(r: Row): Bot {
     position: Number(r.position ?? 0),
     connectionId: (r.connection_id as string | null) ?? null,
     connectionName: (r.connection_name as string | null) ?? null,
+    venueIds: parseJson<string[]>(r.venue_ids, r.connection_id ? [String(r.connection_id)] : []),
+    venues: [],
+    riskOffStreak: Number(r.risk_off_streak ?? 0),
     cash: Number(r.cash ?? 0),
     equity: Number(r.equity ?? 0),
     initialEquity: Number(r.initial_equity ?? 0),

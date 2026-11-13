@@ -6,14 +6,20 @@ import type {
   Bot,
   BotEdge,
   BotEvent,
+  BotPatterns,
   BotStage,
   BotStatus,
   Candle,
   Connection,
   CustomStrategySummary,
   Dashboard,
+  EnvironmentState,
+  EnvironmentTrace,
   EquityPoint,
+  FleetPatternRanking,
+  InstrumentMasterStatus,
   Me,
+  PaperBook,
   ParamValue,
   Portfolio,
   Position,
@@ -23,6 +29,7 @@ import type {
   Strategy,
   SymbolMeta,
   Timeframe,
+  ToolBox,
   Trade,
 } from '../../shared/types'
 
@@ -142,6 +149,30 @@ export const useBotAccuracy = (botId: string | undefined) =>
     placeholderData: (p) => p,
   })
 
+/** Per-symbol pattern scan for one bot: regimes with their evidence, the
+ * historic crash/hype analogs each tape resembles, and the events the market
+ * is producing right now. Refreshes on the slow cadence — a regime read is
+ * not a tick. */
+export const useBotPatterns = (botId: string | undefined) =>
+  useQuery({
+    queryKey: ['bot-patterns', botId],
+    queryFn: () => api<BotPatterns>(`/analysis/bots/${botId}/patterns`),
+    enabled: Boolean(botId),
+    refetchInterval: 60_000,
+    placeholderData: (p) => p,
+  })
+
+/** Fleet-wide pattern ranking: which bots are trading markets reading crash,
+ * hype or squeeze right now, strongest tape first. A regime read is not a
+ * tick, so it refreshes on the slow cadence. */
+export const useFleetPatterns = () =>
+  useQuery({
+    queryKey: ['fleet-patterns'],
+    queryFn: () => api<FleetPatternRanking>('/analysis/patterns'),
+    refetchInterval: 60_000,
+    placeholderData: (p) => p,
+  })
+
 export interface BotEdgeRanking {
   items: BotEdge[]
   window: { bars: number; to: number }
@@ -235,6 +266,16 @@ export const usePortfolio = () =>
     placeholderData: (p) => p,
   })
 
+/** The simulated wallet, reported under Backtesting — never part of the money
+ * book above. */
+export const usePaperBook = () =>
+  useQuery({
+    queryKey: ['portfolio', 'paper'],
+    queryFn: () => api<PaperBook>('/portfolio/paper'),
+    refetchInterval: 20_000,
+    placeholderData: (p) => p,
+  })
+
 export const useSearch = (q: string) =>
   useQuery({
     queryKey: ['search', q],
@@ -254,7 +295,7 @@ export function useInvalidate() {
 export function useApiMutation<TInput, TResult>(
   run: (input: TInput) => Promise<TResult>,
   invalidates: string[],
-  options?: { onSuccess?: (result: TResult, input: TInput) => void },
+  options?: { onSuccess?: (result: TResult, input: TInput) => void; onError?: (error: Error) => void },
 ) {
   const invalidate = useInvalidate()
   return useMutation({
@@ -263,6 +304,7 @@ export function useApiMutation<TInput, TResult>(
       await invalidate(...invalidates)
       options?.onSuccess?.(result, input)
     },
+    onError: options?.onError,
   })
 }
 
@@ -276,6 +318,8 @@ export interface LaunchInput {
   riskPct: number
   mode: 'paper' | 'live'
   connectionId?: string | null
+  /** Multi-venue routing — first id is the primary venue. */
+  venueIds?: string[]
   status?: BotStatus
   /** Inline uploaded rules — the bot runs the `custom` strategist with them. */
   rules?: unknown
@@ -298,18 +342,37 @@ export interface ImportPreview {
   rows: ImportReviewRow[]
 }
 export const reviewImport = (items: Record<string, unknown>[]) =>
-  api<ImportPreview>('/bots/import?validate=1', { method: 'POST', json: { items } })
-
-/** Bulk bot config import (uploaded file or pasted JSON payload). Good rows
+  api<ImportPreview>('/bots/import?validate=1', { method: 'POST', json: { items } })/** Bulk bot config import (uploaded file or pasted JSON payload). Good rows
  * launch (paused); bad rows come back with the reason so the dialog can show
  * them. Rows may carry inline `rules` (custom strategy) and `connectionId`
  * (which saved exchange API the bot routes through). */
+/** What the batch is for: live (paused paper/live bots awaiting review,
+ * the previous behavior), or parked configs that immediately queue a
+ * backtest / training sweep from their exact config. */
+export type ImportIntent = 'live' | 'backtest' | 'train'
+export interface TrainingSummary {
+  botId: string
+  botName: string
+  swept: string | null
+  combos: number
+  bestTrain: number | null
+  bestTest: number | null
+  error: string | null
+}
+export interface ImportRunSummary {
+  queued: number
+  errors: string[]
+  training: TrainingSummary[]
+  backtests: { id: string; name: string }[]
+}
 export interface BotImportResult {
   launched: Bot[]
   failed: { name: string; error: string }[]
+  intent: ImportIntent
+  runs: ImportRunSummary
 }
-export const importBots = (items: LaunchInput[]) =>
-  api<BotImportResult>('/bots/import', { method: 'POST', json: { items } })
+export const importBots = (items: LaunchInput[], intent: ImportIntent = 'live') =>
+  api<BotImportResult>('/bots/import', { method: 'POST', json: { items, intent } })
 
 /** Bulk exchange-API upload: create many connections from one pasted JSON
  * payload. Each row is validated exactly like a single create; good rows are
@@ -334,6 +397,9 @@ export interface BotPatch {
   riskPct?: number
   params?: Record<string, ParamValue>
   connectionId?: string | null
+  venueIds?: string[]
+  /** Starting capital, treated as funding (P&L preserved). */
+  capital?: number
   /** Paper ↔ live venue switch — blocked by the server while the bot runs. */
   mode?: 'paper' | 'live'
 }
@@ -437,14 +503,35 @@ export const fetchMarketHistory = (symbol: string, timeframe: Timeframe, days = 
   )
 }
 
-export const createConnection = (input: { name: string; exchange: string; apiKey: string; apiSecret: string; mode: 'paper' | 'live' }) =>
-  api<{ connection: Connection }>('/connections', { method: 'POST', json: input })
+export const createConnection = (input: {
+  name: string
+  exchange: string
+  apiKey: string
+  apiSecret: string
+  mode: 'paper' | 'live'
+  environment?: 'sandbox' | 'production'
+}) => api<{ connection: Connection }>('/connections', { method: 'POST', json: input })
+/** Probe the saved credentials against the live venue (no order is placed). */
+export const testConnection = (connectionId: string) =>
+  api<{ ok: boolean; message: string }>(`/connections/${connectionId}/test`, { method: 'POST' })
+
+/** Cached BSE instrument master (derivative contracts the adapter can route to). */
+export const useInstrumentMaster = () =>
+  useQuery({
+    queryKey: ['instruments', 'bse'],
+    queryFn: () => api<InstrumentMasterStatus>('/instruments/bse'),
+    staleTime: 60_000,
+  })
+
+/** Force a fresh download of the exchange master from the venue. */
+export const refreshInstrumentMaster = () => api<InstrumentMasterStatus>('/instruments/bse/refresh', { method: 'POST' })
 /** Credential edits. Rotating the key requires rotating the secret too; other
  * fields edit independently. Deleting a connection detaches its bots. */
 export interface ConnectionPatch {
   name?: string
   exchange?: string
   mode?: 'paper' | 'live'
+  environment?: 'sandbox' | 'production'
   apiKey?: string
   apiSecret?: string
 }
@@ -453,3 +540,130 @@ export const updateConnection = (connectionId: string, patch: ConnectionPatch) =
 export const deleteConnection = (connectionId: string) =>
   api<{ ok: true; detached: number; grounded: number }>(`/connections/${connectionId}`, { method: 'DELETE' })
 export const addDemoConnections = () => api<{ added: number }>('/connections/demo', { method: 'POST' })
+
+// --- Tool box (execution plans) & strategy book -------------------------------
+
+/** One trading execution plan in the tool box. */
+export interface PlanDraft {
+  name: string
+  regime: string
+  strategyKey: string
+  params?: Record<string, ParamValue>
+  timeframe: Timeframe | null
+  riskPct: number
+  note: string
+}
+
+export const useToolbox = () =>
+  useQuery({
+    queryKey: ['toolbox'],
+    queryFn: () => api<ToolBox>('/toolbox'),
+    staleTime: 15_000,
+  })
+
+export const createPlan = (draft: PlanDraft) =>
+  api<{ playbook: PlaybookLike }>('/toolbox', { method: 'POST', json: draft })
+
+export const deletePlan = (playbookId: string) =>
+  api<{ ok: true }>(`/toolbox/${playbookId}`, { method: 'DELETE' })
+
+/** One regime's entry in the strategy book, as the API serves it. */
+export interface BookEntryLike {
+  regime: string
+  playbook: PlaybookLike
+  strategyName: string
+  overridden: boolean
+}
+export interface PlaybookLike {
+  id: string
+  name: string
+  regime: string
+  strategyKey: string
+  strategyName?: string
+  params: Record<string, ParamValue>
+  timeframe: string | null
+  riskPct: number
+  note: string
+  source: 'builtin' | 'custom'
+  createdAt?: number
+}
+
+export const useBook = () =>
+  useQuery({
+    queryKey: ['book'],
+    queryFn: () => api<{ items: BookEntryLike[] }>('/book'),
+    staleTime: 15_000,
+  })
+
+export const assignPlan = (regime: string, playbookId: string) =>
+  api<{ ok: true }>('/book', { method: 'PUT', json: { regime, playbookId } })
+
+export const clearBookEntry = (regime: string) =>
+  api<{ ok: true; cleared: boolean }>(`/book/${regime}`, { method: 'DELETE' })
+
+/** One live, actionable strategy-book signal: a recognised pattern on a
+ * tracked market whose regime has a book plan, on a parked bot — plus the
+ * plan it would execute. */
+export interface BookSignal {
+  botId: string
+  botName: string
+  botStatus: string
+  symbol: string
+  regime: string
+  confidence: number
+  playbook: PlaybookLike
+  strategyName: string
+  botCapital: number
+  evidence: string[]
+  price: number
+  changePct: number
+  drawdownPct: number
+  runupPct: number
+  spark: number[]
+}
+
+export const useBookSignals = () =>
+  useQuery({
+    queryKey: ['book-signals'],
+    queryFn: () => api<{ generatedAt: number; items: BookSignal[] }>('/book/signals'),
+    refetchInterval: 60_000,
+    placeholderData: (p) => p,
+  })
+
+/** The live agent environment: held pins, operator kill-switches and the last
+ * read. `symbol` focuses the company half (ownership, specialists, next move). */
+export const useEnvironment = (symbol?: string) =>
+  useQuery({
+    queryKey: ['environment', symbol ?? null],
+    queryFn: () => api<EnvironmentState>(`/analysis/environment${symbol ? `?symbol=${encodeURIComponent(symbol)}` : ''}`),
+    refetchInterval: 20_000,
+    placeholderData: (p) => p,
+  })
+
+/** What the engine decided on each closed bar (gate, proposals with their fact
+ * ids, arbitration, size or reject reason) plus the scored move predictions.
+ * `bot` narrows the timeline, `symbol` the calibration. */
+export const useEnvironmentTrace = (symbol?: string, bot?: string) =>
+  useQuery({
+    queryKey: ['environment-trace', symbol ?? null, bot ?? null],
+    queryFn: () =>
+      api<EnvironmentTrace>(
+        `/analysis/environment/trace${symbol || bot ? `?${symbol ? `symbol=${encodeURIComponent(symbol)}` : ''}${symbol && bot ? '&' : ''}${bot ? `bot=${encodeURIComponent(bot)}` : ''}` : ''}`,
+      ),
+    refetchInterval: 20_000,
+    placeholderData: (p) => p,
+  })
+
+/** Operator kill-switches. The environment holds them; the engine reads its
+ * projection, so the change lands on the next advance pass. */
+export const setEnvironmentControls = (patch: { paused?: boolean; pauseBuys?: boolean }) =>
+  api<{ controls: { paused: boolean; pauseBuys: boolean } }>('/analysis/environment/controls', { method: 'PATCH', json: patch })
+
+/** Execute a plan: `playbookId` (any box plan) or `regime` (the book's
+ * resident answer); `botId` inherits its wallet, otherwise `capital` funds a
+ * fresh paper wallet. Returns the bot created running in paper mode. */
+export const executePlan = (input: { playbookId?: string; regime?: string; symbol: string; botId?: string; capital?: number }) =>
+  api<{ bot: Bot; executed: { playbookId: string; plan: string; regime: string; strategyName: string; symbol: string } }>('/book/execute', {
+    method: 'POST',
+    json: input,
+  })

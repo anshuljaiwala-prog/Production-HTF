@@ -41,6 +41,19 @@ export function relativeTime(ts: number, now = Date.now()): string {
   return new Date(ts).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })
 }
 
+/** A compact elapsed span straight out of two timestamps — "1d 4h",
+ * "38m" — for uptime readouts that shouldn't say "ago" or "just now". */
+export function elapsed(from: number, to = Date.now()): string {
+  const minutes = Math.max(0, Math.round((to - from) / 60_000))
+  if (minutes < 1) return '<1m'
+  if (minutes < 60) return `${minutes}m`
+  const hours = Math.floor(minutes / 60)
+  if (hours < 24) return `${hours}h ${minutes % 60}m`
+  const days = Math.floor(hours / 24)
+  if (days < 30) return `${days}d ${hours % 24}h`
+  return `${Math.floor(days / 30)}mo ${days % 30}d`
+}
+
 export function shortDate(value: number | string | null | undefined): string {
   if (!value) return ''
   const date = typeof value === 'string' ? new Date(`${value}T00:00:00`) : new Date(value)

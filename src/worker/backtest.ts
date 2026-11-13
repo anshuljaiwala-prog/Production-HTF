@@ -1,7 +1,9 @@
 import type { AccuracyStat, EquityPoint, ParamValue, RunMetrics, Timeframe, Trade } from '../shared/types'
+import { evaluateGate, readEnvironment } from './agents/environment'
+import { MACRO_BARS, MACRO_SYMBOLS, MACRO_TIMEFRAME, windowAt } from './agents/harvester'
 import { PaperBroker } from './broker'
 import { id } from './db'
-import { TIMEFRAME_MS, barsBetween, historyStart } from './market'
+import { TIMEFRAME_MS, barsBetween, historyStart, type Bar } from './market'
 import { measureAccuracy, strategyBy } from './strategies'
 
 // Deterministic backtest over the synthetic feed. It mirrors the live engine:
@@ -25,6 +27,10 @@ export interface BacktestInput {
   from: number
   to: number
   riskPct?: number
+  /** Preloaded (stored-import-overlaid) bars for exactly this window; run
+   * from the routes so imported market data is what the backtest replays.
+   * Absent ⇒ the synthetic feed. */
+  bars?: Bar[]
 }
 
 export interface BacktestResult {
@@ -58,7 +64,7 @@ export function runBacktest(input: BacktestInput): BacktestResult {
   const { from, to } = backtestWindow(input.timeframe, input.from, input.to)
   if (to <= from) throw new Error('The backtest period must end after it starts.')
 
-  const bars = barsBetween(input.symbol, input.timeframe, from, to + 1)
+  const bars = input.bars ?? barsBetween(input.symbol, input.timeframe, from, to + 1)
   if (bars.length < strategy.lookback + 10) {
     throw new Error(`Not enough history for ${input.timeframe} bars in that range — pick a longer period.`)
   }
@@ -76,6 +82,17 @@ export function runBacktest(input: BacktestInput): BacktestResult {
   let peak = input.capital
   let maxDrawdown = 0
 
+  // The agent gate runs here too, so a backtest reproduces what the live engine
+  // would have done: the same read, the same hysteresis, one evaluation per
+  // bar. Macro series are generated once over the whole window and sliced per
+  // bar; the bot's own symbol uses the bars being replayed.
+  const macroTfMs = TIMEFRAME_MS[MACRO_TIMEFRAME]
+  const macroSeries = MACRO_SYMBOLS.map((symbol) => ({
+    symbol,
+    bars: barsBetween(symbol, MACRO_TIMEFRAME, from - MACRO_BARS * macroTfMs, to + macroTfMs),
+  }))
+  let agentStreak = 0
+
   const step = Math.max(1, Math.ceil(bars.length / MAX_CURVE_POINTS))
 
   for (let i = strategy.lookback; i < bars.length; i++) {
@@ -90,7 +107,19 @@ export function runBacktest(input: BacktestInput): BacktestResult {
       tfMs,
     })
 
-    if (signal.action === 'buy' && !position) {
+    const agentAt = bar.t + tfMs
+    const gate = evaluateGate(
+      readEnvironment({
+        at: agentAt,
+        macroBars: macroSeries.map(({ symbol, bars: series }) => ({ symbol, bars: windowAt(series, agentAt) })),
+        focus: { symbol: input.symbol, bars: bars.slice(Math.max(0, i + 1 - MACRO_BARS), i + 1) },
+      }),
+      [input.symbol],
+      agentStreak,
+    )
+    agentStreak = gate.streak
+
+    if (signal.action === 'buy' && !position && !gate.blocked) {
       const target = equity * (riskPct / 100)
       const qty = Math.floor(Math.min(target / bar.c, cash / (bar.c * COST_BUFFER)) * QTY_STEP) / QTY_STEP
       if (qty > 0 && qty * bar.c >= MIN_NOTIONAL) {
@@ -109,7 +138,45 @@ export function runBacktest(input: BacktestInput): BacktestResult {
           at: bar.t + tfMs,
         })
       }
-    } else if (signal.action === 'sell' && position) {
+    } else if (signal.action === 'short' && !position) {
+      const target = equity * (riskPct / 100)
+      const qty = Math.floor(Math.min(target / bar.c, equity / (bar.c * COST_BUFFER)) * QTY_STEP) / QTY_STEP
+      if (qty > 0 && qty * bar.c >= MIN_NOTIONAL) {
+        const fill = broker.placeOrder({ symbol: input.symbol, side: 'sell', qty, at: bar.t + tfMs })
+        cash += fill.price * fill.qty - fill.fee
+        position = { qty: -fill.qty, avgPrice: fill.price }
+        trades.push({
+          id: id(),
+          botId: null,
+          symbol: input.symbol,
+          side: 'short',
+          qty: fill.qty,
+          price: fill.price,
+          fee: fill.fee,
+          pnl: null,
+          at: bar.t + tfMs,
+        })
+      }
+    } else if (signal.action === 'cover' && position && position.qty < 0) {
+      const qty = -position.qty
+      const fill = broker.placeOrder({ symbol: input.symbol, side: 'buy', qty, at: bar.t + tfMs })
+      const pnl = (position.avgPrice - fill.price) * qty - fill.fee
+      cash -= fill.price * qty + fill.fee
+      roundTrips++
+      if (pnl > 0) wins++
+      trades.push({
+        id: id(),
+        botId: null,
+        symbol: input.symbol,
+        side: 'cover',
+        qty,
+        price: fill.price,
+        fee: fill.fee,
+        pnl,
+        at: bar.t + tfMs,
+      })
+      position = null
+    } else if (signal.action === 'sell' && position && position.qty > 0) {
       const fill = broker.placeOrder({ symbol: input.symbol, side: 'sell', qty: position.qty, at: bar.t + tfMs })
       const pnl = (fill.price - position.avgPrice) * fill.qty - fill.fee
       cash += fill.price * fill.qty - fill.fee

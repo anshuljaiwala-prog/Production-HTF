@@ -32,7 +32,11 @@ function check(label, ok, detail = '') {
 // 1. Catalog
 {
   const { status, payload } = await call('GET', '/strategies')
-  check('GET /strategies', status === 200 && payload.strategies?.length === 6 && payload.symbols?.length > 0, JSON.stringify(payload).slice(0, 120))
+  check(
+    'GET /strategies',
+    status === 200 && payload.strategies?.length === 7 && payload.symbols?.length > 0 && payload.strategies.some((s) => s.key === 'crash-short'),
+    JSON.stringify(payload).slice(0, 160),
+  )
 }
 
 // 2. Dashboard
@@ -55,9 +59,28 @@ function check(label, ok, detail = '') {
     JSON.stringify(s).slice(0, 200),
   )
   check(
-    'paper bots are counted beside, not inside, the actual portfolio',
-    typeof s.paperBots === 'number' && s.paperCapital >= 0 && s.paperEquity >= 0 && payload.bots.filter((b) => b.mode === 'paper').length === s.paperBots,
-    `paperBots=${s.paperBots} paperEquity=${s.paperEquity}`,
+    'the money book lists no paper bots',
+    payload.bots.every((b) => b.mode === 'live') && !('paperBots' in s),
+    `modes=${[...new Set(payload.bots.map((b) => b.mode))].join(',')}`,
+  )
+  // The simulated wallet lives on its own endpoint, consumed by Backtesting.
+  const paper = await call('GET', '/portfolio/paper')
+  check(
+    'GET /portfolio/paper reports the simulated wallet separately',
+    paper.status === 200 &&
+      typeof paper.payload?.summary?.bots === 'number' &&
+      typeof paper.payload.summary.pnl === 'number' &&
+      Array.isArray(paper.payload.bots) &&
+      paper.payload.bots.every((b) => b.mode === 'paper') &&
+      Array.isArray(paper.payload.funding),
+    JSON.stringify(paper.payload?.summary).slice(0, 180),
+  )
+  // Dashboard must not count paper bots anywhere either.
+  const overview = await call('GET', '/overview')
+  check(
+    'GET /overview is live-only (no paper bots in the fleet strip)',
+    overview.status === 200 && overview.payload.fleet.paper === 0 && overview.payload.fleet.training === 0 && overview.payload.fleet.hangar === 0,
+    JSON.stringify(overview.payload?.fleet),
   )
   check(
     'GET /portfolio per-bot audit is consistent',
@@ -66,8 +89,12 @@ function check(label, ok, detail = '') {
   )
   const wellFormed = (bot) => bot.capital > 0 && bot.equity > 0 && (bot.winRate === null || typeof bot.winRate === 'number')
   check('GET /portfolio bot rows well-formed', payload.bots.every(wellFormed), 'rows malformed')
+  // The money ledger is live-book only: it is legitimately empty while every
+  // bot still trades paper, and any row it does return must carry a numeric
+  // fee and must never belong to a paper bot.
   const ledger = payload.transactions
-  check('GET /portfolio ledger includes fees', status === 200 && ledger.length > 0 && ledger.every((tx) => typeof tx.fee === 'number' && tx.fee >= 0), `ledger=${ledger.length}`)
+  const ledgerClean = ledger.length === 0 || ledger.every((tx) => typeof tx.fee === 'number' && tx.fee >= 0 && tx.mode !== 'paper')
+  check('GET /portfolio ledger is live-only with fee rows', status === 200 && ledgerClean, `ledger=${ledger.length}`)
 }
 
 // 3. Launch a bot
@@ -738,15 +765,28 @@ let modeBotId
     `events=${liveDetail.payload?.events?.length}`,
   )
 
-  // The venue is locked while the bot runs.
-  await call('POST', `/bots/${modeBotId}/control`, { action: 'start' })
-  const liveLocked = await call('PATCH', `/bots/${modeBotId}`, { mode: 'paper' })
-  check('venue locked while the bot runs', liveLocked.status === 409 && liveLocked.payload?.error === 'bot_active', `got ${liveLocked.status} ${liveLocked.payload?.error}`)
-  await call('POST', `/bots/${modeBotId}/control`, { action: 'stop' })
+  // A live bot on an exchange with no adapter pauses on its first advance
+  // with the reason, instead of filling against a fake venue.
+  const startedUnsupported = await call('POST', `/bots/${modeBotId}/control`, { action: 'start' })
+  const unsupportedDetail = await call('GET', `/bots/${modeBotId}`)
+  check(
+    'live bot on an unsupported exchange pauses with a clear reason',
+    startedUnsupported.status === 200 &&
+      unsupportedDetail.payload?.bot?.status === 'paused' &&
+      (unsupportedDetail.payload?.events ?? []).some((e) => e.message.includes('No usable live venue')),
+    `status=${unsupportedDetail.payload?.bot?.status} events=${JSON.stringify(unsupportedDetail.payload?.events?.[0]?.message)}`,
+  )
 
   // Back to paper — the reverse switch also logs.
   const toPaper = await call('PATCH', `/bots/${modeBotId}`, { mode: 'paper' })
   check('live→paper switch works', toPaper.status === 200 && toPaper.payload.bot?.mode === 'paper', `got ${toPaper.status} mode=${toPaper.payload?.bot?.mode}`)
+
+  // The venue is locked while the bot runs: any trading-settings change is
+  // refused on an active bot.
+  await call('POST', `/bots/${modeBotId}/control`, { action: 'start' })
+  const liveLocked = await call('PATCH', `/bots/${modeBotId}`, { mode: 'live', connectionId: modeConnId })
+  check('venue locked while the bot runs', liveLocked.status === 409 && liveLocked.payload?.error === 'bot_active', `got ${liveLocked.status} ${liveLocked.payload?.error}`)
+  await call('POST', `/bots/${modeBotId}/control`, { action: 'stop' })
 
   // Pointing a bot at a connection that doesn't exist (expired id, another
   // workspace's id) is refused instead of routing live orders into a void.
@@ -771,6 +811,383 @@ let modeBotId
   check('cross-origin mutation refused with 403', cross.status === 403, `got ${cross.status}`)
 }
 
+// 10b. Multi-market pattern scan
+{
+  const multi = await call('POST', '/bots', {
+    strategyKey: 'momentum',
+    symbols: ['NVDA', 'AAPL', 'BTC-USD'],
+    timeframe: '1h',
+    capital: 20_000,
+    mode: 'paper',
+    status: 'stopped',
+  })
+  const scanBotId = multi.payload?.bot?.id
+  check('a bot can track several stocks at once', multi.status === 201 && multi.payload.bot.symbols.length === 3, `got ${multi.status} ${JSON.stringify(multi.payload?.bot?.symbols)}`)
+
+  const scan = await call('GET', `/analysis/bots/${scanBotId}/patterns`)
+  const regimes = new Set(['crash', 'selloff', 'hype', 'breakout', 'squeeze', 'uptrend', 'downtrend', 'range'])
+  check(
+    'GET /analysis/bots/:id/patterns scans every tracked symbol',
+    scan.status === 200 && scan.payload.symbols?.length === 3 && scan.payload.symbols.every((s) => regimes.has(s.regime)) && scan.payload.symbols.every((s) => s.spark?.length > 1),
+    `got ${scan.status} ${JSON.stringify(scan.payload?.symbols?.map((s) => s.symbol + ':' + s.regime))}`,
+  )
+  check(
+    'pattern read carries its evidence and window',
+    scan.payload.symbols.every((s) => Array.isArray(s.evidence) && s.evidence.length > 0 && typeof s.confidence === 'number') && scan.payload.window?.bars > 0,
+    `window=${JSON.stringify(scan.payload?.window)}`,
+  )
+  check(
+    'pattern read pairs the price leg with a volume z-score',
+    scan.payload.symbols.every((s) => 'volZ' in s && 'priceZ' in s && typeof s.liquidityVacuum === 'boolean') &&
+      scan.payload.symbols.some((s) => typeof s.volZ === 'number') &&
+      scan.payload.symbols.every((s) => s.evidence.some((line) => line.includes('σ'))),
+    JSON.stringify(scan.payload?.symbols?.map((s) => `${s.symbol}:volZ=${s.volZ},vacuum=${s.liquidityVacuum}`)),
+  )
+  check(
+    'episode analogs match direction and disclose the reading',
+    Array.isArray(scan.payload.episodes) && scan.payload.episodes.every((m) => (m.episode.kind === 'crash' ? m.why.includes('−') : m.why.includes('+')) && m.similarity >= 30 && m.similarity <= 100),
+    JSON.stringify(scan.payload?.episodes?.map((m) => m.episode.name + '@' + m.similarity)),
+  )
+  check(
+    'the event wire is linked to tracked symbols',
+    Array.isArray(scan.payload.events) && scan.payload.events.every((e) => Array.isArray(e.symbols) && scan.payload.symbols.some((s) => e.symbols.includes(s.symbol))),
+    `${scan.payload.events?.length} events`,
+  )
+
+  const ghostScan = await call('GET', '/analysis/bots/00000000-0000-4000-8000-000000000000/patterns')
+  check('pattern scan 404s for an unknown bot', ghostScan.status === 404, `got ${ghostScan.status}`)
+
+  const tooMany = await call('POST', '/bots', {
+    strategyKey: 'dca',
+    symbols: ['BTC-USD', 'ETH-USD', 'SOL-USD', 'NVDA', 'AAPL', 'TSLA', 'SPY'],
+    timeframe: '1h',
+    capital: 1_000,
+  })
+  check(
+    'over-cap symbol list is rejected, not silently trimmed',
+    tooMany.status === 400 && tooMany.payload?.error === 'too_many_symbols',
+    `got ${tooMany.status} ${tooMany.payload?.error}`,
+  )
+
+  await call('DELETE', `/bots/${scanBotId}`)
+}
+
+// 10c. A deposit moves capital but never counts as trading profit.
+// Regression: paper portfolio P&L must be equity − capital (funding moves
+// both together), never equity − (capital − netDeposits), which would
+// double-count every deposit as P&L.
+{
+  const paper = await call('POST', '/bots', {
+    strategyKey: 'dca',
+    symbols: ['BTC-USD'],
+    timeframe: '1h',
+    capital: 10_000,
+    mode: 'paper',
+    status: 'stopped',
+  })
+  const pnlBotId = paper.payload?.bot?.id
+  check('P&L regression: paper bot created', paper.status === 201 && Boolean(pnlBotId), `got ${paper.status}`)
+
+  const beforeDetail = await call('GET', `/bots/${pnlBotId}`)
+  const beforeBot = beforeDetail.payload?.bot
+  const baseCapital = Number(beforeBot?.capital ?? 0)
+  const baseEquity = Number(beforeBot?.equity ?? 0)
+  const baseNetDeposits = Number(beforeBot?.netDeposits ?? 0)
+  const baseTradingPnl = baseEquity - baseCapital
+
+  const depositAmount = 2_500
+  const deposited = await call('POST', `/bots/${pnlBotId}/cashflow`, { amount: depositAmount, note: 'P&L regression deposit' })
+  check('P&L regression: deposit accepted', deposited.status === 200, `got ${deposited.status} ${deposited.payload?.error ?? ''}`)
+
+  const afterDetail = await call('GET', `/bots/${pnlBotId}`)
+  const afterBot = afterDetail.payload?.bot
+  const afterTradingPnl = Number(afterBot?.equity ?? 0) - Number(afterBot?.capital ?? 0)
+
+  check(
+    'deposit increases capital, equity and net deposits together',
+    Math.abs(Number(afterBot?.capital ?? 0) - (baseCapital + depositAmount)) < 0.01 &&
+      Math.abs(Number(afterBot?.equity ?? 0) - (baseEquity + depositAmount)) < 0.01 &&
+      Math.abs(Number(afterBot?.netDeposits ?? 0) - (baseNetDeposits + depositAmount)) < 0.01,
+    `before cap/eq/dep=${baseCapital}/${baseEquity}/${baseNetDeposits} after cap/eq/dep=${afterBot?.capital}/${afterBot?.equity}/${afterBot?.netDeposits}`,
+  )
+  check(
+    'deposit does not change trading P&L (equity − capital)',
+    Math.abs(afterTradingPnl - baseTradingPnl) < 0.01,
+    `before=${baseTradingPnl} after=${afterTradingPnl}`,
+  )
+  check(
+    'double-count formula equity − (capital − netDeposits) would wrongly include the deposit',
+    Math.abs((Number(afterBot?.equity ?? 0) - (Number(afterBot?.capital ?? 0) - Number(afterBot?.netDeposits ?? 0))) - (baseTradingPnl + depositAmount)) < 0.01 &&
+      Math.abs(afterTradingPnl - baseTradingPnl) < 0.01,
+    `correct=${afterTradingPnl} buggy=${Number(afterBot?.equity ?? 0) - (Number(afterBot?.capital ?? 0) - Number(afterBot?.netDeposits ?? 0))}`,
+  )
+
+  // The deposited bot is a paper bot, so its audit row lives on the paper
+  // book (the money book is live-only now).
+  const portfolio = await call('GET', '/portfolio/paper')
+  const audited = (portfolio.payload?.bots ?? []).find((b) => b.id === pnlBotId)
+  check(
+    'paper book audit keeps deposited bot trading P&L unchanged',
+    portfolio.status === 200 &&
+      audited &&
+      Math.abs((Number(audited.equity) - Number(audited.capital)) - baseTradingPnl) < 0.01,
+    `portfolio=${portfolio.status} audited cap/eq=${audited?.capital}/${audited?.equity} base=${baseTradingPnl}`,
+  )
+
+  const removedPnlBot = await call('DELETE', `/bots/${pnlBotId}`)
+  check('P&L regression bot removed', removedPnlBot.status === 200, `got ${removedPnlBot.status}`)
+}
+
+// 10d2. Operator capital edit is funding: cash/equity/capital move together,
+// so trading P&L is untouched and the delta lands in the ledger.
+{
+  const created = await call('POST', '/bots', {
+    strategyKey: 'dca',
+    symbols: ['BTC-USD'],
+    timeframe: '1h',
+    capital: 5_000,
+    mode: 'paper',
+    status: 'paused',
+  })
+  const id = created.payload?.bot?.id
+  const before = created.payload?.bot
+  const raised = await call('PATCH', `/bots/${id}`, { capital: 8_000 })
+  const after = raised.payload?.bot
+  check(
+    'PATCH capital treats the edit as funding',
+    raised.status === 200 &&
+      after?.capital === 8_000 &&
+      Math.abs(after.cash - 8_000) < 0.01 &&
+      Math.abs(after.equity - 8_000) < 0.01 &&
+      Math.abs(after.netDeposits - 3_000) < 0.01,
+    JSON.stringify({ status: raised.status, cap: after?.capital, cash: after?.cash, equity: after?.equity, deposits: after?.netDeposits }),
+  )
+  check(
+    'capital edit leaves trading P&L (equity − capital) unchanged',
+    before && after && Math.abs(after.equity - after.capital - (before.equity - before.capital)) < 0.01,
+    `before=${before && before.equity - before.capital} after=${after && after.equity - after.capital}`,
+  )
+  const flows = await call('GET', '/portfolio/paper')
+  check(
+    'capital edit is recorded in the funding ledger',
+    (flows.payload?.funding ?? []).some((flow) => flow.botId === id && /starting capital/i.test(String(flow.note))),
+    JSON.stringify((flows.payload?.funding ?? []).find((flow) => flow.botId === id)).slice(0, 160),
+  )
+  const tooLow = await call('PATCH', `/bots/${id}`, { capital: 50 })
+  check('PATCH capital rejects a value under $100', tooLow.status === 400, `got ${tooLow.status}`)
+  const rejected = await call('GET', `/bots/${id}`)
+  check('a rejected capital edit changes nothing', rejected.payload?.bot?.capital === 8_000, `capital=${rejected.payload?.bot?.capital}`)
+  await call('DELETE', `/bots/${id}`)
+}
+
+// 10d. Multi-venue routing on one bot + the BSE live adapter seam.
+// A bot may list several exchange connections; the engine fills on the venue
+// quoting the best price. Credentials are pasted later, so the adapter's
+// request path is exercised here with a throwaway token (no order placed).
+{
+  const alpha = await call('POST', '/connections', {
+    name: 'BSE sandbox alert',
+    exchange: 'BSE (via Upstox)',
+    apiKey: 'test-client-id',
+    apiSecret: 'test-access-token-alpha',
+    mode: 'live',
+    environment: 'sandbox',
+  })
+  const beta = await call('POST', '/connections', {
+    name: 'BSE production beta',
+    exchange: 'BSE (via Upstox)',
+    apiKey: 'test-client-id-2',
+    apiSecret: 'test-access-token-beta',
+    mode: 'live',
+    environment: 'production',
+  })
+  const alphaId = alpha.payload?.connection?.id
+  const betaId = beta.payload?.connection?.id
+  check(
+    'BSE connection stores its environment (sandbox / production)',
+    alpha.status === 201 && beta.status === 201 && alpha.payload.connection.environment === 'sandbox' && beta.payload.connection.environment === 'production',
+    `${alpha.status}/${beta.status} ${alpha.payload?.connection?.environment}/${beta.payload?.connection?.environment}`,
+  )
+  check(
+    'BSE access token is never returned',
+    Boolean(alphaId) && !JSON.stringify(alpha.payload).includes('test-access-token-alpha') && alpha.payload.connection.keyMasked.startsWith('••'),
+    alpha.payload?.connection?.keyMasked,
+  )
+
+  const liveWithoutVenue = await call('POST', '/bots', {
+    strategyKey: 'dca',
+    symbols: ['INFY'],
+    timeframe: '1h',
+    capital: 10_000,
+    mode: 'live',
+    status: 'paused',
+  })
+  check('POST /bots rejects a live bot with no venue', liveWithoutVenue.status === 400, `got ${liveWithoutVenue.status}`)
+
+  const multi = await call('POST', '/bots', {
+    strategyKey: 'dca',
+    symbols: ['INFY'],
+    timeframe: '1h',
+    capital: 10_000,
+    mode: 'live',
+    status: 'paused',
+    venueIds: [alphaId, betaId],
+  })
+  const multiBot = multi.payload?.bot
+  check(
+    'POST /bots routes one bot across two exchanges',
+    multi.status === 201 &&
+      Array.isArray(multiBot?.venueIds) &&
+      multiBot.venueIds.join(',') === [alphaId, betaId].join(',') &&
+      multiBot.venues?.length === 2 &&
+      multiBot.connectionId === alphaId,
+    JSON.stringify({ status: multi.status, venues: multiBot?.venues, ids: multiBot?.venueIds, primary: multiBot?.connectionId }),
+  )
+  check(
+    'multi-venue bot names each venue and its environment',
+    multiBot?.venues?.map((v) => v.environment).join(',') === 'sandbox,production',
+    JSON.stringify(multiBot?.venues),
+  )
+
+  const badVenue = await call('PATCH', `/bots/${multiBot?.id}`, { venueIds: ['00000000-0000-4000-8000-000000000000'] })
+  check('PATCH /bots rejects a venue the workspace does not own', badVenue.status === 400, `got ${badVenue.status}`)
+
+  const reorder = await call('PATCH', `/bots/${multiBot?.id}`, { venueIds: [betaId, alphaId] })
+  check(
+    'PATCH /bots reorders venues (best price, primary becomes first)',
+    reorder.status === 200 && reorder.payload?.bot?.venueIds?.join(',') === [betaId, alphaId].join(',') && reorder.payload.bot.connectionId === betaId,
+    JSON.stringify(reorder.payload).slice(0, 300),
+  )
+
+  // Sandbox has no read-only probe (orders only) — the check must say so
+  // instead of claiming a credential it cannot verify.
+  const sandboxProbe = await call('POST', `/connections/${alphaId}/test`)
+  check(
+    'BSE sandbox credential probe explains it is orders-only',
+    sandboxProbe.status === 200 && sandboxProbe.payload?.ok === false && /sandbox is orders-only/i.test(String(sandboxProbe.payload?.message)),
+    `${sandboxProbe.status} ${JSON.stringify(sandboxProbe.payload).slice(0, 160)}`,
+  )
+
+  // Production probe really calls Upstox: a fake token must come back as a
+  // rejected credential, never a silent success.
+  const prodProbe = await call('POST', `/connections/${betaId}/test`)
+  check(
+    'BSE production probe reaches Upstox and reports the rejected token',
+    prodProbe.status === 200 &&
+      prodProbe.payload?.ok === false &&
+      /BSE order API rejected the request \(HTTP 401\)|unreachable/.test(String(prodProbe.payload?.message)),
+    `${prodProbe.status} ${JSON.stringify(prodProbe.payload).slice(0, 200)}`,
+  )
+
+  const removedVenue = await call('DELETE', `/connections/${betaId}`)
+  const afterVenue = await call('GET', `/bots/${multiBot?.id}`)
+  check(
+    'deleting one venue leaves the bot routing on the others',
+    removedVenue.status === 200 &&
+      afterVenue.payload?.bot?.venueIds?.join(',') === alphaId &&
+      afterVenue.payload.bot.venues?.length === 1 &&
+      afterVenue.payload.bot.mode === 'live',
+    JSON.stringify({ status: removedVenue.status, venues: afterVenue.payload?.bot?.venueIds, mode: afterVenue.payload?.bot?.mode }),
+  )
+
+  await call('DELETE', `/bots/${multiBot?.id}`)
+  await call('DELETE', `/connections/${alphaId}`)
+}
+
+// 10e. BSE derivatives are mapped from the exchange instrument master.
+// Derivative keys are expiry- and strike-specific, so the adapter loads the
+// venue's own BOD file (public data, no credentials) and resolves catalog
+// tickers against it. The catalog must expose those contracts for paper
+// trading too, hence the price-series assertions.
+{
+  const status = await call('GET', '/instruments/bse')
+  check(
+    'GET /instruments/bse reports the stored master',
+    status.status === 200 && Array.isArray(status.payload?.underlyings) && status.payload.underlyings.includes('SENSEX'),
+    JSON.stringify(status.payload).slice(0, 160),
+  )
+
+  const refreshed = await call('POST', '/instruments/bse/refresh', {})
+  if (refreshed.status === 502) {
+    console.log(`  SKIP  BSE instrument master download (${String(refreshed.payload?.message).slice(0, 120)})`)
+  } else {
+    check(
+      'POST /instruments/bse/refresh downloads the exchange master',
+      refreshed.status === 200 && refreshed.payload?.contracts > 1_000 && refreshed.payload?.syncedAt > 0,
+      JSON.stringify(refreshed.payload).slice(0, 160),
+    )
+
+    const future = await call('GET', '/instruments/bse/resolve?symbol=SENSEX-FUT')
+    const futureContract = future.payload?.contract
+    check(
+      'SENSEX-FUT resolves to the nearest dated futures contract',
+      future.status === 200 &&
+        String(futureContract?.instrumentKey).startsWith('BSE_FO|') &&
+        futureContract?.instrumentType === 'FUT' &&
+        futureContract?.lotSize >= 1 &&
+        futureContract?.expiry > Date.now(),
+      JSON.stringify(futureContract),
+    )
+
+    const callOption = await call('GET', '/instruments/bse/resolve?symbol=SENSEX-940-CE')
+    const ce = callOption.payload?.contract
+    check(
+      'SENSEX-940-CE resolves to the nearest rupee strike call',
+      callOption.status === 200 && ce?.instrumentType === 'CE' && ce?.strike >= 70_000 && ce?.strike <= 90_000 && ce?.lotSize >= 1,
+      JSON.stringify(ce),
+    )
+
+    const putOption = await call('GET', '/instruments/bse/resolve?symbol=SENSEX-900-PE')
+    check(
+      'SENSEX-900-PE resolves to a put on the same underlying',
+      putOption.status === 200 && putOption.payload?.contract?.instrumentType === 'PE' && putOption.payload.contract.underlying === 'SENSEX',
+      JSON.stringify(putOption.payload?.contract),
+    )
+
+    const otherIndex = await call('GET', '/instruments/bse/resolve?symbol=BANKEX-FUT')
+    check(
+      'BANKEX-FUT resolves with its own lot size',
+      otherIndex.status === 200 && otherIndex.payload?.contract?.underlying === 'BANKEX' && otherIndex.payload.contract.lotSize >= 1,
+      JSON.stringify(otherIndex.payload?.contract),
+    )
+  }
+
+  const notDerivative = await call('GET', '/instruments/bse/resolve?symbol=BTC-USD')
+  check(
+    'resolving a non-derivative says BSE has no such contract',
+    notDerivative.status === 404 && notDerivative.payload?.error === 'not_a_bse_derivative',
+    `${notDerivative.status} ${JSON.stringify(notDerivative.payload).slice(0, 160)}`,
+  )
+
+  const catalog = await call('GET', '/strategies')
+  const futMeta = (catalog.payload?.symbols ?? []).find((s) => s.symbol === 'SENSEX-FUT')
+  const optMeta = (catalog.payload?.symbols ?? []).find((s) => s.symbol === 'SENSEX-940-CE')
+  check(
+    'the catalog lists BSE futures and options as tradeable symbols',
+    futMeta?.kind === 'future' && optMeta?.kind === 'option' && optMeta?.underlying === 'SENSEX',
+    JSON.stringify({ fut: futMeta, opt: optMeta }),
+  )
+
+  // Paper trading a derivative exercises the synthetic series behind every
+  // BSE contract (index level for futures, premium model for options).
+  const derivativeBot = await call('POST', '/bots', {
+    strategyKey: 'dca',
+    symbols: ['SENSEX-FUT', 'SENSEX-940-CE'],
+    timeframe: '1h',
+    capital: 10_000,
+    mode: 'paper',
+    status: 'running',
+  })
+  const derivativeBotId = derivativeBot.payload?.bot?.id
+  const advanced = await call('GET', `/bots/${derivativeBotId}`)
+  check(
+    'a paper bot can trade BSE futures and options on the synthetic feed',
+    derivativeBot.status === 201 && Number.isFinite(advanced.payload?.bot?.equity) && advanced.payload.bot.equity > 0,
+    `${derivativeBot.status} equity=${advanced.payload?.bot?.equity}`,
+  )
+  await call('DELETE', `/bots/${derivativeBotId}`)
+}
+
 // 11. Cleanup the bots created for the test
 {
   const removed = await call('DELETE', `/bots/${botId}`)
@@ -779,6 +1196,176 @@ let modeBotId
     const removedImport = await call('DELETE', `/bots/${importedBotId}`)
     check('DELETE imported bot', removedImport.status === 200, `got ${removedImport.status}`)
   }
+}
+
+// 12. Agent shell: the environment read the engine gates entries with
+{
+  const env = await call('GET', '/analysis/agents')
+  const read = env.payload ?? {}
+  const regimes = new Set(['RISK_ON_BOOM', 'NEUTRAL', 'RISK_OFF_CONTAGION'])
+  check(
+    'GET /analysis/agents reads the macro regime across world markets',
+    env.status === 200 && regimes.has(read.regime) && Array.isArray(read.markets) && read.markets.length === 6,
+    `${env.status} regime=${read.regime} markets=${read.markets?.length}`,
+  )
+  check(
+    'every world market carries its technical and anomaly read',
+    read.markets?.every(
+      (m) => Number.isFinite(m.changePct) && Number.isFinite(m.rsi) && typeof m.anomaly?.signal === 'string',
+    ),
+    JSON.stringify(read.markets?.map((m) => `${m.symbol}:${m.anomaly?.signal}`)),
+  )
+  check(
+    'the rules resolve against working memory and the gate states its verdict',
+    Array.isArray(read.inferences) &&
+      Array.isArray(read.criticalMarkets) &&
+      typeof read.gate?.blocked === 'boolean' &&
+      (read.gate.blocked ? typeof read.gate.reason === 'string' : read.gate.reason === null) &&
+      Number.isFinite(read.gate.streak) &&
+      read.workingMemory?.ticker &&
+      Number.isFinite(read.workingMemory.rsi),
+    `inferences=${read.inferences?.map((i) => i.inferredFact).join(',') || 'none'} gate=${JSON.stringify(read.gate)}`,
+  )
+  const focus = await call('GET', '/analysis/agents?symbol=NVDA')
+  check(
+    'the read can be focused on one market',
+    focus.status === 200 && focus.payload.workingMemory?.ticker === 'NVDA' && Number.isFinite(focus.payload.workingMemory.institutionalPct) && focus.payload.workingMemory.institutionalPct > 0.1,
+    `ticker=${focus.payload?.workingMemory?.ticker} inst=${focus.payload?.workingMemory?.institutionalPct}`,
+  )
+  const packed = await call('GET', '/analysis/agents?symbol=btcusdt')
+  const offCatalog = await call('GET', '/analysis/agents?symbol=NOT-A-SYMBOL')
+  check(
+    'the focus symbol is normalized, and an off-catalog one is rejected',
+    packed.status === 200 && packed.payload.workingMemory?.ticker === 'BTC-USD' && offCatalog.status === 400 && offCatalog.payload?.error === 'unknown_symbol',
+    `packed=${packed.payload?.workingMemory?.ticker} off=${offCatalog.status}`,
+  )
+
+  // Specialist agents: four proposals, arbitration, and a move probability even
+  // with no ownership facts behind it.
+  const focusRead = focus.payload ?? {}
+  check(
+    'four specialist analysts report a bias and a measured conviction',
+    Array.isArray(focusRead.proposals) &&
+      focusRead.proposals.length === 4 &&
+      focusRead.proposals.every((p) => typeof p.agent === 'string' && Number.isFinite(p.conviction) && Math.abs(p.bias) <= 1),
+    JSON.stringify(focusRead.proposals?.map((p) => `${p.agent}:${p.conviction}`)),
+  )
+  check(
+    'arbitration names a winner only above the conviction threshold',
+    focusRead.verdict &&
+      Number.isFinite(focusRead.verdict.threshold) &&
+      (focusRead.verdict.winner === null || focusRead.verdict.conviction >= focusRead.verdict.threshold),
+    JSON.stringify(focusRead.verdict),
+  )
+  check(
+    'the screener reports why it rejected bars and pins, not just how many',
+    focusRead.screened &&
+      typeof focusRead.screened.barReasons === 'object' &&
+      typeof focusRead.screened.pinReasons === 'object' &&
+      Number.isFinite(focusRead.screened.rejectedBars) &&
+      Object.values(focusRead.screened.barReasons).reduce((sum, n) => sum + n, 0) === focusRead.screened.rejectedBars,
+    `bars=${JSON.stringify(focusRead.screened?.barReasons)} pins=${JSON.stringify(focusRead.screened?.pinReasons)}`,
+  )
+  check(
+    'the company move predictor always returns a probability, and says its basis',
+    typeof focusRead.nextMove?.move === 'string' &&
+      focusRead.nextMove.probability > 0 &&
+      focusRead.nextMove.probability <= 0.95 &&
+      typeof focusRead.nextMove.factsAvailable === 'boolean' &&
+      Array.isArray(focusRead.nextMove.candidates),
+    JSON.stringify(focusRead.nextMove)?.slice(0, 160),
+  )
+  const unlisted = await call('GET', '/analysis/agents?symbol=SOL-USD')
+  check(
+    'a ticker with no seeded ownership still predicts, and flags the gap',
+    unlisted.status === 200 && unlisted.payload.nextMove?.factsAvailable === false && unlisted.payload.nextMove.probability > 0,
+    `${unlisted.status} facts=${unlisted.payload?.nextMove?.factsAvailable}`,
+  )
+
+  // The live environment (Durable Object): held pins, and operator switches
+  // that the engine actually honours.
+  const live = await call('GET', '/analysis/environment')
+  check(
+    'GET /analysis/environment returns the live state',
+    live.status === 200 &&
+      Array.isArray(live.payload.pins) &&
+      typeof live.payload.controls?.paused === 'boolean' &&
+      live.payload.read?.markets?.length === 6,
+    `${live.status} pins=${live.payload?.pins?.length}`,
+  )
+  const seenTwice = await call('GET', '/analysis/environment')
+  check(
+    'pins are held, not rebuilt: a re-read increments the same pin',
+    seenTwice.status === 200 && seenTwice.payload.pins?.every((p) => p.reads >= 1 && p.lastSeen >= p.firstSeen),
+    JSON.stringify(seenTwice.payload?.pins?.map((p) => `${p.id}:${p.reads}`)),
+  )
+  const paused = await call('PATCH', '/analysis/environment/controls', { pauseBuys: true })
+  const afterPatch = await call('GET', '/analysis/environment')
+  const invalidControls = await call('PATCH', '/analysis/environment/controls', { pauseBuys: 'yes' })
+  const restored = await call('PATCH', '/analysis/environment/controls', { pauseBuys: false, paused: false })
+  check(
+    'the operator kill-switches round-trip through the environment',
+    paused.status === 200 && paused.payload.controls?.pauseBuys === true && afterPatch.payload?.controls?.pauseBuys === true && invalidControls.status === 400 && restored.payload?.controls?.pauseBuys === false,
+    `patch=${paused.status} read=${JSON.stringify(afterPatch.payload?.controls)} invalid=${invalidControls.status}`,
+  )
+
+  // Decision trace & prediction calibration: what the engine recorded per closed
+  // bar, and whether the always-on move probability has tracked what followed.
+  const trace = await call('GET', '/analysis/environment/trace')
+  const traces = trace.payload?.traces ?? []
+  const calibration = trace.payload?.calibration ?? {}
+  check(
+    'GET /analysis/environment/trace serves the per-bar trace and the calibration',
+    trace.status === 200 && Array.isArray(trace.payload?.traces) && Array.isArray(calibration.bins) && calibration.bins.length === 5 && Number.isFinite(calibration.baseline),
+    `${trace.status} traces=${traces.length} bins=${calibration.bins?.length}`,
+  )
+  check(
+    'every trace carries the gate, each proposal with its fact ids, the arbitration and its fills or typed rejects',
+    traces.every(
+      (entry) =>
+        typeof entry.botId === 'string' &&
+        entry.gate &&
+        typeof entry.gate.blocked === 'boolean' &&
+        Number.isFinite(entry.verdict?.threshold) &&
+        Array.isArray(entry.proposals) &&
+        entry.proposals.length === 4 &&
+        entry.proposals.every((p) => Array.isArray(p.factIds) && p.factIds.length > 0) &&
+        Array.isArray(entry.decisions) &&
+        entry.decisions.every(
+          (d) => typeof d.action === 'string' && typeof d.fill === 'boolean' && (d.fill || d.reject !== null || d.action === 'hold'),
+        ),
+    ),
+    JSON.stringify(traces[0] ?? 'none').slice(0, 220),
+  )
+  check(
+    'calibration counts only scored forecasts and averages their squared error',
+    Number.isFinite(calibration.resolved) &&
+      (calibration.brier === null || (calibration.brier >= 0 && calibration.brier <= 1)) &&
+      calibration.bins.every((bin) => bin.count === 0 || (bin.observed >= 0 && bin.observed <= 1)),
+    `resolved=${calibration.resolved} brier=${calibration.brier}`,
+  )
+
+  // Shorting: the crash hedge opens and covers a negative book.
+  const shortRun = await call('POST', '/backtests', {
+    strategyKey: 'crash-short',
+    symbol: 'TSLA',
+    timeframe: '1h',
+    from: Date.now() - 120 * 86_400_000,
+    to: Date.now(),
+    capital: 10_000,
+    riskPct: 25,
+  })
+  let shortDetail = shortRun.payload?.backtest
+  for (let i = 0; i < 40 && shortDetail?.status !== 'done' && shortDetail?.status !== 'failed'; i++) {
+    await new Promise((resolve) => setTimeout(resolve, 400))
+    shortDetail = (await call('GET', `/backtests/${shortRun.payload?.backtest?.id}`)).payload?.backtest
+  }
+  const shortSides = new Set((shortDetail?.trades ?? []).map((t) => t.side))
+  check(
+    'the crash-short strategy opens and covers a short book',
+    shortDetail?.status === 'done' && shortSides.has('short') && shortSides.has('cover'),
+    `${shortDetail?.status} sides=${[...shortSides].join(',')} trades=${shortDetail?.trades?.length}`,
+  )
 }
 
 console.log(failures === 0 ? '\nAll API checks passed.' : `\n${failures} check(s) failed.`)

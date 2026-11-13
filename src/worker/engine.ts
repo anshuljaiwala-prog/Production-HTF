@@ -1,7 +1,14 @@
-import type { Bot } from '../shared/types'
-import { createBroker, LiveBrokerError, type Broker } from './broker'
+import type { Bot, TraceDecision, TraceRejectReason } from '../shared/types'
+import { environmentControlsFor } from './agents/environment-do'
+import { evaluateGate, readEnvironment } from './agents/environment'
+import { MACRO_BARS, macroBarsAt } from './agents/harvester'
+import { moveDirection } from './agents/specialists'
+import { scorePrediction } from './agents/trace'
+import { LiveBrokerError, PaperBroker, type Broker } from './broker'
+import { createVenueBroker } from './venues'
 import { BOT_SELECT, id, mapBot } from './db'
-import { TIMEFRAME_MS, barIndexAt, lastClosedIndex, type Bar } from './market'
+import { TIMEFRAME_MS, barIndexAt, barsBetween, lastClosedIndex, type Bar } from './market'
+import { barsForRun } from './marketstore'
 import { strategyBy } from './strategies'
 
 // Lazy run loop. The Worker is request-scoped, so there is no long-lived
@@ -18,13 +25,18 @@ const MIN_NOTIONAL = 1
 const QTY_STEP = 1e6
 /** Fee+slippage head-room when sizing a buy against available cash. */
 const COST_BUFFER = 1.003
+/** Closed bars of decision trace kept per bot, newest first. */
+const TRACE_BARS = 300
 
 /** Bots (per workspace) whose simulation is currently writing. The engine is
  * lazy — every read/write route advances running bots — so two parallel HTTP
  * reads of the same bot would both replay the same bars and interleave their
  * D1 statements: filled buys without their cash debits, clobbered `cash`,
- * vanished position rows. The lock collapses those to one writer; a skipped
- * advance simply hasn't caught up yet and the next read does it. */
+ * vanished position rows. Within one isolate the in-memory set collapses
+ * those to one writer. Across isolates (Workers runs many), the replay is
+ * also guarded by a compare-and-set lease in D1 below, so only one replay
+ * ever lands. A skipped advance simply hasn't caught up yet and the next
+ * read does it. */
 const advancingBots = new Set<string>()
 
 type Row = Record<string, unknown>
@@ -47,6 +59,8 @@ export interface AdvanceOptions {
   /** Clock override, used by seeding and tests. */
   at?: number
   broker?: Broker
+  /** Deployment secrets key, so live venues can decrypt stored credentials. */
+  secretsKey?: string
 }
 
 /**
@@ -73,6 +87,10 @@ async function advanceLocked(db: D1Database, owner: string, bot: Bot, options: A
   if (!freshRow) return
   bot = mapBot(freshRow)
   if (bot.status !== 'running') return
+  // Operator kill-switch: a paused environment freezes every book where it is,
+  // without changing a bot's own status — so unpausing resumes exactly this.
+  const controls = await environmentControlsFor(db, owner)
+  if (controls.paused) return
   const strategy = strategyBy(bot.strategyKey)
   if (!strategy) {
     await write(db, bot.id, owner, [
@@ -83,12 +101,37 @@ async function advanceLocked(db: D1Database, owner: string, bot: Bot, options: A
 
   const at = options.at ?? Date.now()
   const tfMs = TIMEFRAME_MS[bot.timeframe]
-  const broker = options.broker ?? createBroker(bot.mode)
+  // Paper bots fill against the simulated venue. Live bots resolve their
+  // venue connections into adapters (see venues.ts); no usable venue pauses
+  // the bot loudly instead of trading on a fake one.
+  let broker: Broker
+  try {
+    broker =
+      options.broker ??
+      (bot.mode === 'live'
+        ? await createVenueBroker(db, owner, bot.venueIds.length ? bot.venueIds : bot.connectionId ? [bot.connectionId] : [], options.secretsKey)
+        : new PaperBroker())
+  } catch (error) {
+    return fail(db, owner, bot, error, [])
+  }
 
   const lastBar = lastClosedIndex(bot.timeframe, at)
   const firstBar =
     bot.lastTickAt === null ? barIndexAt(bot.timeframe, bot.createdAt) : barIndexAt(bot.timeframe, bot.lastTickAt)
   if (lastBar < firstBar || bot.symbols.length === 0) return
+
+  // Compare-and-set advance lease. Both the lease token and the row's last
+  // processed tick are checked in the WHERE clause, so exactly one replay
+  // wins when two isolates (or two requests) race the same bot: the loser's
+  // UPDATE matches nothing and it skips, leaving the catch-up to a later
+  // read. Stale tokens never block the next pass — it always re-reads the
+  // row and swaps the lease in a single conditional write.
+  const leaseToken = crypto.randomUUID()
+  const claimed = await db
+    .prepare(`UPDATE bots SET lease_token = ? WHERE id = ? AND owner_sub = ? AND lease_token IS ? AND last_tick_at IS ?`)
+    .bind(leaseToken, bot.id, owner, (freshRow.lease_token as string | null) ?? null, bot.lastTickAt)
+    .run()
+  if (!claimed.meta.changes) return
 
   let start = firstBar
   let skipped = 0
@@ -104,6 +147,28 @@ async function advanceLocked(db: D1Database, owner: string, bot: Bot, options: A
     histories.set(symbol, broker.bars(symbol, bot.timeframe, historyStart * tfMs, historyEnd))
   }
 
+  // Agent shell (ported from market_agent_env): one read per pass, gating new
+  // entries only — exits, stops and marks are untouched, so a contagion read can
+  // never trap a bot in a position. The bot's own symbol is read from the same
+  // merged bars it trades; the macro breadth stays a cheap synthetic read.
+  const agentAt = (lastBar + 1) * tfMs
+  const focusSymbol = bot.symbols[0] ?? ''
+  const focusFrom = agentAt - MACRO_BARS * tfMs
+  const agent = readEnvironment({
+    at: agentAt,
+    macroBars: macroBarsAt(agentAt),
+    ...(focusSymbol
+      ? { focus: { symbol: focusSymbol, bars: (await barsForRun(db, focusSymbol, bot.timeframe, focusFrom, agentAt)) ?? barsBetween(focusSymbol, bot.timeframe, focusFrom, agentAt) } }
+      : {}),
+  })
+  const gate = evaluateGate(agent, bot.symbols, bot.riskOffStreak)
+  let blockedBuys = 0
+  // The decision trace: one entry per bar this pass evaluates, with what each
+  // symbol did on it. The gate, proposals and verdict above are per pass, so a
+  // catch-up pass shares that one shell read across its bars — the read the bot
+  // actually acted on.
+  const traces: { at: number; decisions: TraceDecision[] }[] = []
+
   const positionRows = await db
     .prepare(`SELECT * FROM positions WHERE bot_id = ?`)
     .bind(bot.id)
@@ -118,6 +183,18 @@ async function advanceLocked(db: D1Database, owner: string, bot: Bot, options: A
       openedAt: Number(row.opened_at),
       dirty: null,
     })
+  }
+
+  // Live books are marked at the venue's executable price, not the synthetic
+  // feed: real fills against simulated marks would report nonsense P&L. One
+  // quote per open symbol per advance keeps the request count bounded.
+  const marks = new Map<string, number>()
+  if (bot.mode === 'live') {
+    for (const position of positions.values()) {
+      if (position.qty === 0) continue
+      const mark = await broker.executableQuote?.(position.symbol, 'buy').catch(() => null)
+      if (mark !== null && mark !== undefined) marks.set(position.symbol, mark)
+    }
   }
 
   let cash = bot.cash
@@ -142,6 +219,7 @@ async function advanceLocked(db: D1Database, owner: string, bot: Bot, options: A
 
   for (let bi = start; bi <= lastBar; bi++) {
     const barClose = (bi + 1) * tfMs
+    const decisions: TraceDecision[] = []
     for (const symbol of bot.symbols) {
       const history = histories.get(symbol)
       if (!history) continue
@@ -159,15 +237,30 @@ async function advanceLocked(db: D1Database, owner: string, bot: Bot, options: A
         params: bot.params,
         tfMs,
       })
+      let orderQty: number | null = null
+      let filled = false
+      let reject: TraceRejectReason | null = null
 
-      if (signal.action === 'buy' && fills < MAX_FILLS_PER_RUN) {
+      // The whole gate: one decision per signal, and the only thing it can do is
+      // stop a long entry. Exits fall through untouched, and so does a short: a
+      // risk-off read is exactly when the crash hedge should be allowed to open.
+      const entryBlocked = gate.blocked || controls.pauseBuys
+      const blockedBuy = signal.action === 'buy' && entryBlocked
+      if (blockedBuy) {
+        blockedBuys++
+        reject = 'gate'
+      }
+      else if (signal.action === 'buy' && fills < MAX_FILLS_PER_RUN) {
         const price = bar.c
         const target = equity * (bot.riskPct / 100)
         const qty = Math.floor(Math.min(target / price, cash / (price * COST_BUFFER)) * QTY_STEP) / QTY_STEP
         if (qty > 0 && qty * price >= MIN_NOTIONAL) {
           try {
-            const fill = broker.placeOrder({ symbol, side: 'buy', qty, at: barClose })
+            const fill = await broker.placeOrder({ symbol, side: 'buy', qty, at: barClose })
             fills++
+            marks.set(symbol, fill.price)
+            orderQty = fill.qty
+            filled = true
             cash -= fill.price * fill.qty + fill.fee
             if (position && position.qty > 0) {
               const total = position.qty + fill.qty
@@ -194,17 +287,22 @@ async function advanceLocked(db: D1Database, owner: string, bot: Bot, options: A
             events.push({
               id: id(),
               level: 'fill',
-              message: `Bought ${trim(fill.qty)} ${symbol} @ ${trim(fill.price)} — ${signal.reason ?? 'entry'}.`,
+              message: `Bought ${trim(fill.qty)} ${symbol} @ ${trim(fill.price)} — ${signal.reason ?? 'entry'}${fill.venue ? ` via ${fill.venue}` : ''}.`,
               at: barClose,
             })
           } catch (error) {
             return fail(db, owner, bot, error, events)
           }
+        } else {
+          reject = 'sizing'
         }
       } else if (signal.action === 'sell' && position && position.qty > 0 && fills < MAX_FILLS_PER_RUN) {
         try {
-          const fill = broker.placeOrder({ symbol, side: 'sell', qty: position.qty, at: barClose })
+          const fill = await broker.placeOrder({ symbol, side: 'sell', qty: position.qty, at: barClose })
           fills++
+          marks.set(symbol, fill.price)
+          orderQty = position.qty
+          filled = true
           const pnl = (fill.price - position.avgPrice) * fill.qty - fill.fee
           cash += fill.price * fill.qty - fill.fee
           realized += pnl
@@ -216,7 +314,78 @@ async function advanceLocked(db: D1Database, owner: string, bot: Bot, options: A
           })
           events.push({
             id: id(),
-            level: 'fill',              message: `Sold ${trim(fill.qty)} ${symbol} @ ${trim(fill.price)} — ${signal.reason ?? 'exit'} (P&L ${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)}).`,
+            level: 'fill',
+            message: `Sold ${trim(fill.qty)} ${symbol} @ ${trim(fill.price)} — ${signal.reason ?? 'exit'}${fill.venue ? ` via ${fill.venue}` : ''} (P&L ${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)}).`,
+            at: barClose,
+          })
+          positions.set(symbol, { ...position, qty: 0, dirty: 'delete' })
+        } catch (error) {
+          return fail(db, owner, bot, error, events)
+        }
+      } else if (signal.action === 'short' && (!position || position.qty === 0) && fills < MAX_FILLS_PER_RUN) {
+        // Venue adapters place long-only orders; a live short would sell shares
+        // the bot does not own. Refuse loudly instead of faking a hedge.
+        if (broker.mode === 'live') {
+          return fail(db, owner, bot, new Error('Live venues do not support short selling — run this strategy in paper mode.'), events)
+        }
+        const price = bar.c
+        const target = equity * (bot.riskPct / 100)
+        // A short posts no cash, but sizing keeps its notional at the same risk
+        // target as a long so the two directions are comparable.
+        const qty = Math.floor(Math.min(target / price, equity / (price * COST_BUFFER)) * QTY_STEP) / QTY_STEP
+        if (qty > 0 && qty * price >= MIN_NOTIONAL) {
+          try {
+            const fill = await broker.placeOrder({ symbol, side: 'sell', qty, at: barClose })
+            fills++
+            marks.set(symbol, fill.price)
+            orderQty = qty
+            filled = true
+            cash += fill.price * fill.qty - fill.fee
+            positions.set(symbol, {
+              id: id(),
+              symbol,
+              qty: -fill.qty,
+              avgPrice: fill.price,
+              openedAt: barClose,
+              dirty: 'insert',
+            })
+            trades.push({
+              sql: `INSERT INTO trades (id, owner_sub, bot_id, symbol, side, qty, price, fee, pnl, created_at) VALUES (?, ?, ?, ?, 'short', ?, ?, ?, NULL, ?)`,
+              bind: [id(), owner, bot.id, symbol, fill.qty, fill.price, fill.fee, barClose],
+            })
+            events.push({
+              id: id(),
+              level: 'fill',
+              message: `Shorted ${trim(fill.qty)} ${symbol} @ ${trim(fill.price)} — ${signal.reason ?? 'entry'}${fill.venue ? ` via ${fill.venue}` : ''}.`,
+              at: barClose,
+            })
+          } catch (error) {
+            return fail(db, owner, bot, error, events)
+          }
+        } else {
+          reject = 'sizing'
+        }
+      } else if (signal.action === 'cover' && position && position.qty < 0 && fills < MAX_FILLS_PER_RUN) {
+        const qty = -position.qty
+        try {
+          const fill = await broker.placeOrder({ symbol, side: 'buy', qty, at: barClose })
+          fills++
+          marks.set(symbol, fill.price)
+          orderQty = qty
+          filled = true
+          const pnl = (position.avgPrice - fill.price) * qty - fill.fee
+          cash -= fill.price * qty + fill.fee
+          realized += pnl
+          roundTrips++
+          if (pnl > 0) wins++
+          trades.push({
+            sql: `INSERT INTO trades (id, owner_sub, bot_id, symbol, side, qty, price, fee, pnl, created_at) VALUES (?, ?, ?, ?, 'cover', ?, ?, ?, ?, ?)`,
+            bind: [id(), owner, bot.id, symbol, qty, fill.price, fill.fee, pnl, barClose],
+          })
+          events.push({
+            id: id(),
+            level: 'fill',
+            message: `Covered ${trim(qty)} ${symbol} @ ${trim(fill.price)} — ${signal.reason ?? 'exit'}${fill.venue ? ` via ${fill.venue}` : ''} (P&L ${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)}).`,
             at: barClose,
           })
           positions.set(symbol, { ...position, qty: 0, dirty: 'delete' })
@@ -224,14 +393,41 @@ async function advanceLocked(db: D1Database, owner: string, bot: Bot, options: A
           return fail(db, owner, bot, error, events)
         }
       }
+      // Anything the strategy asked for that no branch filled is a typed
+      // reject, never a silent no-op.
+      if (!filled && reject === null && signal.action !== 'hold') {
+        reject = fills >= MAX_FILLS_PER_RUN ? 'fill_cap' : 'no_position'
+      }
+      decisions.push({
+        symbol,
+        action: signal.action,
+        reason: signal.reason ?? null,
+        qty: orderQty,
+        fill: filled,
+        reject,
+      })
     }
+    traces.push({ at: barClose, decisions })
 
     equity = cash
     for (const position of positions.values()) {
-      if (position.dirty === 'delete' || position.qty <= 0) continue
-      equity += position.qty * broker.quote(position.symbol, barClose)
+      // A short carries negative qty, so its mark is a liability, not zero.
+      if (position.dirty === 'delete' || position.qty === 0) continue
+      const mark = bot.mode === 'live' ? (marks.get(position.symbol) ?? position.avgPrice) : broker.quote(position.symbol, barClose)
+      equity += position.qty * mark
     }
     points.push({ at: barClose, value: equity })
+  }
+
+  if (blockedBuys > 0) {
+    events.push({
+      id: id(),
+      level: 'info',
+      message: `Agent shell held back ${blockedBuys} ${blockedBuys === 1 ? 'entry' : 'entries'} — ${
+        controls.pauseBuys ? 'new entries paused by the operator' : (gate.reason ?? agent.regime.toLowerCase().replace(/_/g, ' '))
+      }.`,
+      at: (lastBar + 1) * tfMs,
+    })
   }
 
   const statements: PendingRow[] = []
@@ -241,17 +437,39 @@ async function advanceLocked(db: D1Database, owner: string, bot: Bot, options: A
       // entry in the map — clear the (bot_id, symbol) row first so the insert
       // never trips the unique index.
       statements.push({ sql: `DELETE FROM positions WHERE bot_id = ? AND symbol = ?`, bind: [bot.id, position.symbol] })
+      const mark = marks.get(position.symbol)
       statements.push({
-        sql: `INSERT INTO positions (id, owner_sub, bot_id, symbol, qty, avg_price, opened_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-        bind: [position.id, owner, bot.id, position.symbol, position.qty, position.avgPrice, position.openedAt],
+        sql: `INSERT INTO positions (id, owner_sub, bot_id, symbol, qty, avg_price, opened_at, mark_price, mark_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        bind: [
+          position.id,
+          owner,
+          bot.id,
+          position.symbol,
+          position.qty,
+          position.avgPrice,
+          position.openedAt,
+          mark ?? null,
+          mark === undefined ? null : (lastBar + 1) * tfMs,
+        ],
       })
     } else if (position.dirty === 'update') {
+      const mark = marks.get(position.symbol)
       statements.push({
-        sql: `UPDATE positions SET qty = ?, avg_price = ? WHERE bot_id = ? AND symbol = ?`,
-        bind: [position.qty, position.avgPrice, bot.id, position.symbol],
+        sql: `UPDATE positions SET qty = ?, avg_price = ?, mark_price = COALESCE(?, mark_price), mark_at = COALESCE(?, mark_at) WHERE bot_id = ? AND symbol = ?`,
+        bind: [position.qty, position.avgPrice, mark ?? null, mark === undefined ? null : (lastBar + 1) * tfMs, bot.id, position.symbol],
       })
     } else if (position.dirty === 'delete') {
       statements.push({ sql: `DELETE FROM positions WHERE bot_id = ? AND symbol = ?`, bind: [bot.id, position.symbol] })
+    } else if (bot.mode === 'live' && position.qty > 0) {
+      // Untouched by this pass: refresh its stored venue mark so the dashboard,
+      // portfolio and bot page all price it from the venue, not the feed.
+      const mark = marks.get(position.symbol)
+      if (mark !== undefined) {
+        statements.push({
+          sql: `UPDATE positions SET mark_price = ?, mark_at = ? WHERE bot_id = ? AND symbol = ?`,
+          bind: [mark, (lastBar + 1) * tfMs, bot.id, position.symbol],
+        })
+      }
     }
   }
   statements.push(...trades)
@@ -262,14 +480,64 @@ async function advanceLocked(db: D1Database, owner: string, bot: Bot, options: A
     })
   }
   statements.push({
-    sql: `UPDATE bots SET cash = ?, equity = ?, realized_pnl = ?, round_trips = ?, wins = ?, last_tick_at = ?, updated_at = ? WHERE id = ?`,
-    bind: [cash, equity, realized, roundTrips, wins, (lastBar + 1) * tfMs, (lastBar + 1) * tfMs, bot.id],
+    sql: `UPDATE bots SET cash = ?, equity = ?, realized_pnl = ?, round_trips = ?, wins = ?, risk_off_streak = ?, last_tick_at = ?, updated_at = ? WHERE id = ?`,
+    bind: [cash, equity, realized, roundTrips, wins, gate.streak, (lastBar + 1) * tfMs, (lastBar + 1) * tfMs, bot.id],
   })
   // Keep the curve bounded instead of growing forever.
   statements.push({
     sql: `DELETE FROM equity_points WHERE bot_id = ? AND at < ?`,
     bind: [bot.id, (lastBar - 1000) * tfMs],
   })
+  for (const trace of traces) {
+    statements.push({
+      sql: `INSERT OR REPLACE INTO decision_traces (bot_id, owner_sub, at, gate_blocked, gate_reason, risk_off_streak, proposals, verdict, decisions) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      bind: [
+        bot.id,
+        owner,
+        trace.at,
+        gate.blocked ? 1 : 0,
+        gate.reason,
+        gate.streak,
+        JSON.stringify(agent.proposals),
+        JSON.stringify(agent.verdict),
+        JSON.stringify(trace.decisions),
+      ],
+    })
+  }
+  statements.push({
+    sql: `DELETE FROM decision_traces WHERE bot_id = ? AND at < ?`,
+    bind: [bot.id, (lastBar - TRACE_BARS) * tfMs],
+  })
+
+  // Score the always-on move probability: the bar that just closed is what the
+  // bar before it implied, and both are in the history this pass replayed. So
+  // the row lands already resolved and the Brier score is measured rather than
+  // asserted. The forecast's facts are the current read (facts move slowly),
+  // which makes this a one-bar-ahead check, not a point-in-time replay.
+  const focusHistory = histories.get(focusSymbol)
+  const predicted = focusHistory?.find((bar) => bar.t === (lastBar - 1) * tfMs)
+  const realised = focusHistory?.find((bar) => bar.t === lastBar * tfMs)
+  const direction = moveDirection(agent.nextMove.move)
+  const scored = predicted && realised ? scorePrediction(predicted.c, realised.c, direction) : null
+  if (predicted && realised && scored) {
+    statements.push({
+      sql: `INSERT OR REPLACE INTO move_predictions (owner_sub, symbol, timeframe, at, move, probability, facts_available, direction, price, next_close, return_pct, outcome) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      bind: [
+        owner,
+        focusSymbol,
+        bot.timeframe,
+        predicted.t,
+        agent.nextMove.move,
+        agent.nextMove.probability,
+        agent.nextMove.factsAvailable ? 1 : 0,
+        direction,
+        predicted.c,
+        realised.c,
+        scored.returnPct,
+        scored.outcome ? 1 : 0,
+      ],
+    })
+  }
 
   const kept = events.slice(0, MAX_EVENTS_PER_RUN)
   if (events.length > MAX_EVENTS_PER_RUN) {

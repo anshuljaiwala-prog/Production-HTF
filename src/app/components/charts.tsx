@@ -98,7 +98,14 @@ export function AreaChart({
   const color = stroke ?? 'var(--color-accent)'
   return (
     <div className={cx('relative', className)}>
-      <svg viewBox={`0 0 ${w} ${h}`} className="h-auto w-full" preserveAspectRatio="none" onMouseLeave={() => setHover(null)}>
+      <svg
+        viewBox={`0 0 ${w} ${h}`}
+        className="h-auto w-full"
+        preserveAspectRatio="none"
+        role="img"
+        aria-label={`Area chart, ${data.length} points from ${data[0]?.label ?? '—'} to ${data.at(-1)?.label ?? '—'}: ${format(data[0]?.value ?? 0)} to ${format(data.at(-1)?.value ?? 0)}`}
+        onMouseLeave={() => setHover(null)}
+      >
         <defs>
           <linearGradient id={gradientId} x1="0" x2="0" y1="0" y2="1">
             <stop offset="0" stopColor={fill ?? color} stopOpacity="0.22" />
@@ -214,7 +221,14 @@ export function DrawdownChart({
 
   return (
     <div className={cx('relative', className)}>
-      <svg viewBox={`0 0 ${w} ${h}`} className="h-auto w-full" preserveAspectRatio="none" onMouseLeave={() => setHover(null)}>
+      <svg
+        viewBox={`0 0 ${w} ${h}`}
+        className="h-auto w-full"
+        preserveAspectRatio="none"
+        role="img"
+        aria-label={`Drawdown chart, worst ${Math.abs(worst).toFixed(1)} percent below the running peak across ${data.length} points`}
+        onMouseLeave={() => setHover(null)}
+      >
         {depthTicks.map((d) => (
           <g key={d}>
             <line x1={padLeft} x2={w - padRight} y1={y(d)} y2={y(d)} stroke="var(--color-line)" strokeDasharray="2 4" />
@@ -301,7 +315,14 @@ export function BarChart({
 
   return (
     <div className={cx('relative', className)}>
-      <svg viewBox={`0 0 ${w} ${h}`} className="h-auto w-full" preserveAspectRatio="none" onMouseLeave={() => setHover(null)}>
+      <svg
+        viewBox={`0 0 ${w} ${h}`}
+        className="h-auto w-full"
+        preserveAspectRatio="none"
+        role="img"
+        aria-label={`Bar chart, ${data.length} bars from ${format(Math.min(...data.map((d) => d.value), 0))} to ${format(Math.max(...data.map((d) => d.value), 0))}`}
+        onMouseLeave={() => setHover(null)}
+      >
         {ticks.map((t) => (
           <g key={t}>
             <line x1={padLeft} x2={w - padRight} y1={y(t)} y2={y(t)} stroke={t === 0 ? 'var(--color-line-strong)' : 'var(--color-line)'} strokeDasharray={t === 0 ? undefined : '2 4'} />
@@ -395,7 +416,14 @@ export function PairedBarChart({
           <span className="inline-block size-2 rounded-[3px]" style={{ background: bColor }} /> {bLabel}
         </span>
       </div>
-      <svg viewBox={`0 0 ${w} ${h}`} className="h-auto w-full" preserveAspectRatio="none" onMouseLeave={() => setHover(null)}>
+      <svg
+        viewBox={`0 0 ${w} ${h}`}
+        className="h-auto w-full"
+        preserveAspectRatio="none"
+        role="img"
+        aria-label={`Weekly paired bars, ${aLabel} against ${bLabel} over ${data.length} periods`}
+        onMouseLeave={() => setHover(null)}
+      >
         {ticks.map((t) => (
           <g key={t}>
             <line x1={padLeft} x2={w - padRight} y1={y(t)} y2={y(t)} stroke={t === 0 ? 'var(--color-line-strong)' : 'var(--color-line)'} strokeDasharray={t === 0 ? undefined : '2 4'} />
@@ -510,7 +538,7 @@ export function CandleChart({
 }: {
   candles: { t: number; o: number; h: number; l: number; c: number }[]
   /** Fill markers placed by timestamp on the chart's time scale. */
-  markers?: { t: number; side: 'buy' | 'sell'; price: number }[]
+  markers?: { t: number; side: 'buy' | 'sell' | 'short' | 'cover'; price: number }[]
   height?: number
   className?: string
   format?: ChartFormatter
@@ -540,7 +568,14 @@ export function CandleChart({
 
   return (
     <div className={cx('relative', className)}>
-      <svg viewBox={`0 0 ${w} ${h}`} className="h-auto w-full" preserveAspectRatio="none" onMouseLeave={() => setHover(null)}>
+      <svg
+        viewBox={`0 0 ${w} ${h}`}
+        className="h-auto w-full"
+        preserveAspectRatio="none"
+        role="img"
+        aria-label={`Candlestick chart, ${candles.length} candles${candles.length ? ` from ${new Date(candles[0].t).toLocaleDateString('en-US')} to ${new Date(candles.at(-1)!.t).toLocaleDateString('en-US')}, low ${format(lo)}, high ${format(hi)}` : ''}`}
+        onMouseLeave={() => setHover(null)}
+      >
         {ticks.map((t) => (
           <g key={t}>
             <line x1={padLeft} x2={w - padRight} y1={y(t)} y2={y(t)} stroke="var(--color-line)" strokeDasharray="2 4" />
@@ -575,7 +610,8 @@ export function CandleChart({
         {markers.map((m, i) => {
           if (candles.length < 2) return null
           const x = markerX(m.t)
-          const buy = m.side === 'buy'
+          // Covering is a buy, so it marks below the tape like one.
+          const buy = m.side === 'buy' || m.side === 'cover'
           const triY = buy ? h - padBottom : padTop
           const dir = buy ? 1 : -1
           return (
@@ -587,7 +623,7 @@ export function CandleChart({
               animate={{ opacity: 1 }}
               transition={{ duration: 0.4, delay: 0.5 }}
             >
-              <title>{`${buy ? 'Buy' : 'Sell'} fill @ ${format(m.price)}`}</title>
+              <title>{`${m.side[0].toUpperCase()}${m.side.slice(1)} fill @ ${format(m.price)}`}</title>
             </motion.polygon>
           )
         })}

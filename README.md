@@ -27,8 +27,10 @@ credentials, holdings or trade contents.
 
 On localhost without a `FREEBUFF_CLIENT_ID`, the app signs you in as a local
 development user so everything works before auth is provisioned. A new
-workspace is seeded with sample bots, backtests and a demo connection;
-Settings can restore or clear them.
+workspace is seeded with five live-mode (paused) demo bots, two backtests and
+demo venues; Settings can restore or clear them. The Dashboard and Portfolio
+report the live book only — paper trading is reviewed under Training → Paper
+portfolio.
 
 ## How a bot runs
 
@@ -43,6 +45,29 @@ what moves the fleet — honest paper-mode behaviour, documented as such.
 - `src/worker/strategies.ts` — six templates (DCA, Grid, EMA Momentum, Mean
   Reversion, Range Breakout, Market Making) with param schemas that drive the
   launch and backtest forms from one source.
+- `src/worker/venues.ts` — live venue adapters and the best-price router.
+  BSE reaches the exchange through Upstox; cash equities map to fixed ISINs
+  while futures and options (`SENSEX-FUT`, `SENSEX-940-CE`) resolve to dated
+  contracts from the exchange instrument master.
+- `src/worker/instruments.ts` — downloads the BSE instrument file
+  (`BSE.json.gz`, public data, no API key), keeps its 6,000-odd `BSE_FO`
+  contracts in D1 (`bse_contracts`) and resolves a catalog ticker to an
+  `instrument_key`, lot size and expiry. `GET /api/instruments/bse` reports the
+  cache, `POST /api/instruments/bse/refresh` reloads it and
+  `GET /api/instruments/bse/resolve?symbol=SENSEX-FUT` shows what an order
+  would send. The master is trusted for six hours, then reloaded on demand.
+- `src/worker/agents/` — the agent shell, ported from the market_agent_env
+  project. `environment.ts` assembles one immutable snapshot per pass (the
+  Python app's long-lived environment hub, rebuilt on demand because a Worker
+  has no process to tick); `harvester.ts` reads six macro markets from the bar
+  feed and screens their tape events into news pins; `tools.ts` holds the RSI,
+  Bollinger, EMA, volume-dislocation and strategic-move maths; `inference.ts`
+  runs the five forward-chaining production rules and the macro-breadth regime
+  (0.65× risk-off … 1.25× risk-on). The engine reads it once per pass and uses
+  it to gate **new entries only** — a risk-off contagion or a severe-distress
+  rule holds buys back and logs why on the bot's event stream; exits, stops and
+  marks are never blocked. `GET /api/analysis/agents?symbol=NVDA` returns the
+  same read for inspection.
 - `src/worker/backtest.ts` — the same signal, sizing and fee model as the live
   engine, replayed over a bounded window.
 - `src/worker/routes/*` — `bots`, `strategies`, `backtests`, `connections`,
@@ -81,6 +106,8 @@ never returns them again. Personalised responses are
 
 ## Not in v1
 
-Live order routing (a live bot pauses before its first fill instead of
-pretending to trade), real market data, WebSocket streaming (polling instead),
-encryption of stored API secrets, and user-authored strategy code.
+Real market data (the feed is synthetic; only BSE order placement and quotes
+are live), WebSocket streaming (polling instead), and user-authored strategy
+code. Live routing covers BSE through Upstox — cash equities plus SENSEX,
+BANKEX, SENSEX50 and FOCIT futures and options; every other exchange still
+needs an adapter.

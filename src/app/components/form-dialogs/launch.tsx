@@ -3,9 +3,10 @@ import { useNavigate } from 'react-router'
 
 import { Bot, CircleAlert, Cpu, Siren, Zap } from 'lucide-react'
 
-import { TIMEFRAMES, type ParamValue, type Timeframe } from '../../../shared/types'
+import { MAX_BOT_VENUES, TIMEFRAMES, type ParamValue, type Timeframe } from '../../../shared/types'
 import { capture } from '../../lib/analytics'
 import { launchBot, useConnections, useCustomStrategy, useApiMutation, useStrategies, type LaunchInput } from '../../lib/api'
+import { RiskBar } from '../controls'
 import { Badge, Button, Dialog, Field, useToast } from '../ui'
 import { customStrategyView, FieldInput, FieldSelect, paramDefaults, ParamFields, SymbolPicker } from '../form-fields'
 import { money } from '../../lib/format'
@@ -32,7 +33,7 @@ export function LaunchWizard({
   const [capital, setCapital] = useState('10000')
   const [riskPct, setRiskPct] = useState('25')
   const [mode, setMode] = useState<'paper' | 'live'>('paper')
-  const [connectionId, setConnectionId] = useState('')
+  const [venueIds, setVenueIds] = useState<string[]>([])
   const [params, setParams] = useState<Record<string, ParamValue>>({})
 
   // Uploaded rules strategy: resolve its detail through the id, and present
@@ -58,7 +59,7 @@ export function LaunchWizard({
     setSymbols(catalog?.symbols.slice(0, 1).map((meta) => meta.symbol) ?? [])
     setName('')
     setMode('paper')
-    setConnectionId(connections?.items[0]?.id ?? '')
+    setVenueIds(connections?.items[0] ? [connections.items[0].id] : [])
     setCapital('10000')
     setRiskPct('25')
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -83,10 +84,20 @@ export function LaunchWizard({
   if (!strategy) return null
   const usableConnections = connections?.items ?? []
 
-  // Live routing needs a saved exchange account — mirrored server-side on
-  // POST /bots; catching it here keeps the button from promising a launch
-  // the venue will refuse.
-  const liveWithoutConnection = mode === 'live' && !connectionId
+  // Live routing needs at least one saved exchange account — mirrored
+  // server-side on POST /bots; catching it here keeps the button from
+  // promising a launch the venue will refuse.
+  const liveWithoutConnection = mode === 'live' && venueIds.length === 0
+  // Best-price routing: every checked venue is queried and the best fill wins.
+  // The first checked venue is the primary (its book/cash is the reference).
+  const toggleVenue = (connectionId: string) =>
+    setVenueIds((current) =>
+      current.includes(connectionId)
+        ? current.filter((id) => id !== connectionId)
+        : current.length >= MAX_BOT_VENUES
+          ? current
+          : [...current, connectionId],
+    )
   const capitalValue = Number(capital)
   const riskValue = Number(riskPct)
   const validCapital = Number.isFinite(capitalValue) && capitalValue >= 100
@@ -111,7 +122,8 @@ export function LaunchWizard({
         capital: capitalValue,
         riskPct: riskValue,
         mode,
-        connectionId: connectionId || null,
+        connectionId: venueIds[0] ?? null,
+        venueIds: mode === 'live' ? venueIds : venueIds.slice(0, 1),
         ...(customEntry ? { rules: custom?.data?.rules } : {}),
       },
       { onSettled: () => { submitting.current = false } },
@@ -179,26 +191,24 @@ export function LaunchWizard({
             <Cpu className="size-3.5" />
             Sizing
           </h3>
-          <div className="mt-2.5 grid grid-cols-3 gap-3">
+          <div className="mt-2.5 grid grid-cols-2 gap-3">
             <Field label="Starting capital" hint="min $100">
               <span className="relative block">
                 <span className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-[13.5px] text-faint">$</span>
                 <FieldInput type="number" min={100} step={100} className="pl-7" value={capital} onChange={(e) => setCapital(e.target.value)} />
               </span>
             </Field>
-            <Field label="Risk per entry" hint="% of equity">
-              <FieldInput type="number" min={1} max={100} step={1} value={riskPct} onChange={(e) => setRiskPct(e.target.value)} />
-            </Field>
             <Field label="Target entry size" hint="equity × risk %">
               <div className="flex h-9 items-center rounded-control border border-line bg-bg px-3 text-[13.5px] tabular-nums text-muted">
-                {entrySize === null ? '$—' : `$${money(entrySize)}`}
+                {entrySize === null ? '—' : money(entrySize)}
               </div>
             </Field>
           </div>
-          <p className="mt-1.5 text-[11.5px] leading-relaxed text-faint">
-            Every buy sizes to {riskValue || 25}% of the running equity (capped by idle cash). The strategy's own parameters below shape when
-            and how that target is reached.
-          </p>
+          <RiskBar
+            value={validRisk ? riskValue : 25}
+            onChange={(next) => setRiskPct(String(next))}
+            hint={`Drag the bar or type a number — every buy sizes to ${validRisk ? riskValue : 25}% of the running equity (capped by idle cash). The strategy's own parameters below shape when and how that target is reached.`}
+          />
         </section>
 
         <ParamFields params={params} defs={strategy.params} onChange={setParams} />
@@ -218,27 +228,51 @@ export function LaunchWizard({
                 </FieldSelect>
               </Field>
               <Field
-                label="Exchange connection"
+                label={mode === 'live' ? 'Exchanges to route through' : 'Exchange connection'}
                 hint={
                   mode === 'live'
-                    ? 'Live order routing has no adapter in v1 — the bot will pause on its first fill.'
+                    ? `Best quote wins across up to ${MAX_BOT_VENUES} venues; the first checked one is primary.`
                     : 'Saved with the bot; routing only activates when the bot trades live.'
                 }
               >
-                <FieldSelect value={connectionId} onChange={(e) => setConnectionId(e.target.value)}>
-                  <option value="">{usableConnections.length ? 'None — demo venue' : 'No connections yet'}</option>
-                  {usableConnections.map((connection) => (
-                    <option key={connection.id} value={connection.id}>
-                      {connection.name} · {connection.exchange}
-                    </option>
-                  ))}
-                </FieldSelect>
+                {mode === 'live' ? (
+                  <div className="grid gap-1.5">
+                    {usableConnections.length === 0 ? (
+                      <p className="rounded-control border border-line px-3 py-2 text-[12.5px] text-faint">No connections yet</p>
+                    ) : (
+                      usableConnections.map((connection) => {
+                        const checked = venueIds.includes(connection.id)
+                        return (
+                          <label
+                            key={connection.id}
+                            className="flex cursor-pointer items-center gap-2 rounded-control border border-line bg-bg px-3 py-2 text-[13px]"
+                          >
+                            <input type="checkbox" className="accent-accent" checked={checked} onChange={() => toggleVenue(connection.id)} />
+                            <span className="min-w-0 truncate">
+                              {connection.name} · {connection.exchange} · {connection.environment}
+                            </span>
+                            {checked && venueIds[0] === connection.id && <span className="ml-auto text-[11px] text-faint">primary</span>}
+                          </label>
+                        )
+                      })
+                    )}
+                  </div>
+                ) : (
+                  <FieldSelect value={venueIds[0] ?? ''} onChange={(e) => setVenueIds(e.target.value ? [e.target.value] : [])}>
+                    <option value="">{usableConnections.length ? 'None — demo venue' : 'No connections yet'}</option>
+                    {usableConnections.map((connection) => (
+                      <option key={connection.id} value={connection.id}>
+                        {connection.name} · {connection.exchange}
+                      </option>
+                    ))}
+                  </FieldSelect>
+                )}
               </Field>
             </div>
             {liveWithoutConnection && (
               <p className="flex items-start gap-1.5 rounded-[10px] bg-danger-soft px-3 py-2 text-[12.5px] text-danger">
                 <CircleAlert className="mt-0.5 size-3.5 shrink-0" />
-                A live bot needs a saved exchange connection. Add one on the Connections page, or launch in paper mode first.
+                A live bot needs at least one saved exchange connection. Add one on the Connections page, or launch in paper mode first.
               </p>
             )}
             {symbols.length === 0 && (

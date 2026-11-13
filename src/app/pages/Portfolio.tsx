@@ -6,11 +6,12 @@ import { Link } from 'react-router'
 import { AreaChart, BarChart, CompareBars, DrawdownChart, PairedBarChart } from '../components/charts'
 import { ParamFields, SymbolPicker } from '../components/forms'
 import { Badge, Button, Card, EmptyState, Field, Input, Live, PageHeader, Skeleton, useToast } from '../components/ui'
-import { adjustFunding, ApiError, controlBot, patchBot, useApiMutation, useBot, usePortfolio, useStrategies, type BotPatch } from '../lib/api'
+import { adjustFunding, ApiError, controlBot, patchBot, useApiMutation, useBot, useConnections, usePortfolio, useStrategies, type BotPatch } from '../lib/api'
 import { downloadCsv } from '../lib/csv'
 import { cx } from '../lib/cx'
 import { money, moneyExact, moneyExactPlain, relativeTime, shortDate } from '../lib/format'
-import { TIMEFRAMES, activityOf, type CashFlow, type EquityPoint, type ParamValue, type Portfolio, type PortfolioBotAudit, type PortfolioPosition, type PortfolioTransaction, type Timeframe } from '../../shared/types'
+import { getCurrency } from '../lib/prefs'
+import { MAX_BOT_VENUES, TIMEFRAMES, activityOf, type CashFlow, type Connection, type EquityPoint, type ParamValue, type Portfolio, type PortfolioBotAudit, type PortfolioPosition, type PortfolioTransaction, type Timeframe } from '../../shared/types'
 
 const pnlText = (value: number) => `${value >= 0 ? '+' : ''}${money(value)}`
 const mark = (value: number) => (value >= 0 ? 'text-success' : 'text-danger')
@@ -30,47 +31,29 @@ const activityTone: Record<ReturnType<typeof activityOf>, 'success' | 'warning' 
 
 export function Portfolio() {
   const { data, isLoading } = usePortfolio()
-  const [analysis, setAnalysis] = useState<'money' | 'paper'>('money')
-  const [selected, setSelected] = useState<string>('money-fleet')
+  const [selected, setSelected] = useState<string>('fleet')
 
   const isLive = (data?.summary.activeBots ?? 0) > 0
+  // The money book is live-routed bots only. Paper bots are audited under
+  // Training → Paper portfolio and never appear here.
   const bots = data?.bots ?? []
-  // The two books never mix: the Money tab audits live-routed bots only, the
-  // Paper tab audits the simulated wallet. Selecting a bot always lands in
-  // the matching tab.
-  const tabBots = bots.filter((bot) => (analysis === 'paper' ? bot.mode === 'paper' : bot.mode === 'live'))
-  const selectedBot = (() => {
-    const bot = bots.find((bot) => bot.id === selected) ?? null
-    if (bot && bot.mode !== (analysis === 'paper' ? 'paper' : 'live')) return null
-    return bot
-  })()
-
-  const switchAnalysis = (next: 'money' | 'paper') => {
-    setAnalysis(next)
-    setSelected(`${next}-fleet`)
-  }
+  const selectedBot = bots.find((bot) => bot.id === selected) ?? null
 
   return (
     <div className="mx-auto max-w-[1200px] p-5 sm:p-8">
-      <PageHeader title="Portfolio" subtitle="Financial audit of the fleet: every dollar in, every dollar out, per bot." />
+      <PageHeader title="Portfolio" subtitle="Financial audit of the live book: every dollar in, every dollar out, per bot." />
 
       <div className="mt-6 flex flex-wrap items-center gap-1.5">
-        <TabButton active={analysis === 'money'} onMouseDown={() => switchAnalysis('money')}>
+        <TabButton active={selected === 'fleet'} onClick={() => setSelected('fleet')}>
           Money book
-          {isLive && analysis === 'money' && <span className="ml-1 inline-block size-1.5 animate-pulse rounded-full bg-success" />}
-        </TabButton>
-        <TabButton active={analysis === 'paper'} onMouseDown={() => switchAnalysis('paper')}>
-          Paper book
-          {(data?.summary.paperBots ?? 0) > 0 && (
-            <span className="ml-1.5 rounded-[6px] bg-surface-2 px-1 text-[10.5px] text-faint">{data?.summary.paperBots}</span>
-          )}
+          {isLive && selected === 'fleet' && <span className="ml-1 inline-block size-1.5 animate-pulse rounded-full bg-success" />}
         </TabButton>
         <span className="mx-1 h-5 w-px bg-line" />
-        {tabBots.map((bot) => (
+        {bots.map((bot) => (
           <TabButton
             key={bot.id}
             active={selected === bot.id}
-            onMouseDown={() => setSelected(bot.id)}
+            onClick={() => setSelected(bot.id)}
           >
             <span className={cx('mr-1 inline-block size-1.5 rounded-full', statusDot[bot.status])} />
             {bot.name}
@@ -80,15 +63,12 @@ export function Portfolio() {
 
       {isLoading && <Skeleton className="mt-3 h-8" />}
 
-      {data && !selectedBot && analysis === 'money' && <FleetAudit data={data} live={isLive} />}
-      {data && !selectedBot && analysis === 'paper' && (
-        <PaperBook data={data} onOpen={(id) => setSelected(id)} />
-      )}
+      {data && !selectedBot && <FleetAudit data={data} live={isLive} />}
       {data && selectedBot && (
         <BotPerformance
           audit={data.bots.find((bot) => bot.id === selectedBot.id)!}
           flows={data.funding.filter((flow) => flow.botId === selectedBot.id)}
-          onBack={() => setSelected(`${analysis}-fleet`)}
+          onBack={() => setSelected('fleet')}
         />
       )}
     </div>
@@ -98,16 +78,16 @@ export function Portfolio() {
 function TabButton({
   active,
   children,
-  onMouseDown,
+  onClick,
 }: {
   active: boolean
   children: React.ReactNode
-  onMouseDown: () => void
+  onClick: () => void
 }) {
   return (
     <button
       type="button"
-      onMouseDown={onMouseDown}
+      onClick={onClick}
       className={cx(
         'flex h-8 items-center gap-1 rounded-[9px] px-3 text-[12.5px] font-medium transition-colors',
         active ? 'bg-fg text-bg' : 'border border-line bg-surface text-muted hover:text-fg',
@@ -148,13 +128,10 @@ function FleetAudit({ data, live }: { data: Portfolio; live: boolean }) {
         ))}
       </div>
 
-      {data.summary.paperBots > 0 && (
-        <p className="mt-3 rounded-tile border border-line bg-surface-2/60 px-3 py-2 text-[12.5px] text-muted">
-          {data.summary.paperBots} paper bot{data.summary.paperBots === 1 ? '' : 's'} (simulated wallet equity{' '}
-          <span className="font-medium text-fg">{money(data.summary.paperEquity)}</span>) trade beside this book but are
-          excluded from every figure above — the actual portfolio measures live-routed capital only.
-        </p>
-      )}
+      <p className="mt-3 rounded-tile border border-line bg-surface-2/60 px-3 py-2 text-[12.5px] text-muted">
+        This book is live-routed capital only. Paper bots are audited separately under
+        <span className="font-medium text-fg"> Training → Paper portfolio</span>.
+      </p>
 
       <div className="mt-3 grid gap-3 lg:grid-cols-3">
         <div className="grid gap-3 lg:col-span-2">
@@ -241,16 +218,16 @@ function FleetAudit({ data, live }: { data: Portfolio; live: boolean }) {
           <table className="w-full table-fixed text-left text-[13.5px]">
             <thead>
               <tr className="h-10 border-y border-line bg-bg/60 text-[12.5px] text-muted">
-                <th className="w-[17%] px-5 font-medium">Bot</th>
-                <th className="w-[9%] px-2 text-right font-medium">Capital</th>
-                <th className="w-[10%] px-2 text-right font-medium">Equity</th>
-                <th className="w-[11%] px-2 text-right font-medium">Net P&L</th>
-                <th className="w-[11%] px-2 text-right font-medium">Realized</th>
-                <th className="w-[10%] px-2 text-right font-medium">Unrealized</th>
-                <th className="w-[8%] px-2 text-right font-medium">Fees</th>
-                <th className="w-[7%] px-2 text-right font-medium">Fills</th>
-                <th className="w-[9%] px-2 text-right font-medium">Win rate</th>
-                <th className="w-[10%] px-5 text-right font-medium">Status</th>
+                <th scope="col" className="w-[17%] px-5 font-medium">Bot</th>
+                <th scope="col" className="w-[9%] px-2 text-right font-medium">Capital</th>
+                <th scope="col" className="w-[10%] px-2 text-right font-medium">Equity</th>
+                <th scope="col" className="w-[11%] px-2 text-right font-medium">Net P&L</th>
+                <th scope="col" className="w-[11%] px-2 text-right font-medium">Realized</th>
+                <th scope="col" className="w-[10%] px-2 text-right font-medium">Unrealized</th>
+                <th scope="col" className="w-[8%] px-2 text-right font-medium">Fees</th>
+                <th scope="col" className="w-[7%] px-2 text-right font-medium">Fills</th>
+                <th scope="col" className="w-[9%] px-2 text-right font-medium">Win rate</th>
+                <th scope="col" className="w-[10%] px-5 text-right font-medium">Status</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-line">
@@ -640,6 +617,11 @@ function FundingPanel({ audit, flows }: { audit: PortfolioBotAudit; flows: CashF
   const value = Number(amount)
   const valid = Number.isFinite(value) && value > 0 && value <= 10_000_000
   const tooMuchOut = value > audit.cash + 1e-6
+  // Amounts are entered in the ledger's USD terms; the rest of the app
+  // displays the operator's currency toggle, so show what was typed at the
+  // toggle's rate — otherwise a 12.345 deposit surprises as ₹1,026.
+  const displayUnits = getCurrency()
+  const prettyTyped = valid && displayUnits !== 'USD' ? ` ≈ ${moneyExact(value)}` : ''
 
   return (
     <Card className="mt-3 p-5">
@@ -657,12 +639,12 @@ function FundingPanel({ audit, flows }: { audit: PortfolioBotAudit; flows: CashF
         </div>
       </div>
 
-      <div className="mt-4 flex max-w-md flex-wrap items-center gap-2">
+        <div className="mt-4 flex max-w-md flex-wrap items-center gap-2">
         <Input
           type="number"
           min="0"
           step="0.01"
-          placeholder="Amount"
+          placeholder="Amount (USD)"
           value={amount}
           onChange={(e) => setAmount(e.target.value)}
           className="w-32"
@@ -686,8 +668,8 @@ function FundingPanel({ audit, flows }: { audit: PortfolioBotAudit; flows: CashF
           Withdraw
         </Button>
         {valid && tooMuchOut && <span className="text-[12px] text-warning">Only {moneyExactPlain(audit.cash)} is idle cash right now.</span>}
+        {valid && !tooMuchOut && prettyTyped && <span className="text-[12px] text-faint">reads as{prettyTyped} at the display currency toggle</span>}
       </div>
-
       {flows.length > 0 && (
         <ul className="mt-4 divide-y divide-line">
           {flows.slice(0, 6).map((flow) => (
@@ -757,14 +739,21 @@ function SettingsPanel({ audit }: { audit: PortfolioBotAudit }) {
   const { data: catalog } = useStrategies()
   const strategy = catalog?.strategies.find((s) => s.key === audit.strategyKey)
   const bot = detail?.bot
-  const active = activityOf(audit) === 'active'
+  // Trading settings are editable whenever the engine is parked (paused,
+  // grounded, in the hangar) — regardless of mode. The activity label isn't
+  // the right gate: a running paper bot reports 'training', not 'active',
+  // yet the server still rejects config changes for it with 409.
+  const active = audit.status === 'running'
   const [open, setOpen] = useState(false)
+
+  const { data: connections } = useConnections()
 
   const [name, setName] = useState('')
   const [symbols, setSymbols] = useState<string[]>([])
   const [timeframe, setTimeframe] = useState<Timeframe>('1h')
   const [riskPct, setRiskPct] = useState('25')
   const [params, setParams] = useState<Record<string, ParamValue>>({})
+  const [venueIds, setVenueIds] = useState<string[]>([])
 
   // Re-seed the form from the bot's live config every time the editor opens.
   useEffect(() => {
@@ -774,7 +763,26 @@ function SettingsPanel({ audit }: { audit: PortfolioBotAudit }) {
     setTimeframe(bot.timeframe)
     setRiskPct(String(bot.riskPct))
     setParams(bot.params)
+    setVenueIds(bot.venueIds.length ? bot.venueIds : bot.connectionId ? [bot.connectionId] : [])
   }, [open, bot])
+
+  // Attached venues in routing order: row one is primary, so moving a row up
+  // also changes which connection's book/cash the bot treats as its reference.
+  const savedVenues = connections?.items ?? []
+  const attachedVenues = venueIds.map((id) => savedVenues.find((c) => c.id === id)).filter((c): c is Connection => Boolean(c))
+  const detachedVenues = savedVenues.filter((c) => !venueIds.includes(c.id))
+  const venueMissing = bot?.mode === 'live' && venueIds.length === 0
+  function moveVenue(connectionId: string, delta: number) {
+    setVenueIds((current) => {
+      const from = current.indexOf(connectionId)
+      const to = from + delta
+      if (from < 0 || to < 0 || to >= current.length) return current
+      const next = [...current]
+      next.splice(from, 1)
+      next.splice(to, 0, connectionId)
+      return next
+    })
+  }
 
   const save = useApiMutation((patch: BotPatch) => patchBot(audit.id, patch), ['bots', 'bot', 'portfolio', 'search'], {
     onSuccess: () => {
@@ -794,6 +802,7 @@ function SettingsPanel({ audit }: { audit: PortfolioBotAudit }) {
       timeframe,
       riskPct: Number(riskPct),
       params,
+      venueIds,
     })
   }
 
@@ -807,8 +816,8 @@ function SettingsPanel({ audit }: { audit: PortfolioBotAudit }) {
           </h3>
           <p className="mt-0.5 text-[12px] text-faint">
             {active
-              ? 'This bot is actively trading — pause it above to change its settings.'
-              : 'The bot is not holding or trading: its settings can change right now.'}
+              ? 'This bot is running live against the engine — pause or ground it above to change its settings.'
+              : 'The bot is not running: its settings can change right now.'}
           </p>
         </div>
         <Button
@@ -832,7 +841,7 @@ function SettingsPanel({ audit }: { audit: PortfolioBotAudit }) {
               <select
                 value={timeframe}
                 onChange={(e) => setTimeframe(e.target.value as Timeframe)}
-                className="h-9 rounded-control border border-line-strong bg-surface px-3 text-[13.5px] text-fg outline-none focus:border-accent"
+                className="h-9 rounded-control border border-control bg-surface px-3 text-[13.5px] text-fg outline-none focus:border-accent"
               >
                 {TIMEFRAMES.filter((tf) => strategy.timeframes.includes(tf.key)).map((tf) => (
                   <option key={tf.key} value={tf.key}>
@@ -845,6 +854,72 @@ function SettingsPanel({ audit }: { audit: PortfolioBotAudit }) {
 
           <SymbolPicker symbols={catalog?.symbols ?? []} value={symbols} onChange={setSymbols} />
 
+          <Field
+            label="Exchange venues"
+            hint={`Best quote wins across up to ${MAX_BOT_VENUES} exchanges; the first attached one is primary. Venues only route while the bot trades live.`}
+          >
+            <div className="grid gap-1.5">
+              {savedVenues.length === 0 && (
+                <p className="rounded-control border border-line px-3 py-2 text-[12.5px] text-faint">No connections yet — add an exchange on the Connections page.</p>
+              )}
+              {savedVenues.length > 0 && attachedVenues.length === 0 && (
+                <p className="rounded-control border border-line px-3 py-2 text-[12.5px] text-faint">No exchange attached — a live bot needs at least one.</p>
+              )}
+              {attachedVenues.map((venue, index) => (
+                <div key={venue.id} className="flex items-center gap-2 rounded-control border border-line bg-bg px-3 py-2 text-[13px]">
+                  <span className="min-w-0 truncate">
+                    {venue.name} · {venue.exchange} · {venue.environment}
+                  </span>
+                  <span className="ml-auto flex items-center gap-0.5">
+                    {index === 0 && <span className="mr-1 text-[11px] text-faint">primary</span>}
+                    <button
+                      type="button"
+                      title="Move up"
+                      disabled={index === 0}
+                      onClick={() => moveVenue(venue.id, -1)}
+                      className="rounded px-1 text-muted hover:text-fg disabled:opacity-30"
+                    >
+                      ↑
+                    </button>
+                    <button
+                      type="button"
+                      title="Move down"
+                      disabled={index === attachedVenues.length - 1}
+                      onClick={() => moveVenue(venue.id, 1)}
+                      className="rounded px-1 text-muted hover:text-fg disabled:opacity-30"
+                    >
+                      ↓
+                    </button>
+                    <button
+                      type="button"
+                      title="Detach this exchange"
+                      onClick={() => setVenueIds((current) => current.filter((id) => id !== venue.id))}
+                      className="rounded px-1 text-muted hover:text-danger"
+                    >
+                      ×
+                    </button>
+                  </span>
+                </div>
+              ))}
+              {detachedVenues.length > 0 && (
+                <div className="flex flex-wrap gap-1.5">
+                  {detachedVenues.map((venue) => (
+                    <button
+                      key={venue.id}
+                      type="button"
+                      disabled={venueIds.length >= MAX_BOT_VENUES}
+                      title={venueIds.length >= MAX_BOT_VENUES ? `A bot routes across up to ${MAX_BOT_VENUES} exchanges.` : `Attach ${venue.name}`}
+                      onClick={() => setVenueIds((current) => [...current, venue.id])}
+                      className="rounded-control border border-line px-2 py-1 text-[12px] text-muted hover:border-accent hover:text-fg disabled:opacity-40"
+                    >
+                      + {venue.name}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          </Field>
+
           <div className="grid grid-cols-2 gap-3">
             <Field label="Risk per entry" hint="% of equity committed on each entry">
               <Input type="number" min={1} max={100} step={1} value={riskPct} onChange={(e) => setRiskPct(e.target.value)} />
@@ -854,13 +929,14 @@ function SettingsPanel({ audit }: { audit: PortfolioBotAudit }) {
           <ParamFields params={params} defs={strategy.params} onChange={setParams} />
 
           <div className="flex items-center gap-2">
-            <Button variant="primary" type="submit" loading={save.isPending} disabled={active}>
+            <Button variant="primary" type="submit" loading={save.isPending} disabled={active || venueMissing}>
               Save settings
             </Button>
             <Button type="button" onClick={() => setOpen(false)}>
               Cancel
             </Button>
             {active && <span className="text-[12px] text-warning">Bot is active — settings are frozen until it pauses.</span>}
+            {!active && venueMissing && <span className="text-[12px] text-warning">A live bot needs at least one exchange — attach one above.</span>}
           </div>
           {save.error && <p className="text-[13px] text-danger">{save.error.message}</p>}
         </form>
@@ -891,7 +967,10 @@ function AllocationCard({ data }: { data: Portfolio }) {
   const cryptoInvested = symbols.filter(([symbol]) => isCrypto(symbol)).reduce((sum, [, e]) => sum + e.invested, 0)
   const invested = stocksInvested + cryptoInvested
   const heldTotal = symbols.reduce((sum, [, e]) => sum + e.held, 0)
-  const cash = data.bots.reduce((sum, bot) => sum + bot.cash, 0)
+  // Idle cash is the money book's: paper bots are a separate simulated
+  // wallet, and mixing their cash in makes liquidity exceed the very fleet
+  // equity this card is measured against.
+  const cash = data.bots.filter((bot) => bot.mode === 'live').reduce((sum, bot) => sum + bot.cash, 0)
   const deployed = invested + cash
   const share = (value: number) => (deployed > 0 ? `${((value / deployed) * 100).toFixed(1)}%` : '—')
 
@@ -990,149 +1069,6 @@ function AllocationCard({ data }: { data: Portfolio }) {
   )
 }
 
-/** The simulated wallet's own book: every paper-mode bot, what it holds right
- * now, its P&L and its curve — audited here precisely because none of it
- * enters the money book above. */
-function PaperBook({ data, onOpen }: { data: Portfolio; onOpen: (botId: string) => void }) {
-  const paperBots = data.bots.filter((bot) => bot.mode === 'paper')
-  const heldNow = paperBots.reduce((sum, bot) => sum + bot.equity, 0)
-  const pilot = paperBots.reduce((sum, bot) => sum + (bot.capital - bot.netDeposits), 0)
-  const paperPnl = heldNow - pilot
-  const realized = paperBots.reduce((sum, bot) => sum + bot.realizedPnl, 0)
-  const unrealized = paperBots.reduce((sum, bot) => sum + bot.unrealizedPnl, 0)
-  const paperWinRate = (() => {
-    const trips = paperBots.reduce((sum, bot) => sum + bot.roundTrips, 0)
-    const wins = paperBots.reduce((sum, bot) => sum + bot.wins, 0)
-    return trips > 0 ? (wins / trips) * 100 : null
-  })()
-
-  const paperIds = new Set(paperBots.map((bot) => bot.id))
-  const flows = data.funding.filter((flow) => paperIds.has(flow.botId))
-  const deposits = flows.filter((flow) => flow.amount > 0).reduce((sum, flow) => sum + flow.amount, 0)
-  const withdrawals = flows.filter((flow) => flow.amount < 0).reduce((sum, flow) => sum - flow.amount, 0)
-
-  const kpis = [
-    { label: 'Money held now', value: moneyExact(heldNow), hint: 'cash + open marks across paper bots' },
-    { label: 'Paper P&L', value: pnlText(paperPnl), hint: `${pct(pilot > 0 ? (paperPnl / pilot) * 100 : 0)} on committed funding`, tone: mark(paperPnl) },
-    { label: 'Realized', value: pnlText(realized), tone: mark(realized), hint: '', },
-    { label: 'Unrealized', value: pnlText(unrealized), tone: mark(unrealized), hint: '', },
-    { label: 'Win rate', value: paperWinRate === null ? '—' : `${paperWinRate.toFixed(0)}%`, hint: '', },
-  ]
-
-  return (
-    <>
-      <p className="mt-3 rounded-tile border border-line bg-surface-2/60 px-3 py-2 text-[12.5px] text-muted">
-        Paper bots trade the simulation wallet. This tab audits them, but their equity and P&L are
-        <span className="font-medium text-fg"> never blended into</span> the money book — that stays live-routed capital only.
-      </p>
-
-      <div className="mt-3 grid grid-cols-2 gap-3 lg:grid-cols-5">
-        {kpis.map((kpi) => (
-          <Card key={kpi.label} className="flex h-[104px] flex-col justify-between p-4">
-            <p className="text-[13px] text-muted">{kpi.label}</p>
-            <div>
-              <p className={cx('text-[19px] font-semibold tracking-[-0.02em] tabular-nums', kpi.tone)}>{kpi.value}</p>
-              {kpi.hint && <p className="mt-0.5 text-[12px] text-faint">{kpi.hint}</p>}
-            </div>
-          </Card>
-        ))}
-      </div>
-
-      <div className="mt-3 grid gap-3 lg:grid-cols-3">
-        <Card className="p-5 lg:col-span-2">
-          <h2 className="text-[14px] font-semibold">Simulated wallet equity</h2>
-          <p className="mt-0.5 text-[12px] text-faint">Daily close across every paper bot · last 30 days</p>
-          <div className="mt-4">
-            {data.paperEquityCurve.length > 0 ? (
-              <AreaChart data={data.paperEquityCurve} format={money} />
-            ) : (
-              <EmptyState icon={<Wallet />} title="No paper history yet" description="Run a paper bot and this wallet curve builds daily." />
-            )}
-          </div>
-        </Card>
-        <Card className="p-5">
-          <h2 className="text-[14px] font-semibold">Funding &amp; reconciliation</h2>
-          <p className="mt-0.5 text-[12px] text-faint">Paper cash flows against the simulated wallet — the paper twin of the money book's ledger.</p>
-          <p className="mt-1 text-[11.5px] text-faint">deposits − withdrawals · {flows.length} flows on paper bots</p>
-          <p className="mt-1 text-[11.5px] text-faint">deposits {moneyExact(deposits)} · withdrawals {moneyExact(withdrawals)} · net {moneyExact(deposits - withdrawals)}</p>
-          <div className="mt-3 flex flex-col gap-1.5 text-[13px] tabular-nums">
-            <div className="flex items-center justify-between"><span className="text-muted">Committed funding</span><span>{moneyExact(deposits - withdrawals)}</span></div>
-            <div className="flex items-center justify-between"><span className="text-muted">Committed pilot funding</span><span>{moneyExact(pilot)}</span></div>
-            <div className="flex items-center justify-between border-t border-line pt-2"><span className="text-muted">+ Paper P&amp;L</span><span className={mark(paperPnl)}>{pnlText(paperPnl)}</span></div>
-            <div className="flex items-center justify-between border-t border-line pt-2 text-[13.5px] font-semibold"><span>= Money held now</span><span>{moneyExact(heldNow)}</span></div>
-          </div>
-        </Card>
-      </div>
-
-      <Card className="mt-3 overflow-hidden">
-        <div className="flex flex-wrap items-center justify-between gap-2 px-5 pt-5">
-          <div>
-            <h2 className="text-[14px] font-semibold">Paper bots — money held per bot</h2>
-            <p className="mt-0.5 text-[12px] text-faint">Total money each bot holds right now: idle cash plus its open positions at the mark.</p>
-          </div>
-          <Button size="sm" onClick={() => exportBotsCsv(data)}>
-            <Download className="size-3.5" />
-            Export CSV
-          </Button>
-        </div>
-        <div className="mt-3 overflow-x-auto">
-          <table className="w-full table-fixed text-left text-[13px]">
-            <thead>
-              <tr className="h-9 border-y border-line bg-bg/60 text-[12px] text-muted">
-                <th className="w-[24%] px-5 font-medium">Bot</th>
-                <th className="w-[9%] px-2 font-medium">State</th>
-                <th className="w-[9%] px-2 font-medium">Market</th>
-                <th className="w-[13%] px-2 text-right font-medium">Money held</th>
-                <th className="w-[11%] px-2 text-right font-medium">Idle cash</th>
-                <th className="w-[11%] px-2 text-right font-medium">Net P&L</th>
-                <th className="w-[9%] px-2 text-right font-medium">Win rate</th>
-                <th className="w-[8%] px-2 text-right font-medium">Fees</th>
-                <th className="w-[6%] px-2 text-right font-medium">Fills</th>
-                <th className="w-[10%] px-5 text-right font-medium" />
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-line">
-              {paperBots.map((bot) => {
-                const botPnl = bot.equity - (bot.capital - bot.netDeposits)
-                return (
-                  <tr key={bot.id} className="h-11 transition-colors hover:bg-surface-2/50">
-                    <td className="px-5">
-                      <button type="button" onClick={() => onOpen(bot.id)} className="block max-w-full truncate text-left font-medium transition-colors hover:text-accent">
-                        {bot.name}
-                      </button>
-                      <span className="block truncate text-[11.5px] text-faint">{bot.strategyName} · {bot.timeframe}</span>
-                    </td>
-                    <td className="px-2" title="Training: actively paper trading · Hangar: parked (backtesting or idle)">
-                      <Badge tone={activityTone[activityOf(bot)]} dot>
-                        {activityOf(bot)}
-                      </Badge>
-                    </td>
-                    <td className="px-2 text-muted">{bot.mode === 'paper' ? 'paper' : bot.mode}</td>
-                    <td className="px-2 text-right font-semibold tabular-nums">{moneyExact(bot.equity)}</td>
-                    <td className="px-2 text-right tabular-nums text-muted">{moneyExact(bot.cash)}</td>
-                    <td className={cx('px-2 text-right tabular-nums font-medium', mark(botPnl))}>{moneyExactPlain(botPnl)}</td>
-                    <td className="px-2 text-right tabular-nums text-muted">{bot.winRate === null ? '—' : `${bot.winRate.toFixed(0)}%`}</td>
-                    <td className="px-2 text-right tabular-nums text-faint">{moneyExactPlain(bot.fees)}</td>
-                    <td className="px-2 text-right tabular-nums text-muted">{bot.fills}</td>
-                    <td className="px-5 text-right">
-                      <Button size="sm" onClick={() => onOpen(bot.id)}>
-                        Analyze
-                      </Button>
-                    </td>
-                  </tr>
-                )
-              })}
-            </tbody>
-          </table>
-          {paperBots.length === 0 && (
-            <EmptyState icon={<Wallet />} title="No paper bots" description="Launch a bot in paper mode and it audits here without touching the money book." />
-          )}
-        </div>
-      </Card>
-    </>
-  )
-}
-
 /** Per-bot audit card → audit.csv: one row per bot plus a totals row, with
  * the funding reconciliation columns the screen reconciles against. */
 function exportBotsCsv(data: Portfolio) {
@@ -1203,12 +1139,12 @@ function PositionsCard({ positions, title, countLabel }: { positions: PortfolioP
         <table className="w-full table-fixed text-left text-[13px]">
           <thead>
             <tr className="h-9 border-y border-line bg-bg/60 text-[12px] text-muted">
-              <th className="w-[24%] px-5 font-medium">Symbol</th>
-              <th className="w-[18%] px-2 font-medium">Bot</th>
-              <th className="w-[13%] px-2 text-right font-medium">Qty</th>
-              <th className="w-[15%] px-2 text-right font-medium">Avg</th>
-              <th className="w-[14%] px-2 text-right font-medium">Mark</th>
-              <th className="w-[16%] px-5 text-right font-medium">Unrealised</th>
+              <th scope="col" className="w-[24%] px-5 font-medium">Symbol</th>
+              <th scope="col" className="w-[18%] px-2 font-medium">Bot</th>
+              <th scope="col" className="w-[13%] px-2 text-right font-medium">Qty</th>
+              <th scope="col" className="w-[15%] px-2 text-right font-medium">Avg</th>
+              <th scope="col" className="w-[14%] px-2 text-right font-medium">Mark</th>
+              <th scope="col" className="w-[16%] px-5 text-right font-medium">Unrealised</th>
             </tr>
           </thead>
           <tbody className="divide-y divide-line">
@@ -1250,13 +1186,13 @@ function LedgerCard({ transactions, countLabel }: { transactions: PortfolioTrans
         <table className="w-full table-fixed text-left text-[13px]">
           <thead>
             <tr className="h-9 border-y border-line bg-bg/60 text-[12px] text-muted">
-              <th className="w-[17%] px-5 font-medium">Time</th>
-              <th className="w-[18%] px-2 font-medium">Bot</th>
-              <th className="w-[14%] px-2 font-medium">Symbol</th>
-              <th className="w-[9%] px-2 text-right font-medium">Side</th>
-              <th className="w-[12%] px-2 text-right font-medium">Price</th>
-              <th className="w-[10%] px-2 text-right font-medium">Fee</th>
-              <th className="w-[14%] px-5 text-right font-medium">P&L</th>
+              <th scope="col" className="w-[17%] px-5 font-medium">Time</th>
+              <th scope="col" className="w-[18%] px-2 font-medium">Bot</th>
+              <th scope="col" className="w-[14%] px-2 font-medium">Symbol</th>
+              <th scope="col" className="w-[9%] px-2 text-right font-medium">Side</th>
+              <th scope="col" className="w-[12%] px-2 text-right font-medium">Price</th>
+              <th scope="col" className="w-[10%] px-2 text-right font-medium">Fee</th>
+              <th scope="col" className="w-[14%] px-5 text-right font-medium">P&L</th>
             </tr>
           </thead>
           <tbody className="divide-y divide-line">

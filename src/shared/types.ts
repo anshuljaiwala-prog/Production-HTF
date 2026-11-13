@@ -10,6 +10,11 @@ export const TIMEFRAMES: { key: Timeframe; label: string }[] = [
   { key: '1d', label: '1 day' },
 ]
 
+/** How many markets one bot tracks at once. Enforced by the launch and patch
+ * ingress and mirrored by the symbol picker, so the form never offers a
+ * selection the server would trim. */
+export const MAX_TRACKED_SYMBOLS = 6
+
 /** Lifecycle column on the strategy board. */
 export type BotStage = 'draft' | 'backtest' | 'paper' | 'live'
 export const BOT_STAGES: { key: BotStage; label: string }[] = [
@@ -50,7 +55,7 @@ export type ParamValue = number | string | boolean
 /** Asset classes the simulated market covers. Options are modelled as
  * constant-maturity synthetic derivatives over an underlying; everything
  * else is a plain instrument with its own synthetic price path. */
-export type AssetKind = 'crypto' | 'equity' | 'etf' | 'fund' | 'commodity' | 'fx' | 'option'
+export type AssetKind = 'crypto' | 'equity' | 'etf' | 'fund' | 'commodity' | 'fx' | 'option' | 'future'
 
 export const ASSET_CLASSES: { key: AssetKind; label: string; hint: string }[] = [
   { key: 'crypto', label: 'Crypto', hint: '24/7 spot pairs' },
@@ -60,7 +65,21 @@ export const ASSET_CLASSES: { key: AssetKind; label: string; hint: string }[] = 
   { key: 'commodity', label: 'Commodities', hint: 'metals, energy' },
   { key: 'fx', label: 'Forex', hint: 'multi-nation currency pairs' },
   { key: 'option', label: 'Options', hint: 'calls & puts on the same synthetic feed' },
+  { key: 'future', label: 'Futures', hint: 'expiry-dated contracts (BSE index futures)' },
 ]
+
+/** Cached state of one exchange's instrument master (currently BSE's BSE_FO
+ * contracts), as loaded from the venue into the workspace database. */
+export interface InstrumentMasterStatus {
+  /** Live contracts stored: futures, calls and puts. */
+  contracts: number
+  /** When the master was last downloaded, epoch ms; null when never loaded. */
+  syncedAt: number | null
+  /** How long a cached master is trusted before it is reloaded. */
+  ttlMs: number
+  /** Underlyings the master carries derivatives for. */
+  underlyings: string[]
+}
 
 export interface SymbolMeta {
   symbol: string
@@ -233,7 +252,23 @@ export interface Connection {
   /** API key shown masked (last four only); the secret is never returned. */
   keyMasked: string
   mode: BotMode
+  /** Which venue environment the adapter talks to: exchange sandbox or the
+   * production order API. */
+  environment: VenueEnvironment
   createdAt: number
+}
+
+export type VenueEnvironment = 'sandbox' | 'production'
+
+/** How many exchanges one live bot can route across (best price wins). */
+export const MAX_BOT_VENUES = 4
+
+/** One exchange connection a bot can route an order through. */
+export interface BotVenue {
+  connectionId: string
+  name: string
+  exchange: string
+  environment: VenueEnvironment
 }
 
 export interface Bot {
@@ -250,8 +285,14 @@ export interface Bot {
   stage: BotStage
   status: BotStatus
   position: number
+  /** Primary venue (first in `venueIds`), kept for older call sites. */
   connectionId: string | null
   connectionName: string | null
+  /** Every venue this bot may route through, primary first. */
+  venueIds: string[]
+  venues: BotVenue[]
+  /** Consecutive risk-off reads, for the agent gate's damping. */
+  riskOffStreak: number
   cash: number
   equity: number
   initialEquity: number
@@ -281,7 +322,8 @@ export interface Trade {
   id: string
   botId: string | null
   symbol: string
-  side: 'buy' | 'sell'
+  /** `short` opens a negative book, `cover` closes it. */
+  side: 'buy' | 'sell' | 'short' | 'cover'
   qty: number
   price: number
   fee: number
@@ -432,8 +474,11 @@ export interface PortfolioTransaction {
   id: string
   botId: string | null
   botName: string | null
+  /** Always the live book ('live') — present so clients can verify no
+   * paper fill leaked into the money ledger. */
+  mode?: 'paper' | 'live'
   symbol: string
-  side: 'buy' | 'sell'
+  side: 'buy' | 'sell' | 'short' | 'cover'
   qty: number
   price: number
   fee: number
@@ -465,17 +510,8 @@ export interface Portfolio {
     bots: number
     activeBots: number
     openPositions: number
-    /** Paper-mode bots sit beside the real book: their simulated wallet
-     * performance must not distort actual portfolio metrics, so they're
-     * counted here instead of in the totals above. */
-    paperBots: number
-    paperCapital: number
-    paperEquity: number
   }
   equity: { label: string; value: number }[]
-  /** Aggregate daily equity of paper-mode bots only — the simulated wallet
-   * ledger that sits beside the actual book. Empty when no paper bots exist. */
-  paperEquityCurve: { label: string; value: number }[]
   /** One row per ISO week covered by the stored flows/trades: net funding
    * (deposits − withdrawals) against realized P&L for the same week, so the
    * fleet overview can reconcile cash movement against trading results. */
@@ -483,6 +519,30 @@ export interface Portfolio {
   bots: PortfolioBotAudit[]
   positions: PortfolioPosition[]
   transactions: PortfolioTransaction[]
+  /** Live-book cash flows; paper bots are not part of this ledger. */
+  funding: CashFlow[]
+}
+
+/** The simulated wallet, reported separately under Backtesting. It is never
+ * mixed into the Portfolio page's money book. */
+export interface PaperBook {
+  summary: {
+    bots: number
+    capital: number
+    equity: number
+    pnl: number
+    realizedPnl: number
+    unrealizedPnl: number
+    fees: number
+    fills: number
+    roundTrips: number
+    wins: number
+    winRate: number | null
+    netFunding: number
+    openPositions: number
+  }
+  equity: { label: string; value: number }[]
+  bots: PortfolioBotAudit[]
   funding: CashFlow[]
 }
 
@@ -490,4 +550,542 @@ export interface Me {
   user: { sub: string; name?: string; email?: string; picture?: string }
   workspace: { name: string; seededAt: number | null }
   capabilities: { database: boolean; files: boolean; auth: 'freebuff' | 'development' }
+}
+
+// --- Pattern scan & event linkage -------------------------------------------
+
+/** What a symbol's recent tape looks like, measured not guessed: a crash is a
+ * deep drawdown with a fast recent leg, a hype the mirror, a squeeze
+ * compressed volatility, etc. Every regime carries the numbers behind it. */
+export type PatternRegime = 'crash' | 'selloff' | 'hype' | 'breakout' | 'squeeze' | 'uptrend' | 'downtrend' | 'range'
+
+export const PATTERN_REGIMES: { key: PatternRegime; label: string; hint: string }[] = [
+  { key: 'crash', label: 'Crash', hint: 'deep drawdown with a fast recent leg' },
+  { key: 'selloff', label: 'Selloff', hint: 'marked drawdown, slower than a crash' },
+  { key: 'hype', label: 'Hype', hint: 'fast run-up off a recent low' },
+  { key: 'breakout', label: 'Breakout', hint: 'new high with expanding volatility' },
+  { key: 'squeeze', label: 'Squeeze', hint: 'compressed volatility, no direction' },
+  { key: 'uptrend', label: 'Uptrend', hint: 'rising slope with contained drawdown' },
+  { key: 'downtrend', label: 'Downtrend', hint: 'falling slope with contained run-up' },
+  { key: 'range', label: 'Range', hint: 'no dominant direction' },
+]
+
+/** One symbol's pattern read over the bot's own timeframe and history window. */
+export interface SymbolPattern {
+  symbol: string
+  kind: AssetKind
+  /** Last closed price. */
+  price: number
+  /** Return across the whole analysis window, in percent. */
+  changePct: number
+  /** Return over the recent leg (last RECENT_BARS of the window), in percent. */
+  recentPct: number
+  /** Price return over the last 50 bars, in percent. */
+  trendPct: number
+  /** Close below the window high, in percent (0 when at the high). */
+  drawdownPct: number
+  /** Close above the window low, in percent (0 when at the low). */
+  runupPct: number
+  /** Realised per-bar volatility in percent. */
+  volPct: number
+  /** Where `volPct` sits among the window's other 20-bar blocks, 0–100. */
+  volPercentile: number
+  /** Recent volatility as a multiple of the window's median block volatility —
+   * a percentile alone can call a calm tape a spike. */
+  volVsMedian: number
+  /** How far the latest close sits from the recent window's mean, in standard
+   * deviations. Null when the window carries no dispersion. */
+  priceZ: number | null
+  /** The same z-score for volume: >0 heavy participation, <0 thin. Null when
+   * the tape carries no usable volume. */
+  volZ: number | null
+  /** A violent price excursion (|priceZ| ≥ 2.5) on thin volume (volZ < 0.5):
+   * the tape was pushed through an empty book, not confirmed by participation. */
+  liquidityVacuum: boolean
+  /** Bars since the window high / low — how fast the move happened. */
+  barsSinceHigh: number
+  barsSinceLow: number
+  regime: PatternRegime
+  /** How far past the rule's threshold this read sits, 0–100. */
+  confidence: number
+  /** Human-readable facts behind the classification, with the numbers. */
+  evidence: string[]
+  /** Last closes, sampled for a sparkline. */
+  spark: number[]
+  /** Position the bot holds in this symbol (0 when flat). */
+  positionQty: number
+}
+
+export type EpisodeKind = 'crash' | 'hype'
+
+/** A large historical crash or hype the scanner compares the current tape
+ * against. Figures are the published peak-to-trough (or low-to-peak) moves
+ * and rough durations of the episode. */
+export interface CrisisEpisode {
+  id: string
+  name: string
+  kind: EpisodeKind
+  /** Period label, e.g. "Sep 1929 – Jul 1932". */
+  period: string
+  /** Peak-to-trough for crashes (negative) / low-to-peak for hypes (positive). */
+  magnitudePct: number
+  /** Days the move took, start to trough/peak. */
+  days: number
+  /** Realised volatility as a multiple of the preceding calm baseline. */
+  volMultiple: number
+  /** Markets most associated with the episode. */
+  assets: string[]
+  /** One line on what happened. */
+  what: string
+}
+
+/** A tracked symbol scored against one episode. Direction must agree: a
+ * drawdown is only compared with crashes, a run-up only with hypes. */
+export interface EpisodeMatch {
+  episode: CrisisEpisode
+  symbol: string
+  /** 0–100 shape similarity (magnitude, speed, volatility multiple). */
+  similarity: number
+  /** The current reading that produced the score. */
+  why: string
+}
+
+/** Something the market is doing right now, derived from the same stored feed
+ * the bots trade — the events a pattern read is linked to. */
+export interface MarketEvent {
+  id: string
+  kind: 'drawdown' | 'runup' | 'vol-spike' | 'stress' | 'breadth'
+  severity: 'info' | 'warn' | 'alert'
+  headline: string
+  detail: string
+  symbols: string[]
+  /** The measured number behind it (percent, or a count for breadth). */
+  value: number
+  at: number
+}
+
+/** Everything the bot detail page shows for a multi-symbol pattern scan. */
+export interface BotPatterns {
+  botId: string
+  timeframe: Timeframe
+  generatedAt: number
+  window: { from: number; to: number; bars: number }
+  symbols: SymbolPattern[]
+  /** Best historic crash/hype analogs across every tracked symbol. */
+  episodes: EpisodeMatch[]
+  events: MarketEvent[]
+}
+
+/** The regimes the fleet ranking acts on: tapes an operator has to react to
+ * now, rather than the full regime vocabulary of a single-symbol scan. */
+export type FleetRegime = Extract<PatternRegime, 'crash' | 'hype' | 'squeeze'>
+
+export const FLEET_REGIMES: { key: FleetRegime; label: string; hint: string }[] = [
+  { key: 'crash', label: 'Crash', hint: 'deep drawdown with a fast recent leg' },
+  { key: 'hype', label: 'Hype', hint: 'fast run-up off a recent low' },
+  { key: 'squeeze', label: 'Squeeze', hint: 'compressed volatility, direction not set' },
+]
+
+/** One bot in the fleet pattern ranking, scored on the strongest crash, hype or
+ * squeeze read among the markets it tracks. */
+export interface FleetPatternEntry {
+  rank: number
+  botId: string
+  name: string
+  strategyName: string
+  status: BotStatus
+  stage: BotStage
+  mode: BotMode
+  timeframe: Timeframe
+  /** The strongest target-regime market among this bot's tracked symbols. */
+  symbol: string
+  regime: FleetRegime
+  /** Composite 0–100: regime confidence blended with move intensity, lifted
+   * when the bot actually holds the market. */
+  score: number
+  /** The classifier's confidence in the regime read, 0–100. */
+  confidence: number
+  /** How far past the regime threshold the tape sits, 0–100. */
+  intensity: number
+  /** Position held in `symbol` (0 when flat). */
+  positionQty: number
+  /** Other tracked markets also reading crash, hype or squeeze. */
+  others: string[]
+  /** Target-regime counts across every market this bot tracks. */
+  breakdown: Record<FleetRegime, number>
+  changePct: number
+  recentPct: number
+  drawdownPct: number
+  runupPct: number
+  volPercentile: number
+  /** Volume z-score behind this read — see SymbolPattern.volZ. */
+  volZ: number | null
+  /** Violent move on thin volume; the regime read is unconfirmed. */
+  liquidityVacuum: boolean
+  evidence: string[]
+  spark: number[]
+}
+
+/** Fleet-wide pattern ranking: which bots are trading markets that read crash,
+ * hype or squeeze right now, strongest tape first. */
+export interface FleetPatternRanking {
+  generatedAt: number
+  /** Bars analysed per market. */
+  bars: number
+  /** Bots evaluated in this scan. */
+  scanned: number
+  /** Bots with at least one target-regime market. */
+  matched: number
+  /** Bots whose strongest read belongs to each regime. */
+  counts: Record<FleetRegime, number>
+  /** Matched bots that are currently running. */
+  active: number
+  /** Matched bots holding a position in one of those markets. */
+  positions: number
+  items: FleetPatternEntry[]
+}
+
+/** One historical bar imported into the API database (bulk data upload). */
+export interface ImportedBar {
+  symbol: string
+  timeframe: Timeframe
+  t: number
+  o: number
+  h: number
+  l: number
+  c: number
+  v: number
+}
+
+/** Result of a bulk import: how many rows landed, and why the rest were
+ * screened out — duplicates (same bucket, same bar), invalid (non-finite
+ * prices, broken OHLC), unknown symbol/timeframe. */
+export interface MarketImportResult {
+  accepted: number
+  updated: number
+  duplicates: { index: number; reason: string }[]
+  invalid: { index: number; reason: string }[]
+}
+
+/** What the API database holds today, per symbol+timeframe bucket. */
+export interface StoredBarsSummary {
+  symbol: string
+  timeframe: Timeframe
+  bars: number
+  first: number
+  last: number
+}
+
+// --- Tool box (execution plans) & strategy book ------------------------------
+
+/** A trading execution plan in the tool box: the concrete bot configuration to
+ * run when the pattern scanner recognises the plan's regime on a tracked
+ * market. Plans exist as ready-to-deploy configs — the book decides when they
+ * fire, execution copies them onto a bot. */
+export interface Playbook {
+  id: string
+  name: string
+  /** The regime read that calls for this plan. */
+  regime: PatternRegime
+  strategyKey: string
+  params: Record<string, ParamValue>
+  /** The bar timeframe the plan wants to run on; null follows the bot's own. */
+  timeframe: Timeframe | null
+  /** Position sizing as a percent of equity, per fill. */
+  riskPct: number
+  /** Why this response, in one operator-readable line. */
+  note: string
+  source: 'builtin' | 'custom'
+  createdAt: number
+}
+
+/** One regime's entry in the strategy book: which plan fires when that
+ * regime is recognised and execution follows. `overridden` marks an entry
+ * the operator has replaced from the tool box defaults. */
+export interface BookEntry {
+  regime: PatternRegime
+  playbook: Playbook
+  strategyName: string
+  overridden: boolean
+}
+
+/** A live, actionable read from the strategy book: a recognised pattern on a
+ * tracked market whose regime has a book entry, on a bot not already trading
+ * it — the row the operator executes to trade the pattern. */
+export interface BookSignal {
+  botId: string
+  botName: string
+  botStatus: BotStatus
+  symbol: string
+  regime: PatternRegime
+  /** The classifier's confidence in the regime read, 0–100. */
+  confidence: number
+  playbook: Playbook
+  strategyName: string
+  /** The bot's tracked capital for sizing an executed plan against. */
+  botCapital: number
+  /** Why the scanner classed this market into the regime, with numbers. */
+  evidence: string[]
+  price: number
+  changePct: number
+  drawdownPct: number
+  runupPct: number
+  spark: number[]
+}
+
+/** Tool box payload: every plan the operator can deploy, builtin first. */
+export interface ToolBox {
+  items: Playbook[]
+
+  /** How many regimes of the book this box's plans cover. */
+  bookCoverage: number
+}
+
+/** Current-affairs payload: today's cross-market snapshot plus a world news
+ * wire (live RSS when the sandbox can reach it, market-driven wire otherwise). */
+export interface Affairs {
+  generatedAt: number
+  newsSource: 'rss' | 'feed'
+  snapshot: { symbol: string; label: string; kind: string; price: number; dayPct: number }[]
+  regions: { region: string; proxy: string; dayPct: number; series: number[] }[]
+  movers: { symbol: string; dayPct: number; price: number }[]
+  news: { title: string; source: string; link: string; publishedAt: number }[]
+}
+
+// --- Agent shell (ported from market_agent_env) -----------------------------
+
+/** The macro regime the expert system derives from cross-market breadth. */
+export type MacroRegime = 'RISK_ON_BOOM' | 'NEUTRAL' | 'RISK_OFF_CONTAGION'
+
+/** Volume/price dislocation read (the Python app's AnomalyDetector). */
+export type AnomalySignal = 'CRASH_TRIGGER' | 'BOOM_TRIGGER' | 'LIQUIDITY_VACUUM' | 'NORMAL_VARIATION'
+
+/** A tape event pinned for the inference rules. Rebuilt from the market on
+ * every environment read — there is no decaying news store to age. */
+export interface NewsPin {
+  id: string
+  ticker: string
+  title: string
+  summary: string
+  source: string
+  timestamp: number
+  impactLevel: 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL'
+  /** −1…1. */
+  sentiment: number
+}
+
+/** One fired production rule: the fact it derived and the action it suggests. */
+export interface AgentInference {
+  inferredFact: string
+  bias: string
+  salience: number
+  nextAction: string
+  triggeredByRule: string
+}
+
+/** One market's technical read inside the environment. */
+export interface AgentMarketRead {
+  symbol: string
+  /** Change over the last 24 bars, in percent. */
+  changePct: number
+  rsi: number
+  anomaly: { signal: AnomalySignal; details: string | null }
+}
+
+/** The facts the forward-chaining rules resolved against. */
+export interface AgentWorkingMemory {
+  ticker: string
+  institutionalPct: number
+  sentiment: number
+  rsi: number
+  affiliationsCount: number
+  anomalySignal: string
+  criticalNegativeNews: boolean
+  globalNegativeCount: number
+}
+
+/** Everything one environment read produced: the regime, the markets behind
+ * it, the pins it harvested, the facts it fired on and whether new buys are
+ * allowed. */
+export interface AgentRead {
+  generatedAt: number
+  regime: MacroRegime
+  markets: AgentMarketRead[]
+  /** Markets dislocated badly enough that bots trading them stand down. */
+  criticalMarkets: string[]
+  pins: NewsPin[]
+  inferences: AgentInference[]
+  workingMemory: AgentWorkingMemory
+  /** The focused company's ownership, affiliations and sentiment. */
+  company: AgentCompanyFacts
+  /** What each specialist analyst concluded, before arbitration. */
+  proposals: AgentProposal[]
+  /** The specialist that won, or null when none cleared the threshold. */
+  verdict: AgentVerdict
+  /** The company's most likely next strategic move. */
+  nextMove: CompanyMovePrediction
+  /** Rows the screener rejected before they reached the rules, by reason. */
+  screened: {
+    rejectedBars: number
+    rejectedPins: number
+    /** e.g. `{ bad_range: 2, out_of_order: 1 }`. */
+    barReasons: Record<string, number>
+    pinReasons: Record<string, number>
+  }
+}
+
+/** The gate's verdict for one bot (or, with no symbols, the macro view). */
+export interface AgentGateVerdict {
+  blocked: boolean
+  /** Why entries are held back, or null when they are allowed. */
+  reason: string | null
+  /** Consecutive risk-off checks, to persist and pass back on the next read. */
+  streak: number
+}
+
+/** The specialised analysts of the expert system (market_agent_env's bots.py).
+ * Each reads one slice of the environment and proposes a direction with the
+ * conviction its own facts support. */
+export type SpecialistAgent = 'ownership' | 'anomaly' | 'news' | 'move'
+
+export interface AgentProposal {
+  agent: SpecialistAgent
+  /** −1…1. Negative is bearish, positive bullish. */
+  bias: number
+  /** 0…1 — how strongly the agent's own measured facts back its bias. Derived
+   * from those facts, never assigned by hand. */
+  conviction: number
+  rationale: string
+  /** The numbers behind the proposal, so a reader can check the arithmetic. */
+  facts: string[]
+  /** Stable ids of the facts each entry in `facts` came from, e.g.
+   * `ownership:institutional_pct` or `news:<pin id>` — so a trace can say which
+   * inputs a proposal actually used, not just that it had some. */
+  factIds: string[]
+}
+
+/** Which specialist won the arbitration, and on what. */
+export interface AgentVerdict {
+  winner: SpecialistAgent | null
+  bias: number
+  conviction: number
+  rationale: string
+  /** Proposals below this conviction never win. */
+  threshold: number
+}
+
+export interface CompanyMoveCandidate {
+  move: string
+  /** 0…1. */
+  probability: number
+  rationale: string
+}
+
+/** The company's most likely next strategic move. `probability` is always
+ * present — with no ownership facts it is the status-quo baseline and
+ * `factsAvailable` says why, rather than the prediction disappearing. */
+export interface CompanyMovePrediction {
+  move: string
+  probability: number
+  rationale: string
+  candidates: CompanyMoveCandidate[]
+  factsAvailable: boolean
+}
+
+/** The company knowledge the environment holds for one ticker. */
+export interface AgentCompanyFacts {
+  ticker: string
+  ownership: { holder: string; percentage: number; holderType: string }[]
+  affiliations: string[]
+  sentimentScore: number
+  /** Sum of institutional stakes, 0…1. */
+  institutionalPct: number
+  /** False when this ticker has no seeded knowledge: nothing is inferred. */
+  factsAvailable: boolean
+}
+
+/** A pin as the environment stores it: the same tape event, with how long it
+ * has been held and how many reads re-saw it. */
+export interface EnvironmentPin extends NewsPin {
+  firstSeen: number
+  lastSeen: number
+  reads: number
+}
+
+/** Live environment state, as the Durable Object holds it between requests. */
+export interface EnvironmentState {
+  generatedAt: number
+  controls: { paused: boolean; pauseBuys: boolean }
+  /** The last read the environment performed. */
+  read: AgentRead
+  pins: EnvironmentPin[]
+}
+
+// --- Decision trace & prediction calibration ---------------------------------
+
+/** Why a signal the strategy emitted never filled. */
+export type TraceRejectReason = 'gate' | 'sizing' | 'fill_cap' | 'live_short' | 'no_position'
+
+/** One symbol's outcome inside a closed bar. */
+export interface TraceDecision {
+  symbol: string
+  action: 'buy' | 'sell' | 'short' | 'cover' | 'hold'
+  /** The strategy's own reason for the signal, if it gave one. */
+  reason: string | null
+  /** Size the engine placed, or null when nothing was placed. */
+  qty: number | null
+  fill: boolean
+  reject: TraceRejectReason | null
+}
+
+/** One closed bar's decision, as the engine made it: the gate, every specialist
+ * proposal with the fact ids behind it, the arbitration result and what each
+ * symbol did. */
+export interface AgentDecisionTrace {
+  botId: string
+  botName: string
+  /** Bar close time, ms. */
+  at: number
+  gate: AgentGateVerdict
+  proposals: AgentProposal[]
+  verdict: AgentVerdict
+  decisions: TraceDecision[]
+}
+
+/** Predicted-probability bucket vs the frequency it actually happened. */
+export interface PredictionBin {
+  from: number
+  to: number
+  count: number
+  /** Mean probability the forecasts in this bucket carried. */
+  meanPredicted: number
+  /** Share of them whose predicted event actually happened. */
+  observed: number
+}
+
+export interface ScoredPrediction {
+  symbol: string
+  /** Bar close the prediction was made at. */
+  at: number
+  move: string
+  probability: number
+  returnPct: number | null
+  outcome: boolean | null
+}
+
+/** How well the always-on move probability has tracked what followed. */
+export interface PredictionCalibration {
+  /** Rows scored, and the window the aggregate covers. */
+  resolved: number
+  /** Mean squared error of the probabilities; 0 is perfect, 0.25 is a coin. */
+  brier: number | null
+  /** Brier score of a constant 0.5 forecast, for comparison. */
+  baseline: number
+  bins: PredictionBin[]
+  latest: ScoredPrediction[]
+}
+
+export interface EnvironmentTrace {
+  traces: AgentDecisionTrace[]
+  calibration: PredictionCalibration
 }

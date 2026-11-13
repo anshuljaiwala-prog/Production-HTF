@@ -84,68 +84,78 @@ workspace.get('/overview', async (c) => {
 
   let bots = await loadBots(db, owner)
   const running = bots.filter((b) => b.status === 'running').slice(0, 12)
-  for (const bot of running) await advanceBot(db, owner, bot)
+  for (const bot of running) await advanceBot(db, owner, bot, { secretsKey: c.env.SECRETS_KEY })
   if (running.length) bots = await loadBots(db, owner)
 
   const windowStart = startOfDay.getTime() - (windowDays - 1) * DAY
   const [today, positions, stages, events, points] = await db.batch([
-    db.prepare(`SELECT COALESCE(SUM(pnl), 0) AS v FROM trades WHERE owner_sub = ? AND pnl IS NOT NULL AND created_at >= ?`).bind(owner, dayStart),
-    db.prepare(`SELECT symbol, qty, avg_price FROM positions WHERE owner_sub = ?`).bind(owner),
-    db.prepare(`SELECT stage, COUNT(*) AS n FROM bots WHERE owner_sub = ? GROUP BY stage`).bind(owner),
+    // P&L today is a money-book KPI: paper bots run in the simulated wallet
+    // (reported under Backtesting) and never enter the dashboard.
+    db.prepare(`SELECT COALESCE(SUM(pnl), 0) AS v FROM trades WHERE owner_sub = ? AND pnl IS NOT NULL AND created_at >= ? AND bot_id IN (SELECT id FROM bots WHERE owner_sub = ? AND mode = 'live')`).bind(owner, dayStart, owner),
+    // Open-position marks feed money-book KPIs only — paper holdings stay
+    // inside their bots' audit rows.
+    db.prepare(`SELECT symbol, qty, avg_price, mark_price FROM positions WHERE owner_sub = ? AND bot_id IN (SELECT id FROM bots WHERE owner_sub = ? AND mode = 'live')`).bind(owner, owner),
+    db.prepare(`SELECT stage, COUNT(*) AS n FROM bots WHERE owner_sub = ? AND mode = 'live' GROUP BY stage`).bind(owner),
     db
       .prepare(
         `SELECT e.*, b.name AS bot_name FROM bot_events e JOIN bots b ON b.id = e.bot_id
-         WHERE e.owner_sub = ? ORDER BY e.created_at DESC, e.id DESC LIMIT 12`,
+         WHERE e.owner_sub = ? AND b.mode = 'live' ORDER BY e.created_at DESC, e.id DESC LIMIT 12`,
       )
       .bind(owner),
     db
-      .prepare(`SELECT bot_id, at, value FROM equity_points WHERE owner_sub = ? AND at >= ? ORDER BY at ASC LIMIT ${windowDays > EQUITY_WINDOW_DAYS ? 12_000 : 4_000}`)
-      .bind(owner, windowStart),
+      .prepare(
+        `SELECT bot_id, at, value FROM equity_points WHERE owner_sub = ? AND at >= ?
+           AND bot_id IN (SELECT id FROM bots WHERE owner_sub = ? AND mode = 'live') ORDER BY at ASC LIMIT ${windowDays > EQUITY_WINDOW_DAYS ? 12_000 : 4_000}`,
+      )
+      .bind(owner, windowStart, owner),
   ])
 
   const positionRows = (positions.results ?? []) as Row[]
   // Day P&L: fills closed today plus what open positions are worth right now.
-  const unrealized = positionRows.reduce(
-    (sum, row) => sum + (quote(String(row.symbol), t) - Number(row.avg_price)) * Number(row.qty),
-    0,
-  )
+  // Open positions are marked at the venue price the engine stored; the feed
+  // is only a fallback for rows that predate stored marks.
+  const unrealized = positionRows.reduce((sum, row) => {
+    const storedMark = row.mark_price === null || row.mark_price === undefined ? null : Number(row.mark_price)
+    const mark = storedMark !== null && Number.isFinite(storedMark) && storedMark > 0 ? storedMark : quote(String(row.symbol), t)
+    return sum + (mark - Number(row.avg_price)) * Number(row.qty)
+  }, 0)
   const realizedToday = Number((today.results[0] as { v: number }).v ?? 0)
 
   // Deployed capital counts only live bots — paper bots and backtests play
   // with the simulation pot, not the workspace's real(ish) money.
   const liveBots = bots.filter((b) => b.mode === 'live')
   const capitalDeployed = liveBots.reduce((sum, b) => sum + b.equity, 0)
-  const wins = bots.reduce((sum, b) => sum + b.wins, 0)
-  const roundTrips = bots.reduce((sum, b) => sum + b.roundTrips, 0)
+  const wins = liveBots.reduce((sum, b) => sum + b.wins, 0)
+  const roundTrips = liveBots.reduce((sum, b) => sum + b.roundTrips, 0)
   const stageRows = stages.results as { stage: Dashboard['stageTotals'][number]['stage']; n: number }[]
 
   const body: Dashboard = {
     kpis: {
       capitalDeployed,
       liveBots: liveBots.length,
-      activeBots: bots.filter((b) => b.status === 'running').length,
+      activeBots: liveBots.filter((b) => b.status === 'running').length,
       todayPnl: realizedToday + unrealized,
       winRate: roundTrips > 0 ? (wins / roundTrips) * 100 : null,
       openPositions: positionRows.length,
     },
-    equity: buildEquitySeries(bots, points.results as Row[], windowStart, t),
+    equity: buildEquitySeries(liveBots, points.results as Row[], windowStart, t),
     stageTotals: (['draft', 'backtest', 'paper', 'live'] as const).map((stage) => ({
       stage,
       count: stageRows.find((r) => r.stage === stage)?.n ?? 0,
     })),
-    // Operator vocabulary for the whole fleet, not just the attention slice.
-    // Paper bots live in the training hangar: running = training, parked = hangar.
+    // Operator vocabulary for the live book. Paper bots are training data and
+    // are reported under Backtesting, so their hangar/training counts are 0.
     fleet: {
-      running: bots.filter((b) => b.mode === 'live' && b.status === 'running').length,
-      paused: bots.filter((b) => b.mode === 'live' && b.status !== 'running' && activityOf(b) === 'inactive').length,
-      grounded: bots.filter((b) => b.mode === 'live' && b.status !== 'running' && activityOf(b) === 'grounded').length,
-      training: bots.filter((b) => b.mode === 'paper' && b.status === 'running').length,
-      hangar: bots.filter((b) => b.mode === 'paper' && b.status !== 'running').length,
-      paper: bots.filter((b) => b.mode === 'paper').length,
+      running: liveBots.filter((b) => b.status === 'running').length,
+      paused: liveBots.filter((b) => b.status !== 'running' && activityOf(b) === 'inactive').length,
+      grounded: liveBots.filter((b) => b.status !== 'running' && activityOf(b) === 'grounded').length,
+      training: 0,
+      hangar: 0,
+      paper: 0,
       live: liveBots.length,
-      total: bots.length,
+      total: liveBots.length,
     },
-    attention: bots
+    attention: liveBots
       .filter((b) => b.status === 'paused' || (b.status === 'running' && b.initialEquity > 0 && b.equity < b.initialEquity * 0.92))
       .slice(0, 5),
     events: ((events.results ?? []) as Row[]).map(mapEvent),

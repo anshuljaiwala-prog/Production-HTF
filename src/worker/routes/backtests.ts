@@ -5,6 +5,7 @@ import { backtestWindow, runBacktest } from '../backtest'
 import { id, mapBacktest, mapBot, now } from '../db'
 import type { AppContext } from '../env'
 import { HISTORY_YEARS, TIMEFRAME_MS, barsBetween, historyStart, normalizeSymbol } from '../market'
+import { barsForRun } from '../marketstore'
 import type { CustomRules } from '../strategies'
 import { applyCustomKnobs, parseRules, rulesToParams, sanitizeParams, strategyBy } from '../strategies'
 import type { AccuracyStat, Backtest, Candle, EquityPoint, ParamDef, ParamValue, RunMetrics, SimBudget, Timeframe } from '../../shared/types'
@@ -53,6 +54,10 @@ async function resolveBacktest(db: D1Database, row: Row): Promise<Row> {
   if (String(row.status) !== 'running') return row
   const backtest = mapBacktest(row)
   try {
+    // Imported bars overlay the synthetic feed so the run replays the same
+    // window the market API would serve — null when nothing was imported.
+    const { from, to } = backtestWindow(backtest.timeframe, backtest.from, backtest.to)
+    const bars = await barsForRun(db, backtest.symbol, backtest.timeframe, from, to + 1) ?? undefined
     const result = runBacktest({
       strategyKey: backtest.strategyKey,
       symbol: backtest.symbol,
@@ -61,6 +66,7 @@ async function resolveBacktest(db: D1Database, row: Row): Promise<Row> {
       capital: backtest.capital,
       from: backtest.from,
       to: backtest.to,
+      ...(bars && { bars }),
     })
     // Accuracy rides inside the metrics blob — no schema churn for it.
     const metricsJson = JSON.stringify({ ...result.metrics, accuracy: result.accuracy })
@@ -154,25 +160,28 @@ backtests.get('/:id/market', async (c) => {
   })
 })
 
-backtests.post('/', async (c) => {
-  const db = c.get('db')
-  const owner = c.get('user').sub
-  const body = await c.req.json<{
-    strategyKey?: string
-    symbol?: string
-    timeframe?: Timeframe
-    params?: Record<string, unknown>
-    capital?: number
-    from?: number
-    to?: number
-    name?: string
-    /** Upload a rules payload inline, pointing the run at the `custom`
-     * strategist with these rules instead of a catalog template. */
-    rules?: unknown
-  }>()
+/** One backtest queueing, shared by POST / and the bot-upload backtest
+ * intent: an uploaded config is scheduled by the exact same function a
+ * hand-made backtest goes through, so strategy support, symbol
+ * normalization, the sim pot and the five-year history bound all apply. */
+export interface BacktestSpec {
+  strategyKey?: string
+  symbol?: string
+  timeframe?: Timeframe
+  params?: Record<string, unknown>
+  capital?: number
+  from?: number
+  to?: number
+  name?: string
+  /** Upload a rules payload inline, pointing the run at the `custom`
+   * strategist with these rules instead of a catalog template. */
+  rules?: unknown
+}
+export type TrainSpecError = { error: string; message: string }
 
+export async function scheduleBacktest(db: D1Database, owner: string, body: BacktestSpec): Promise<{ backtest: Backtest } | TrainSpecError> {
   const strategy = strategyBy(String(body.strategyKey ?? ''))
-  if (!strategy) return c.json({ error: 'unknown_strategy', message: 'Pick a strategy from the catalog.' }, 400)
+  if (!strategy) return { error: 'unknown_strategy', message: 'Pick a strategy from the catalog.' }
 
   // Inline rules (uploaded strategy) route through the `custom` strategist.
   let rulesRules: CustomRules | null = null
@@ -182,36 +191,33 @@ backtests.post('/', async (c) => {
       rulesRules = parseRules(body.rules).rules
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Invalid rules.'
-      return c.json({ error: 'invalid_rules', message }, 400)
+      return { error: 'invalid_rules', message }
     }
     displayName = rulesRules.name
   }
 
   const timeframe = (body.timeframe ?? strategy.timeframes[Math.floor(strategy.timeframes.length / 2)]) as Timeframe
   if (!strategy.timeframes.includes(timeframe)) {
-    return c.json({ error: 'timeframe_unsupported', message: `${strategy.name} does not run on the ${timeframe} timeframe.` }, 400)
+    return { error: 'timeframe_unsupported', message: `${strategy.name} does not run on the ${timeframe} timeframe.` }
   }
 
   const symbol = normalizeSymbol(String(body.symbol ?? ''))
   if (!symbol) {
     const given = String(body.symbol ?? '').trim()
-    return c.json(
-      { error: 'unknown_symbols', message: given ? `"${given}" is not a tradeable symbol here — try catalog entries like BTC-USD or EUR-USD.` : 'Choose a symbol.' },
-      400,
-    )
+    return { error: 'unknown_symbols', message: given ? `"${given}" is not a tradeable symbol here — try catalog entries like BTC-USD or EUR-USD.` : 'Choose a symbol.' }
   }
 
   const capital = Number(body.capital)
   if (!Number.isFinite(capital) || capital < 100) {
-    return c.json({ error: 'invalid_capital', message: 'Starting capital must be at least $100.' }, 400)
+    return { error: 'invalid_capital', message: 'Starting capital must be at least $100.' }
   }
   // Runs draw from the simulation pot, never from workspace funding.
   const sim = await simBudget(db, owner)
   if (capital > sim.available) {
-    return c.json(
-      { error: 'sim_budget_exhausted', message: `Backtests draw from the simulation pot — $${sim.available.toLocaleString('en-US')} available of the $${SIM_BUDGET.toLocaleString('en-US')} pot. Delete old runs to free money.` },
-      400,
-    )
+    return {
+      error: 'sim_budget_exhausted',
+      message: `Backtests draw from the simulation pot — $${sim.available.toLocaleString('en-US')} available of the $${SIM_BUDGET.toLocaleString('en-US')} pot. Delete old runs to free money.`,
+    }
   }
 
   const clock = now()
@@ -220,10 +226,10 @@ backtests.post('/', async (c) => {
   // The platform retains HISTORY_YEARS of stored history — a run entirely
   // outside that window has no data to replay.
   if (to < historyStart(clock)) {
-    return c.json(
-      { error: 'outside_history', message: `Stored history covers the last ${HISTORY_YEARS} years — pick a period that reaches into it.` },
-      400,
-    )
+    return {
+      error: 'outside_history',
+      message: `Stored history covers the last ${HISTORY_YEARS} years — pick a period that reaches into it.`,
+    }
   }
   // Keep the run bounded: the engine caps a backtest at MAX_BARS bars, and a
   // user-entered range can never start before the retention edge as of now —
@@ -260,7 +266,15 @@ backtests.post('/', async (c) => {
     .run()
 
   const row = await db.prepare(`SELECT * FROM backtests WHERE id = ?`).bind(backtestId).first<Row>()
-  return privateJson(c, { backtest: row ? withName({ ...mapBacktest(row), strategyName: displayName }) : null }, 201)
+  return row
+    ? { backtest: withName({ ...mapBacktest(row), strategyName: displayName }) }
+    : { error: 'create_failed', message: 'Backtest could not be created.' }
+}
+
+backtests.post('/', async (c) => {
+  const result = await scheduleBacktest(c.get('db'), c.get('user').sub, await c.req.json<BacktestSpec>())
+  if ('error' in result) return c.json(result, 400)
+  return privateJson(c, { backtest: result.backtest }, 201)
 })
 
 // --- Training: grid search over stored history ------------------------------
@@ -292,23 +306,57 @@ interface OptimizerRun {
  * five-year history, scoring every combination on a train slice (70% of the
  * window) and a hold-out test slice (30%). Nothing is persisted — training
  * runs are in-memory and never allocate the simulation pot. */
-backtests.post('/optimize', async (c) => {
-  const db = c.get('db')
-  const owner = c.get('user').sub
-  const body = await c.req.json<{
-    strategyKey?: string
-    botId?: string
-    symbol?: string
-    timeframe?: Timeframe
-    capital?: number
-    params?: Record<string, unknown>
-    days?: number
-    objective?: 'return' | 'sharpe'
-    vary?: VaryParam[]
-    /** Upload a rules payload inline, pointing the run at the `custom`
-     * strategist with these rules instead of a catalog template. */
-    rules?: unknown
-  }>()
+/** Grid-search training, shared by POST /optimize and the bot-upload train
+ * intent. Trains an existing bot (botId), an uploaded rules payload (rules)
+ * or a composed config, sweeping a small parameter grid over the stored
+ * five-year history and scoring each combination on a train slice (70%) and
+ * a hold-out test slice (30%). Nothing is persisted — runs stay in-memory
+ * and never allocate the simulation pot. */
+export interface TrainSpec {
+  strategyKey?: string
+  botId?: string
+  symbol?: string
+  timeframe?: Timeframe
+  capital?: number
+  params?: Record<string, unknown>
+  days?: number
+  objective?: 'return' | 'sharpe'
+  vary?: VaryParam[]
+  /** Upload a rules payload inline, pointing the run at the `custom`
+   * strategist with these rules instead of a catalog template. */
+  rules?: unknown
+  /** No explicit grid supplied: default-sweep the first bounded numeric
+   * knob (3 values) so uploaded configs can train without a form. */
+  autoSweep?: boolean
+  /** Skip the full-window winner replay — the bulk upload path only wants
+   * per-row summaries, not every curve. */
+  slim?: boolean
+}
+
+export type TrainResult =
+  | {
+      source: {
+        strategyKey: string
+        strategyName: string
+        symbol: string
+        timeframe: Timeframe
+        capital: number
+        days: number
+        from: number
+        to: number
+        split: number
+        label: string
+      }
+      objective: 'return' | 'sharpe'
+      history: { years: number; from: number }
+      runs: OptimizerRun[]
+      bestIndex: number
+      best: { curve: EquityPoint[]; accuracy: AccuracyStat; metrics: RunMetrics } | null
+      knobs: { key: string; label: string; unit: string | null; values: number[] }[]
+    }
+  | { error: string; message: string; status?: 400 | 404 }
+
+export async function runTraining(db: D1Database, owner: string, body: TrainSpec): Promise<TrainResult> {
 
   // A bot config seeds every field: pick "train this bot" and its strategy,
   // market, timeframe, capital and params come straight off the bot.
@@ -326,7 +374,7 @@ backtests.post('/optimize', async (c) => {
     try {
       baseRules = parseRules(body.rules).rules
     } catch (error) {
-      return c.json({ error: 'invalid_rules', message: error instanceof Error ? error.message : 'Invalid rules.' }, 400)
+      return { error: 'invalid_rules', message: error instanceof Error ? error.message : 'Invalid rules.' }
     }
     strategyKey = 'custom'
     baseParams = rulesToParams(baseRules)
@@ -337,7 +385,7 @@ backtests.post('/optimize', async (c) => {
       .prepare(`SELECT * FROM bots WHERE id = ? AND owner_sub = ?`)
       .bind(body.botId, owner)
       .first<Row>()
-    if (!botRow) return c.json({ error: 'not_found', message: 'Bot not found.' }, 404)
+    if (!botRow) return { error: 'not_found', message: 'Bot not found.', status: 404 }
     const bot = mapBot(botRow)
     if (bot.strategyKey === 'custom') {
       // Custom bots carry their rules inline — same training path as an
@@ -345,7 +393,7 @@ backtests.post('/optimize', async (c) => {
       try {
         baseRules = parseRules(JSON.parse(String(bot.params.rules ?? ''))).rules
       } catch (error) {
-        return c.json({ error: 'invalid_rules', message: error instanceof Error ? error.message : 'The bot\u2019s rules payload is unreadable.' }, 400)
+        return { error: 'invalid_rules', message: error instanceof Error ? error.message : 'The bot\u2019s rules payload is unreadable.' }
       }
     }
     baseParams = bot.params
@@ -357,14 +405,14 @@ backtests.post('/optimize', async (c) => {
   }
 
   const strategy = strategyBy(strategyKey)
-  if (!strategy) return c.json({ error: 'unknown_strategy', message: 'Pick a strategy from the catalog.' }, 400)
+  if (!strategy) return { error: 'unknown_strategy', message: 'Pick a strategy from the catalog.' }
   const tf: Timeframe = timeframe ?? strategy.timeframes[Math.floor(strategy.timeframes.length / 2)]
   if (!strategy.timeframes.includes(tf)) {
-    return c.json({ error: 'timeframe_unsupported', message: `${strategy.name} does not run on the ${tf} timeframe.` }, 400)
+    return { error: 'timeframe_unsupported', message: `${strategy.name} does not run on the ${tf} timeframe.` }
   }
-  if (!symbol) return c.json({ error: 'symbol_required', message: 'Choose a symbol.' }, 400)
+  if (!symbol) return { error: 'symbol_required', message: 'Choose a symbol.' }
   if (!Number.isFinite(capital) || capital < 100) {
-    return c.json({ error: 'invalid_capital', message: 'Starting capital must be at least $100.' }, 400)
+    return { error: 'invalid_capital', message: 'Starting capital must be at least $100.' }
   }
 
   const days = Math.min(OPTIMIZE_DAYS_MAX, Math.max(OPTIMIZE_DAYS_MIN, Math.round(Number(body.days) || DEFAULTS[tf] * 2)))
@@ -373,28 +421,37 @@ backtests.post('/optimize', async (c) => {
   // Build the grid: 1–2 numeric knobs. Catalog strategies sweep their own
   // param schema; uploaded rules sweep their thresholds and stop/target.
   const knobDefs = strategy.key === 'custom' && baseRules ? customKnobDefs(baseRules) : strategy.params
-  const vary = (Array.isArray(body.vary) ? body.vary : []).slice(0, 2)
+  const varies = (Array.isArray(body.vary) ? body.vary : []).slice(0, 2)
+  const vary = varies.length > 0 ? varies : defaultSweep(knobDefs)
   if (vary.length === 0) {
-    return c.json({ error: 'nothing_to_train', message: 'Pick at least one parameter to sweep.' }, 400)
+    return { error: 'nothing_to_train', message: 'Pick at least one parameter to sweep.' }
   }
   const knobs: { def: ParamDef; values: number[] }[] = []
   for (const knob of vary) {
     const def = knobDefs.find((p) => p.key === knob.key)
     if (!def || def.type !== 'number') {
-      return c.json({ error: 'unknown_param', message: `"${knob.key}" is not a tunable numeric parameter of ${strategy.name}.` }, 400)
+      return { error: 'unknown_param', message: `"${knob.key}" is not a tunable numeric parameter of ${strategy.name}.` }
     }
     const from = Number(knob.from)
     const to = Number(knob.to)
     const steps = Math.round(Number(knob.steps))
     if (!Number.isFinite(from) || !Number.isFinite(to) || to <= from || steps < 2 || steps > MAX_VARY_STEPS) {
-      return c.json({ error: 'bad_sweep', message: `${def.label}: use a range from < to with 2–${MAX_VARY_STEPS} steps.` }, 400)
+      return { error: 'bad_sweep', message: `${def.label}: use a range from < to with 2–${MAX_VARY_STEPS} steps.` }
     }
-    const values = Array.from({ length: steps }, (_, i) => from + ((to - from) * i) / (steps - 1))
+    // Snap to the parameter's own step: an integer lever ("entry interval")
+    // must never train on fractional bars.
+    const grain = typeof def.step === 'number' && def.step > 0 ? def.step : 1
+    const values = Array.from({ length: steps }, (_, i) => {
+      const raw = from + ((to - from) * i) / (steps - 1)
+      const snapped = Math.round(raw / grain) * grain
+      const bounded = Math.min(def.max ?? snapped, Math.max(def.min ?? snapped, snapped))
+      return Number(bounded.toFixed(4))
+    })
     knobs.push({ def, values })
   }
   const combos = knobs.reduce((n, knob) => n * knob.values.length, 1)
   if (combos > MAX_COMBOS) {
-    return c.json({ error: 'grid_too_big', message: `That grid is ${combos} runs — keep it to ${MAX_COMBOS} (fewer steps or parameters).` }, 400)
+    return { error: 'grid_too_big', message: `That grid is ${combos} runs — keep it to ${MAX_COMBOS} (fewer steps or parameters).` }
   }
 
   const to = now()
@@ -441,8 +498,10 @@ backtests.post('/optimize', async (c) => {
   const bestIndex = rows.indexOf(ranked[0])
 
   // One full-window replay of the winner: curve + accuracy for the report.
+  // Slim mode (bulk upload) skips it — the row summaries are all the client
+  // needs and a 25-config batch must not pay for 25 full replays.
   let bestDetail: { curve: EquityPoint[]; accuracy: AccuracyStat; metrics: RunMetrics } | null = null
-  if (!ranked[0]?.error) {
+  if (!ranked[0]?.error && !body.slim) {
     try {
       const full = runBacktest({ strategyKey: strategy.key, symbol, timeframe: tf, params: ranked[0].params, capital, from, to })
       bestDetail = { curve: full.curve, accuracy: full.accuracy, metrics: full.metrics }
@@ -451,7 +510,7 @@ backtests.post('/optimize', async (c) => {
     }
   }
 
-  return privateJson(c, {
+  return {
     source: { strategyKey: strategy.key, strategyName: strategy.key === 'custom' ? (baseRules?.name ?? strategy.name) : strategy.name, symbol, timeframe: tf, capital, days, from, to, split, label: sourceName },
     objective,
     history: { years: HISTORY_YEARS, from: historyStart(to) },
@@ -459,7 +518,24 @@ backtests.post('/optimize', async (c) => {
     bestIndex,
     best: bestDetail,
     knobs: knobs.map((knob) => ({ key: knob.def.key, label: knob.def.label, unit: knob.def.unit ?? null, values: knob.values })),
-  })
+  }
+}
+
+/** The upload path trains without a form: derive a small default grid from
+ * the first bounded numeric knob (3 values). The strategy's primary lever
+ * (first numeric knob in its schema) is swept across its declared bounds;
+ * returns [] when nothing is sweepable. */
+function defaultSweep(defs: ParamDef[]): VaryParam[] {
+  const bounded = defs.filter((def) => def.type === 'number' && typeof def.min === 'number' && typeof def.max === 'number' && def.max > def.min && typeof def.default === 'number')
+  if (bounded.length === 0) return []
+  const def = bounded[0]
+  return [{ key: def.key, from: def.min as number, to: def.max as number, steps: 3 }]
+}
+
+backtests.post('/optimize', async (c) => {
+  const result = await runTraining(c.get('db'), c.get('user').sub, await c.req.json<TrainSpec>())
+  if ('error' in result) return c.json(result, result.status ?? (400 as const))
+  return privateJson(c, result)
 })
 
 backtests.delete('/:id', async (c) => {

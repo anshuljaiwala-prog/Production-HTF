@@ -5,8 +5,11 @@ import { BOT_SELECT, id, logEvent, mapBot, mapEvent, mapPosition, mapTrade, now 
 import type { AppContext } from '../env'
 import { advanceBot } from '../engine'
 import { TIMEFRAME_MS, barsBetween, normalizeSymbol, quote } from '../market'
+import { scheduleBacktest, runTraining } from './backtests'
+import { insertDemoBots } from '../seed'
 import { STRATEGIES, measureAccuracy, parseRules, rulesToParams, sanitizeParams, strategyBy } from '../strategies'
-import type { Bot, BotStage, BotStatus, ParamValue, Timeframe } from '../../shared/types'
+import { MAX_BOT_VENUES, MAX_TRACKED_SYMBOLS } from '../../shared/types'
+import type { Bot, BotStage, BotStatus, BotVenue, CustomRules, ParamValue, Timeframe } from '../../shared/types'
 
 type Row = Record<string, unknown>
 
@@ -14,7 +17,34 @@ export const bots = new Hono<AppContext>()
 
 /** Running bots are fast-forwarded on read; cap the work per request. */
 const MAX_ADVANCE_PER_REQUEST = 12
-const MAX_SYMBOLS = 6
+const MAX_SYMBOLS = MAX_TRACKED_SYMBOLS
+
+type VenueMap = Map<string, BotVenue>
+
+/** Every saved venue in the workspace, so bots can name the exchanges they
+ * route through without a join per bot. */
+async function loadVenueMap(db: D1Database, owner: string): Promise<VenueMap> {
+  const result = await db
+    .prepare(`SELECT id, name, exchange, environment FROM connections WHERE owner_sub = ?`)
+    .bind(owner)
+    .all<Row>()
+  return new Map(
+    (result.results ?? []).map((row) => [
+      String(row.id),
+      {
+        connectionId: String(row.id),
+        name: String(row.name),
+        exchange: String(row.exchange),
+        environment: String(row.environment ?? '') === 'sandbox' ? 'sandbox' : 'production',
+      },
+    ]),
+  )
+}
+
+/** Resolve a bot's venue ids into the display rows the UI renders. */
+function withVenues(bot: Bot, map: VenueMap): Bot {
+  return { ...bot, venues: bot.venueIds.map((id) => map.get(id)).filter((venue): venue is BotVenue => Boolean(venue)) }
+}
 
 function withStrategy(bot: Bot): Bot {
   // Uploaded (custom) strategies report their rules name, not the generic one.
@@ -42,9 +72,9 @@ async function loadBot(db: D1Database, owner: string, botId: string): Promise<Bo
   return row ? mapBot(row) : null
 }
 
-async function advanceRunning(db: D1Database, owner: string, items: Bot[]): Promise<boolean> {
+async function advanceRunning(db: D1Database, owner: string, items: Bot[], secretsKey?: string): Promise<boolean> {
   const running = items.filter((b) => b.status === 'running').slice(0, MAX_ADVANCE_PER_REQUEST)
-  for (const bot of running) await advanceBot(db, owner, bot)
+  for (const bot of running) await advanceBot(db, owner, bot, { secretsKey })
   return running.length > 0
 }
 
@@ -52,14 +82,17 @@ bots.get('/', async (c) => {
   const db = c.get('db')
   const owner = c.get('user').sub
   let items = await loadBots(db, owner)
-  if (await advanceRunning(db, owner, items)) items = await loadBots(db, owner)
-  return privateJson(c, { items: items.map(withStrategy), strategies: STRATEGIES })
+  if (await advanceRunning(db, owner, items, c.env.SECRETS_KEY)) items = await loadBots(db, owner)
+  const venues = await loadVenueMap(db, owner)
+  return privateJson(c, { items: items.map((bot) => withStrategy(withVenues(bot, venues))), strategies: STRATEGIES })
 })
 
 interface CreateBody {
   strategyKey?: string
   name?: string
   symbols?: string[]
+  /** Singular synonym accepted for operator convenience, folded into `symbols`. */
+  symbol?: string
   timeframe?: Timeframe
   params?: Record<string, unknown>
   capital?: number
@@ -67,6 +100,8 @@ interface CreateBody {
   mode?: 'paper' | 'live'
   /** Exchange-API binding: bots route through a saved connection. */
   connectionId?: string | null
+  /** Multi-venue routing (best price wins); first id is the primary venue. */
+  venueIds?: string[]
   /** Inline uploaded strategy: validated rules routed through `custom`. */
   rules?: unknown
   stage?: BotStage
@@ -83,6 +118,7 @@ interface ValidatedSpec {
   riskPct: number
   mode: 'paper' | 'live'
   connectionId: string | null
+  venueIds: string[]
   status: BotStatus
   stage: BotStage
   name: string
@@ -119,7 +155,10 @@ async function validateSpec(db: D1Database, owner: string, body: CreateBody): Pr
   const rejected = new Set<string>()
   const seen = new Set<string>()
   const symbols: string[] = []
-  for (const entry of body.symbols ?? []) {
+  // Rows sometimes carry the backtest-API spelling — a single `symbol` —
+  // treat it as a one-element list instead of rejecting the row outright.
+  const symbolList = body.symbols ?? (body.symbol ? [String(body.symbol)] : undefined)
+  for (const entry of symbolList ?? []) {
     const normalized = normalizeSymbol(String(entry))
     if (!normalized) {
       const text = String(entry).trim()
@@ -136,6 +175,15 @@ async function validateSpec(db: D1Database, owner: string, body: CreateBody): Pr
       ? { error: 'unknown_symbols', message: `No tradeable symbols in this row: ${[...rejected].slice(0, 4).join(', ')} — try catalog entries like BTC-USD or EUR-USD.` }
       : { error: 'symbols_required', message: 'Choose at least one symbol.' }
   }
+  // The cap is a hard limit, not a silent trim: a bot that tracked fewer
+  // markets than its operator selected would scan and trade a different book
+  // than the one on screen.
+  if (symbols.length > MAX_SYMBOLS) {
+    return {
+      error: 'too_many_symbols',
+      message: `A bot tracks up to ${MAX_SYMBOLS} markets at once (this row has ${symbols.length}) — split the list across bots.`,
+    }
+  }
 
   const timeframe = (body.timeframe ?? strategy.timeframes[Math.floor(strategy.timeframes.length / 2)]) as Timeframe
   if (!strategy.timeframes.includes(timeframe)) {
@@ -149,17 +197,27 @@ async function validateSpec(db: D1Database, owner: string, body: CreateBody): Pr
   const riskPct = Math.min(100, Math.max(1, Number(body.riskPct) || 25))
   const mode: 'paper' | 'live' = body.mode === 'live' ? 'live' : 'paper'
 
-  let connectionId: string | null = null
-  if (body.connectionId) {
+  // Venue set: an explicit multi-venue list wins, otherwise the single
+  // connection id (legacy callers) becomes the one-element list.
+  const requestedVenues = body.venueIds !== undefined ? body.venueIds : body.connectionId ? [String(body.connectionId)] : []
+  const venueIds: string[] = []
+  for (const entry of requestedVenues) {
+    const venueId = String(entry ?? '').trim()
+    if (!venueId || venueIds.includes(venueId)) continue
     const connection = await db
       .prepare(`SELECT id FROM connections WHERE id = ? AND owner_sub = ?`)
-      .bind(String(body.connectionId), owner)
+      .bind(venueId, owner)
       .first<{ id: string }>()
-    if (!connection) return { error: 'connection_not_found', message: 'That connection no longer exists.' }
-    connectionId = connection.id
-  } else if (mode === 'live') {
-    return { error: 'connection_required', message: 'A live bot needs an exchange connection.' }
+    if (!connection) return { error: 'connection_not_found', message: 'That connection no longer exists in this workspace.' }
+    venueIds.push(connection.id)
   }
+  if (venueIds.length > MAX_BOT_VENUES) {
+    return { error: 'too_many_venues', message: `A bot routes across up to ${MAX_BOT_VENUES} exchanges — remove ${venueIds.length - MAX_BOT_VENUES}.` }
+  }
+  if (mode === 'live' && venueIds.length === 0) {
+    return { error: 'connection_required', message: 'A live bot needs at least one exchange connection to route orders through.' }
+  }
+  const connectionId = venueIds[0] ?? null
 
   const status: BotStatus = body.status === 'stopped' || body.status === 'paused' ? body.status : 'running'
   const stage: BotStage = body.stage ?? (status === 'running' ? (mode === 'live' ? 'live' : 'paper') : 'draft')
@@ -175,15 +233,17 @@ async function validateSpec(db: D1Database, owner: string, body: CreateBody): Pr
     riskPct,
     mode,
     connectionId,
+    venueIds,
     status,
     stage,
     name,
   }
 }
 
-/** One bot creation, shared by single launch and bulk import: validates and
- * inserts, returning either the bot or a rejection reason. */
-async function createBot(db: D1Database, owner: string, body: CreateBody): Promise<{ bot?: Bot; error?: string; message?: string }> {
+/** One bot creation, shared by single launch, bulk import and strategy-book
+ * execution: validates and inserts, returning either the bot or a rejection
+ * reason. */
+export async function createBot(db: D1Database, owner: string, body: CreateBody): Promise<{ bot?: Bot; error?: string; message?: string }> {
   const spec = await validateSpec(db, owner, body)
   if ('error' in spec) return spec
 
@@ -193,8 +253,8 @@ async function createBot(db: D1Database, owner: string, body: CreateBody): Promi
   await db
     .prepare(
       `INSERT INTO bots (id, owner_sub, name, strategy_key, symbols, timeframe, params, capital, risk_pct, mode, stage, status,
-        position, connection_id, cash, equity, initial_equity, realized_pnl, round_trips, wins, created_at, started_at, last_tick_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, 0, 0, 0, ?, ?, ?, ?)`,
+        position, connection_id, venue_ids, cash, equity, initial_equity, realized_pnl, round_trips, wins, created_at, started_at, last_tick_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, 0, 0, 0, ?, ?, ?, ?)`,
     )
     .bind(
       botId,
@@ -210,6 +270,7 @@ async function createBot(db: D1Database, owner: string, body: CreateBody): Promi
       spec.stage,
       spec.status,
       spec.connectionId,
+      JSON.stringify(spec.venueIds),
       spec.capital,
       spec.capital,
       spec.capital,
@@ -238,22 +299,103 @@ bots.post('/', async (c) => {
   const body = await c.req.json<CreateBody>()
   const result = await createBot(db, owner, body)
   if (result.error) return c.json({ error: result.error, message: result.message }, 400)
-  return privateJson(c, { bot: withStrategy(result.bot!) }, 201)
+  return privateJson(c, { bot: withStrategy(withVenues(result.bot!, await loadVenueMap(db, owner))) }, 201)
 })
 
 /** Bulk bot config import — the direct JSON-payload upload path. Accepts
  * `{ items: [...] }` (or `{ bots: [...] }`) where each row may carry inline
  * `rules` (uploaded strategy) and a `connectionId` (which API the bot routes
- * through). With `?validate=1` nothing is created: every row is checked
- * exactly as a real import would be, and the reasons come back for a
- * preview before the operator commits. */
+ * through), plus an intent: what the batch is for.
+ *
+ * Every intent — live, backtest, train — creates the bot through the same
+ * `createBot` used by single live launch, so uploaded configs are validated,
+ * named, evented and stored identically no matter where they are going.
+ * `live` launches them paused (operator review before trading), while
+ * `backtest` and `train` queue a run from the bot's exact config through the
+ * same scheduling/training functions the interactive pages use. With
+ * `?validate=1` nothing is created and every row's rejection reason comes
+ * back for a preview. */
+export type ImportIntent = 'live' | 'backtest' | 'train'
 const MAX_IMPORT = 25
+
+interface QueueSummary {
+  queued: number
+  errors: string[]
+  /** Train intent: per-bot sweep summaries (no curves). */
+  training: { botId: string; botName: string; swept: string | null; combos: number; bestTrain: number | null; bestTest: number | null; error: string | null }[]
+  /** Backtest intent: queued run names, for the success toast. */
+  backtests: { id: string; name: string }[]
+}
+
+/** Queue the intent's run from a freshly created (paused) bot. Custom bots
+ * pass their stored rules payload; catalog bots pass their params. */
+async function queueRunForBot(db: D1Database, owner: string, intent: 'backtest' | 'train', bot: Bot, summary: QueueSummary): Promise<void> {
+  let rules: CustomRules | undefined
+  if (bot.strategyKey === 'custom') {
+    try {
+      rules = (JSON.parse(String(bot.params.rules ?? '')) as { rules: CustomRules }).rules
+    } catch {
+      summary.errors.push(`${bot.name}: stored rules payload is unreadable — config saved, run not queued`)
+      return
+    }
+  }
+  if (intent === 'backtest') {
+    const result = await scheduleBacktest(db, owner, {
+      strategyKey: bot.strategyKey,
+      symbol: bot.symbols[0],
+      timeframe: bot.timeframe,
+      capital: bot.capital,
+      name: bot.name,
+      ...(rules !== undefined ? { rules } : { params: bot.params }),
+    })
+    if ('error' in result) {
+      summary.errors.push(`${bot.name}: ${result.message}`)
+      return
+    }
+    summary.queued++
+    summary.backtests.push({ id: result.backtest.id, name: result.backtest.name })
+    await logEvent(db, owner, bot.id, 'info', `Backtest queued from the uploaded config — replaying history when the batch finishes ingesting.`)
+    return
+  }
+  const training = await runTraining(db, owner, {
+    strategyKey: bot.strategyKey,
+    symbol: bot.symbols[0],
+    capital: bot.capital,
+    autoSweep: true,
+    slim: true,
+    ...(rules !== undefined ? { rules } : { params: bot.params }),
+  })
+  if ('error' in training) {
+    summary.errors.push(`${bot.name}: ${training.message}`)
+    return
+  }
+  const best = training.runs[training.bestIndex]
+  const summaryRow = {
+    botId: bot.id,
+    botName: bot.name,
+    swept: training.knobs[0]?.label ?? null,
+    combos: training.runs.length,
+    bestTrain: best && !best.error && best.train ? best.train.totalReturn : null,
+    bestTest: best && !best.error && best.test ? best.test.totalReturn : null,
+    error: best?.error ?? null,
+  }
+  summary.training.push(summaryRow)
+  summary.queued++
+  await logEvent(
+    db,
+    owner,
+    bot.id,
+    'info',
+    `Training sweep run from the uploaded config — ${summaryRow.combos} combinations on ${training.knobs[0]?.label ?? 'no knobs'}, best in-window ${Number.isFinite(summaryRow.bestTrain) ? (summaryRow.bestTrain as number).toFixed(1) : '?'}%.`,
+  )
+}
 
 bots.post('/import', async (c) => {
   const db = c.get('db')
   const owner = c.get('user').sub
   const validateOnly = c.req.query('validate') === '1'
-  const body = await c.req.json<{ items?: CreateBody[]; bots?: CreateBody[] }>()
+  const body = await c.req.json<{ items?: CreateBody[]; bots?: CreateBody[]; intent?: ImportIntent }>()
+  const intent = body.intent === 'backtest' || body.intent === 'train' ? body.intent : 'live'
   const rawItems = Array.isArray(body.items) ? body.items : Array.isArray(body.bots) ? body.bots : []
   const items = rawItems.slice(0, MAX_IMPORT)
   if (items.length === 0) {
@@ -274,13 +416,48 @@ bots.post('/import', async (c) => {
 
   const launched: Bot[] = []
   const failed: { name: string; error: string }[] = []
+  const venues = await loadVenueMap(db, owner)
+  const runs: QueueSummary = { queued: 0, errors: [], training: [], backtests: [] }
   for (const [index, item] of items.entries()) {
+    // Non-live intents run off simulation money, not the operator's wallet:
+    // park the row as paper so a live-mode row can still be imported for
+    // backtesting without pretending it will ever route to an exchange.
+    const parkingMode = intent === 'live' ? item.mode : 'paper'
     const label = item.name?.trim() || item.symbols?.filter(Boolean).join(', ') || `Import ${index + 1}`
-    const result = await createBot(db, owner, { ...item, status: 'paused' })
-    if (result.bot) launched.push(withStrategy(result.bot))
-    else failed.push({ name: label, error: result.message ?? 'Invalid config.' })
+    const result = await createBot(db, owner, { ...item, mode: parkingMode, status: 'paused' })
+    if (result.bot) launched.push(withStrategy(withVenues(result.bot, venues)))
+    else {
+      failed.push({ name: label, error: result.message ?? 'Invalid config.' })
+      continue
+    }
+    if (intent !== 'live') await queueRunForBot(db, owner, intent, result.bot, runs)
   }
-  return privateJson(c, { launched, failed })
+  return privateJson(c, { launched, failed, intent, runs })
+})
+
+/** Replace the workspace's fleet with the five demo bots (live-mode, paused).
+ * Bots and their books are deleted; connections, backtests and strategies are
+ * left alone. Seeding never advances a bot, so nothing is ordered. */
+bots.post('/demo', async (c) => {
+  const db = c.get('db')
+  const owner = c.get('user').sub
+  await db.batch([
+    db.prepare(`DELETE FROM bots WHERE owner_sub = ?`).bind(owner),
+    db.prepare(`DELETE FROM positions WHERE owner_sub = ?`).bind(owner),
+    db.prepare(`DELETE FROM trades WHERE owner_sub = ?`).bind(owner),
+    db.prepare(`DELETE FROM bot_events WHERE owner_sub = ?`).bind(owner),
+    db.prepare(`DELETE FROM equity_points WHERE owner_sub = ?`).bind(owner),
+    db.prepare(`DELETE FROM cashflows WHERE owner_sub = ?`).bind(owner),
+  ])
+  const [anyVenue, bseVenue] = await Promise.all([
+    db.prepare(`SELECT id FROM connections WHERE owner_sub = ? AND exchange != ? ORDER BY created_at DESC LIMIT 1`)
+      .bind(owner, 'BSE (via Upstox)')
+      .first<{ id: string }>(),
+    db.prepare(`SELECT id FROM connections WHERE owner_sub = ? AND exchange = ? LIMIT 1`).bind(owner, 'BSE (via Upstox)').first<{ id: string }>(),
+  ])
+  await insertDemoBots(db, owner, anyVenue?.id ?? null, Date.now(), bseVenue?.id ?? null)
+  const items = await loadBots(db, owner)
+  return privateJson(c, { bots: items.length }, 201)
 })
 
 interface ValidateRowResult {
@@ -378,7 +555,7 @@ bots.get('/:id', async (c) => {
   if (!bot) return c.json({ error: 'not_found', message: 'Bot not found.' }, 404)
 
   if (bot.status === 'running') {
-    await advanceBot(db, owner, bot)
+    await advanceBot(db, owner, bot, { secretsKey: c.env.SECRETS_KEY })
     bot = (await loadBot(db, owner, botId)) ?? bot
   }
 
@@ -400,13 +577,16 @@ bots.get('/:id', async (c) => {
   // curve stays exactly the closed-bar record the engine produced.
   const marks = new Map<string, number>()
   const positionRows = (positions.results ?? []).map((row) => {
-    const mark = quote(String(row.symbol), at)
+    // Live positions carry the venue mark the engine recorded; paper ones (and
+    // rows written before marks existed) fall back to the reference feed.
+    const stored = row.mark_price === null || row.mark_price === undefined ? null : Number(row.mark_price)
+    const mark = stored !== null && Number.isFinite(stored) && stored > 0 ? stored : quote(String(row.symbol), at)
     marks.set(String(row.symbol), mark)
     return { ...mapPosition(row), markPrice: mark, unrealizedPnl: (mark - Number(row.avg_price)) * Number(row.qty) }
   })
   const mappedEquity = (equity.results ?? []).map((row) => ({ t: Number(row.at), value: Number(row.value) }))
 
-  let responseBot = withStrategy(bot)
+  let responseBot = withStrategy(withVenues(bot, await loadVenueMap(db, owner)))
   if (bot.status === 'running') {
     const unrealized = positionRows.reduce((sum, pos) => sum + pos.qty * pos.markPrice, 0)
     const liveEquity = bot.cash + unrealized
@@ -437,18 +617,56 @@ bots.patch('/:id', async (c) => {
     riskPct?: number
     params?: Record<string, unknown>
     connectionId?: string | null
+    /** Replace the routable venue set (primary first). */
+    venueIds?: string[]
+    /** Operator capital edit, treated as funding (see below). */
+    capital?: number
     /** Switch execution venue: paper (simulated wallet) ↔ live (exchange APIs). */
     mode?: 'paper' | 'live'
   }>()
   const bot = await loadBot(db, owner, botId)
   if (!bot) return c.json({ error: 'not_found', message: 'Bot not found.' }, 404)
+  // Run-state belongs to the control endpoint, not PATCH: a caller sending
+  // `status` here gets a clear rejection instead of a silent 200 that changed
+  // nothing.
+  if ('status' in body) {
+    return c.json({ error: 'use_control', message: 'Start, pause, ground and stop go through POST /api/bots/:id/control.' }, 400)
+  }
+
+  // Capital is funding, not a trading setting: the delta moves cash, equity,
+  // capital and net deposits together, so recorded trading P&L (equity minus
+  // capital) never changes. It is handled before the active-bot gate because
+  // deposits are allowed on a running bot too.
+  let capitalChange: { delta: number; next: number } | null = null
+  if (body.capital !== undefined) {
+    const next = Math.round(Number(body.capital) * 100) / 100
+    if (!Number.isFinite(next) || next < 100) {
+      return c.json({ error: 'invalid_capital', message: 'Starting capital must be at least $100.' }, 400)
+    }
+    if (next > 10_000_000) {
+      return c.json({ error: 'invalid_capital', message: 'Starting capital must be below $10,000,000.' }, 400)
+    }
+    const delta = Math.round((next - bot.capital) * 100) / 100
+    if (Math.abs(delta) >= 0.01) {
+      if (delta < 0 && -delta > bot.cash + 1e-6) {
+        return c.json(
+          {
+            error: 'insufficient_cash',
+            message: `Lowering capital by $${(-delta).toFixed(2)} needs that much idle cash — this bot holds $${bot.cash.toFixed(2)}. Close positions or withdraw less.`,
+          },
+          400,
+        )
+      }
+      capitalChange = { delta, next }
+    }
+  }
 
   // Trading settings — and a paper↔live venue switch — are only editable
   // while the bot is not active: pause or stop it first so what it decides on
   // never changes mid-run and a trade is never split across venues.
   const modeChange = body.mode !== undefined && body.mode !== bot.mode ? (body.mode === 'live' ? 'live' : 'paper') : null
   const wantsTradingSettings =
-    body.symbols !== undefined || body.timeframe !== undefined || body.riskPct !== undefined || body.params !== undefined || body.connectionId !== undefined || modeChange !== null
+    body.symbols !== undefined || body.timeframe !== undefined || body.riskPct !== undefined || body.params !== undefined || body.connectionId !== undefined || body.venueIds !== undefined || modeChange !== null
   if (wantsTradingSettings && bot.status === 'running') {
     return c.json({ error: 'bot_active', message: 'Pause or ground this bot before changing its trading settings or venue.' }, 409)
   }
@@ -502,26 +720,35 @@ bots.patch('/:id', async (c) => {
       return c.json({ error: 'invalid_rules', message: error instanceof Error ? error.message : 'Invalid rules payload.' }, 400)
     }
   }
-  const connectionId = body.connectionId !== undefined ? (body.connectionId === null ? null : String(body.connectionId)) : bot.connectionId
-  // Going live requires an exchange API: refuse to flip a connectionless bot
-  // into venue execution where it would have nowhere to route orders.
-  if (modeChange === 'live' && !connectionId) {
+  // Venue set: an explicit list replaces the stored one; a bare connectionId
+  // keeps its older meaning (that venue becomes the primary). Every id must
+  // be a real connection this workspace owns — a bot that receives a forged
+  // id must be caught here instead of routing live orders into a void.
+  let venueIds = bot.venueIds
+  if (body.venueIds !== undefined || body.connectionId !== undefined) {
+    const requested = body.venueIds !== undefined ? body.venueIds : body.connectionId ? [String(body.connectionId)] : []
+    const resolved: string[] = []
+    for (const entry of requested) {
+      const venueId = String(entry ?? '').trim()
+      if (!venueId || resolved.includes(venueId)) continue
+      const conn = await db.prepare(`SELECT id FROM connections WHERE id = ? AND owner_sub = ?`).bind(venueId, owner).first<Row>()
+      if (!conn) {
+        return c.json({ error: 'connection_missing', message: 'That exchange connection no longer exists in this workspace — reconnect the bot on the Connections page.' }, 400)
+      }
+      resolved.push(String(conn.id))
+    }
+    if (resolved.length > MAX_BOT_VENUES) {
+      return c.json({ error: 'too_many_venues', message: `A bot routes across up to ${MAX_BOT_VENUES} exchanges — remove ${resolved.length - MAX_BOT_VENUES}.` }, 400)
+    }
+    venueIds = resolved
+  }
+  const connectionId = venueIds[0] ?? null
+  const mode: 'paper' | 'live' = modeChange ?? bot.mode
+  // Going live requires an exchange API: refuse to flip a venue-less bot into
+  // execution where it would have nowhere to route orders.
+  if (mode === 'live' && venueIds.length === 0) {
     return c.json({ error: 'connection_required', message: 'Connect an exchange API to this bot before switching it to live trading.' }, 400)
   }
-  // And it must be a real connection the operator owns: a bot that survives
-  // a connection deletion (or receives a forged id from another workspace)
-  // must be caught here instead of routing live orders into a void.
-  const switchingConnection = (body.connectionId !== undefined && body.connectionId !== null) || modeChange === 'live'
-  if (switchingConnection && connectionId) {
-    const conn = await db
-      .prepare(`SELECT id FROM connections WHERE id = ? AND owner_sub = ?`)
-      .bind(connectionId, owner)
-      .first<Row>()
-    if (!conn) {
-      return c.json({ error: 'connection_missing', message: 'That exchange connection no longer exists in this workspace — reconnect the bot on the Connections page.' }, 400)
-    }
-  }
-  const mode: 'paper' | 'live' = modeChange ?? bot.mode
 
   // Diff the applied settings against what was stored so the event stream
   // shows config changes — "timeframe 1h → 4h, risk 25% → 30%" — not just
@@ -533,7 +760,10 @@ bots.patch('/:id', async (c) => {
   if (timeframe !== bot.timeframe) changes.push(`timeframe ${bot.timeframe} → ${timeframe}`)
   if (riskPct !== bot.riskPct) changes.push(`risk ${bot.riskPct}% → ${riskPct}%`)
   if (JSON.stringify(symbols) !== JSON.stringify(bot.symbols)) changes.push(`symbols ${bot.symbols.join(', ')} → ${symbols.join(', ')}`)
-  if (connectionId !== bot.connectionId) changes.push(`connection → ${connectionId ?? 'demo venue'}`)
+  if (JSON.stringify(venueIds) !== JSON.stringify(bot.venueIds)) {
+    const venues = await loadVenueMap(db, owner)
+    changes.push(`venues → ${venueIds.map((id) => venues.get(id)?.name ?? id).join(', ') || 'none'}`)
+  }
   if (bot.strategyKey !== 'custom') {
     const paramChanges = Object.keys(params)
       .filter((key) => JSON.stringify(params[key]) !== JSON.stringify(bot.params[key]))
@@ -549,7 +779,7 @@ bots.patch('/:id', async (c) => {
 
   await db
     .prepare(
-      `UPDATE bots SET name = ?, stage = ?, position = ?, symbols = ?, timeframe = ?, risk_pct = ?, params = ?, connection_id = ?, mode = ?, updated_at = ?
+      `UPDATE bots SET name = ?, stage = ?, position = ?, symbols = ?, timeframe = ?, risk_pct = ?, params = ?, connection_id = ?, venue_ids = ?, mode = ?, updated_at = ?
        WHERE id = ? AND owner_sub = ?`,
     )
     .bind(
@@ -561,6 +791,7 @@ bots.patch('/:id', async (c) => {
       riskPct,
       JSON.stringify(params),
       connectionId,
+      JSON.stringify(venueIds),
       mode,
       now(),
       botId,
@@ -568,12 +799,35 @@ bots.patch('/:id', async (c) => {
     )
     .run()
 
+  if (capitalChange) {
+    const t = now()
+    await db.batch([
+      db
+        .prepare(
+          `UPDATE bots SET capital = ?, cash = cash + ?, equity = equity + ?, net_deposits = net_deposits + ?, updated_at = ?
+           WHERE id = ? AND owner_sub = ?`,
+        )
+        .bind(capitalChange.next, capitalChange.delta, capitalChange.delta, capitalChange.delta, t, botId, owner),
+      db
+        .prepare(`INSERT INTO cashflows (id, owner_sub, bot_id, amount, note, created_at) VALUES (?, ?, ?, ?, ?, ?)`)
+        .bind(id(), owner, botId, capitalChange.delta, `Operator set starting capital to $${capitalChange.next.toFixed(2)}`, t),
+    ])
+    const abs = Math.abs(capitalChange.delta).toLocaleString('en-US', { style: 'currency', currency: 'USD' })
+    await logEvent(
+      db,
+      owner,
+      botId,
+      'info',
+      `Starting capital set to $${capitalChange.next.toFixed(2)} — ${capitalChange.delta > 0 ? 'topped up' : 'reduced'} by ${abs} as funding, so trading P&L is unchanged.`,
+    )
+  }
+
   if (changes.length) {
     await logEvent(db, owner, botId, 'info', `Settings edited — ${changes.join('; ')}`.slice(0, 500))
   }
 
   const updated = await loadBot(db, owner, botId)
-  return privateJson(c, { bot: updated ? withStrategy(updated) : null })
+  return privateJson(c, { bot: updated ? withStrategy(withVenues(updated, await loadVenueMap(db, owner))) : null })
 })
 
 bots.post('/:id/control', async (c) => {
@@ -612,10 +866,10 @@ bots.post('/:id/control', async (c) => {
 
   let updated = (await loadBot(db, owner, botId)) ?? bot
   if (status === 'running') {
-    await advanceBot(db, owner, updated)
+    await advanceBot(db, owner, updated, { secretsKey: c.env.SECRETS_KEY })
     updated = (await loadBot(db, owner, botId)) ?? updated
   }
-  return privateJson(c, { bot: withStrategy(updated) })
+  return privateJson(c, { bot: withStrategy(withVenues(updated, await loadVenueMap(db, owner))) })
 })
 
 interface FundingBody {
@@ -662,7 +916,7 @@ bots.post('/:id/cashflow', async (c) => {
   await logEvent(db, owner, botId, 'info', amount > 0 ? `Operator deposited ${abs}.` : `Operator withdrew ${abs}.`)
 
   const updated = await loadBot(db, owner, botId)
-  return privateJson(c, { bot: updated ? withStrategy(updated) : null })
+  return privateJson(c, { bot: updated ? withStrategy(withVenues(updated, await loadVenueMap(db, owner))) : null })
 })
 
 bots.delete('/:id', async (c) => {

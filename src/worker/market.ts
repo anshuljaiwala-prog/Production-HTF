@@ -58,6 +58,22 @@ const UNIVERSE: Record<string, SymbolSpec> = {
   BABA: { kind: 'equity', base: 86.4, vol: 0.13, drift: 0.0002, decimals: 2 },
   INFY: { kind: 'equity', base: 19.1, vol: 0.08, drift: 0.0005, decimals: 2 },
   NESN: { kind: 'equity', base: 92.6, vol: 0.05, drift: 0.0003, decimals: 2 },
+  // BSE-listed cash equities (the live BSE adapter maps these to BSE_EQ
+  // instrument keys; see venues.ts)
+  RELIANCE: { kind: 'equity', base: 15.2, vol: 0.07, drift: 0.0005, decimals: 2 },
+  TCS: { kind: 'equity', base: 45.8, vol: 0.065, drift: 0.0004, decimals: 2 },
+  HDFCBANK: { kind: 'equity', base: 20.4, vol: 0.07, drift: 0.0006, decimals: 2 },
+  SBIN: { kind: 'equity', base: 9.6, vol: 0.09, drift: 0.0005, decimals: 2 },
+  // BSE derivatives. The exchange trades futures and options on four
+  // underlyings (SENSEX, BANKEX, SENSEX50, FOCIT) and nothing else, so each
+  // contract family is one synthetic series here. Quotes are in the catalog's
+  // app unit — see INR_PER_APP_UNIT — which keeps one lot affordable for a
+  // bot wallet; the live adapter resolves the real rupee contract, lot size
+  // and expiry from the exchange instrument master (instruments.ts).
+  'SENSEX-FUT': { kind: 'future', base: 922, vol: 0.055, drift: 0.0006, decimals: 2 },
+  'BANKEX-FUT': { kind: 'future', base: 777, vol: 0.06, drift: 0.0005, decimals: 2 },
+  'SENSEX50-FUT': { kind: 'future', base: 301, vol: 0.05, drift: 0.0004, decimals: 2 },
+  'FOCIT-FUT': { kind: 'future', base: 452, vol: 0.07, drift: 0.0005, decimals: 2 },
   // Index ETFs
   SPY: { kind: 'etf', base: 583, vol: 0.045, drift: 0.0004, decimals: 2 },
   QQQ: { kind: 'etf', base: 505, vol: 0.055, drift: 0.0005, decimals: 2 },
@@ -95,8 +111,16 @@ const FOREIGN_LABELS: Record<string, string> = {
   ASML: 'ASML · Netherlands',
   HSBC: 'HSBC · United Kingdom',
   BABA: 'Alibaba · China (ADR)',
-  INFY: 'Infosys · India (ADR)',
+  'SENSEX-FUT': 'SENSEX futures · BSE',
+  'BANKEX-FUT': 'BANKEX futures · BSE',
+  'SENSEX50-FUT': 'SENSEX50 futures · BSE',
+  'FOCIT-FUT': 'FOCIT futures · BSE',
+  INFY: 'Infosys · India (ADR + BSE)',
   NESN: 'Nestlé · Switzerland',
+  RELIANCE: 'Reliance Industries · India (BSE)',
+  TCS: 'Tata Consultancy Services · India (BSE)',
+  HDFCBANK: 'HDFC Bank · India (BSE)',
+  SBIN: 'State Bank of India · BSE',
   EFA: 'Developed ex-US · ETF',
   EWJ: 'Japan · ETF',
   EWZ: 'Brazil · ETF',
@@ -122,7 +146,55 @@ export const OPTION_SYMBOLS = [
   'SPY-580-PUT-45D',
   'XAU-2800-CALL-30D',
   'EUR-USD-1.10-CALL-30D',
+  // BSE index options: UNDERLYING-STRIKE-CE|PE. The strike is quoted in the
+  // catalog's app unit; the live adapter maps it onto the nearest rupee
+  // strike of the nearest exchange expiry loaded from the instrument master.
+  'SENSEX-940-CE',
+  'SENSEX-900-PE',
+  'BANKEX-790-CE',
+  'BANKEX-750-PE',
+  'SENSEX50-310-CE',
+  'FOCIT-460-CE',
 ]
+
+/** BSE F&O underlyings — the exchange lists derivatives on these four only.
+ * Everything else it trades is cash equity (BSE_EQ). */
+const BSE_INDEX_SERIES: Record<string, SymbolSpec> = {
+  SENSEX: { kind: 'equity', base: 920, vol: 0.055, drift: 0.0006, decimals: 2 },
+  BANKEX: { kind: 'equity', base: 775, vol: 0.06, drift: 0.0005, decimals: 2 },
+  SENSEX50: { kind: 'equity', base: 300, vol: 0.05, drift: 0.0004, decimals: 2 },
+  FOCIT: { kind: 'equity', base: 450, vol: 0.07, drift: 0.0005, decimals: 2 },
+}
+
+/** Rupees per app unit. The catalog quotes BSE instruments at the platform's
+ * USD scale (see the BSE equities above), while the exchange master lists
+ * rupee strikes; this is the factor between them, matching the app's INR
+ * display rate. Only contract resolution uses it — P&L stays in app units. */
+export const INR_PER_APP_UNIT = 83.1
+
+/** Constant maturity for the BSE option series. The live contract is whichever
+ * expiry the master lists nearest, so the model deliberately does not pretend
+ * to track the exact dated chain. */
+export const BSE_OPTION_DTE = 7
+
+export interface BseContractRef {
+  underlying: string
+  type: 'FUT' | 'CE' | 'PE'
+  /** App-unit strike; null for futures. */
+  strike: number | null
+}
+
+const BSE_FUT_RE = /^(SENSEX|BANKEX|SENSEX50|FOCIT)-FUT$/
+const BSE_OPTION_RE = /^(SENSEX|BANKEX|SENSEX50|FOCIT)-([0-9]+(?:\.[0-9]+)?)-(CE|PE)$/
+
+/** Recognise a BSE derivative ticker (`SENSEX-FUT`, `SENSEX-940-CE`). */
+export function parseBseContractSymbol(symbol: string): BseContractRef | null {
+  const fut = BSE_FUT_RE.exec(symbol)
+  if (fut) return { underlying: fut[1], type: 'FUT', strike: null }
+  const option = BSE_OPTION_RE.exec(symbol)
+  if (option) return { underlying: option[1], type: option[3] as 'CE' | 'PE', strike: Number(option[2]) }
+  return null
+}
 
 export interface OptionSpec {
   underlying: string
@@ -136,7 +208,12 @@ const OPTION_RE = /^([A-Z][A-Z0-9.-]*?)-([0-9]+(?:\.[0-9]+)?)-(CALL|PUT)-(\d+)D$
 
 export function parseOptionSymbol(symbol: string): OptionSpec | null {
   const match = OPTION_RE.exec(symbol)
-  if (!match) return null
+  if (!match) {
+    // BSE index options: constant maturity over the matching index series.
+    const bse = BSE_OPTION_RE.exec(symbol)
+    if (bse) return { underlying: bse[1], strike: Number(bse[2]), type: bse[3] === 'CE' ? 'call' : 'put', dteDays: BSE_OPTION_DTE }
+    return null
+  }
   const underlying = UNIVERSE[match[1]] ? match[1] : match[1].endsWith('-USD') ? match[1] : `${match[1]}-USD`
   if (!UNIVERSE[underlying]) return null
   return { underlying, strike: Number(match[2]), type: match[3] === 'CALL' ? 'call' : 'put', dteDays: Math.max(1, Number(match[4])) }
@@ -204,7 +281,7 @@ const DRIFT_ANCHOR_DAYS = Date.UTC(2026, 9, 1) / DAY
 export const symbolLabel = (symbol: string) => symbol
 
 function specOf(symbol: string): SymbolSpec {
-  const spec = UNIVERSE[symbol]
+  const spec = UNIVERSE[symbol] ?? BSE_INDEX_SERIES[symbol]
   if (spec) return spec
   // Unknown symbols still get a stable, plausible series.
   return { kind: 'equity', base: 100 + (seedOf(symbol) % 400), vol: 0.09, drift: 0.0004, decimals: 2 }

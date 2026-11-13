@@ -3,13 +3,19 @@ import { Hono } from 'hono'
 import { authMode, getAuth, requireUser } from './auth'
 import { requireDb } from './db'
 import type { AppContext, Env } from './env'
+import { analysis } from './routes/analysis'
 import { backtests } from './routes/backtests'
 import { bots } from './routes/bots'
 import { connections } from './routes/connections'
+import { instruments } from './routes/instruments'
 import { market } from './routes/market'
 import { portfolio } from './routes/portfolio'
 import { strategies } from './routes/strategies'
+import { book, toolbox } from './routes/toolbox'
 import { workspace } from './routes/workspace'
+
+// Durable Object classes must be exported from the Worker entrypoint.
+export { EnvironmentDurableObject } from './agents/environment-do'
 
 const app = new Hono<AppContext>()
 
@@ -29,8 +35,12 @@ api.route('/bots', bots)
 api.route('/strategies', strategies)
 api.route('/backtests', backtests)
 api.route('/connections', connections)
+api.route('/instruments', instruments)
 api.route('/portfolio', portfolio)
 api.route('/market', market)
+api.route('/analysis', analysis)
+api.route('/toolbox', toolbox)
+api.route('/book', book)
 app.route('/api', api)
 
 app.onError((error, c) => {

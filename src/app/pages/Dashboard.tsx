@@ -54,13 +54,13 @@ export function Dashboard() {
           sparkPositive: todayPnl >= 0,
           tone: todayPnl >= 0 ? 'text-success' : 'text-danger',
         },
-        { label: 'Active bots', value: String(data.kpis.activeBots), hint: `of ${totalBots} launched` },
+        { label: 'Active bots', value: String(data.kpis.activeBots), hint: `of ${totalBots} live` },
         {
           label: 'Win rate',
           value: data.kpis.winRate === null ? '—' : `${data.kpis.winRate.toFixed(0)}%`,
           hint: data.kpis.winRate === null ? 'no closed trades yet' : 'closed round trips',
         },
-        { label: 'Open positions', value: String(data.kpis.openPositions), hint: 'across the fleet' },
+        { label: 'Open positions', value: String(data.kpis.openPositions), hint: 'across the live book' },
       ]
     : []
 
@@ -70,11 +70,8 @@ export function Dashboard() {
   const strip = fleet
     ? [
         { label: 'Active', count: fleet.running, to: '/bots', className: 'text-success', icon: <Zap className="size-3.5" /> },
-        { label: 'Training', count: fleet.training, to: '/bots', className: 'text-info', icon: <BotIcon className="size-3.5" /> },
         { label: 'Holding', count: fleet.paused, to: '/bots', className: 'text-warning', icon: <Pause className="size-3.5" /> },
-        { label: 'In hangar', count: fleet.hangar, to: '/bots', className: 'text-muted', icon: <BotIcon className="size-3.5" /> },
         { label: 'Grounded', count: fleet.grounded, to: '/bots', className: 'text-danger', icon: <PowerOff className="size-3.5" /> },
-        { label: 'Live', count: fleet.live, to: '/portfolio', className: 'text-accent', icon: <Layers className="size-3.5" /> },
       ]
     : []
 
@@ -82,7 +79,7 @@ export function Dashboard() {
     <div className="mx-auto max-w-[1200px] p-5 sm:p-8">
       <PageHeader
         title="Dashboard"
-        subtitle="High-frequency bots, filled against the simulated venue."
+        subtitle="High-frequency bots on the live book, routed to their exchange venues."
         actions={
           <Button variant="primary" onClick={() => navigate('/strategies')}>
             <Zap />
@@ -162,7 +159,7 @@ export function Dashboard() {
                   <AreaChart data={data.equity} />
                   <ChartNote
                     value={`daily closes · last ${days === 365 ? 'year' : `${days}d`}`}
-                    source="simulated venue, marked per bot on open bars"
+                    source="venue marks per bot on open bars"
                   />
                 </>
               ) : (
@@ -182,7 +179,7 @@ export function Dashboard() {
             </Link>
           </div>
           <ul className="mt-5 flex flex-col gap-3.5">
-            {(data?.stageTotals ?? []).map((stage, i) => (
+            {(data?.stageTotals ?? []).filter((stage) => stage.stage !== 'paper').map((stage, i) => (
               <li key={stage.stage} className="grid grid-cols-[92px_1fr_auto] items-center gap-3 text-[13px]">
                 <span className="text-muted">{BOT_STAGES.find((s) => s.key === stage.stage)?.label}</span>
                 <span className="h-2 overflow-hidden rounded-[4px] bg-surface-2">
@@ -213,7 +210,7 @@ export function Dashboard() {
           </div>
           <ul className="mt-3 divide-y divide-line">
             {data?.attention.map((bot) => {
-              const pnl = bot.initialEquity > 0 ? ((bot.equity - bot.initialEquity) / bot.initialEquity) * 100 : 0
+              const pnl = bot.capital > 0 ? ((bot.equity - bot.capital) / bot.capital) * 100 : 0
               return (
                 <li key={bot.id}>
                   <Link to={`/bots/${bot.id}`} className="flex items-center gap-3 py-3 transition-colors hover:bg-surface-2/60">

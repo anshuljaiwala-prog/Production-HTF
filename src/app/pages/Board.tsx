@@ -223,7 +223,7 @@ function SortableCard({ bot, onOpen }: { bot: Bot; onOpen: () => void }) {
 }
 
 function BotCard({ bot, onOpen, overlay }: { bot: Bot; onOpen?: () => void; overlay?: boolean }) {
-  const pnl = bot.initialEquity > 0 ? ((bot.equity - bot.initialEquity) / bot.initialEquity) * 100 : 0
+  const pnl = bot.capital > 0 ? ((bot.equity - bot.capital) / bot.capital) * 100 : 0
   return (
     <article
       onClick={onOpen}

@@ -1,7 +1,8 @@
 import { runBacktest } from './backtest'
-import { id, mapBot, type Row } from './db'
-import { advanceBot } from './engine'
+import { id } from './db'
 import { TIMEFRAME_MS } from './market'
+import { BSE_INSTRUMENTS } from './venues'
+import { encryptSecret, loadSecretKeys } from './secrets'
 import { defaultParams, strategyBy } from './strategies'
 
 // Sample workspace: a handful of bots across the lifecycle columns plus two
@@ -26,56 +27,61 @@ interface BotSeed {
   note?: string
 }
 
+// The demo fleet. All five are live-mode and paused: they appear in the
+// live-only Dashboard and Portfolio, but seeding never places an order —
+// starting one is an operator decision that needs real venue credentials.
 const BOT_SEEDS: BotSeed[] = [
   {
-    name: 'BTC momentum · 1h',
+    name: 'BTC momentum · live',
     strategyKey: 'momentum',
     symbols: ['BTC-USD'],
     timeframe: '1h',
     capital: 25_000,
     riskPct: 30,
-    mode: 'paper',
-    stage: 'paper',
-    status: 'running',
+    mode: 'live',
+    stage: 'live',
+    status: 'paused',
     startedBarsAgo: 118,
+    note: 'Staged for live trading on the saved demo venue — paused until real credentials replace the demo ones.',
   },
   {
-    name: 'ETH grid scalper',
+    name: 'ETH grid scalper · live',
     strategyKey: 'grid',
     symbols: ['ETH-USD'],
     timeframe: '15m',
     capital: 12_000,
     riskPct: 20,
-    mode: 'paper',
-    stage: 'paper',
-    status: 'running',
+    mode: 'live',
+    stage: 'live',
+    status: 'paused',
     startedBarsAgo: 118,
+    note: 'Staged for live trading — grid steps are set for 15m ETH.',
   },
   {
-    name: 'NVDA range breakout',
+    name: 'NVDA range breakout · live',
     strategyKey: 'breakout',
     symbols: ['NVDA'],
     timeframe: '1d',
     capital: 15_000,
     riskPct: 25,
-    mode: 'paper',
-    stage: 'backtest',
-    status: 'stopped',
+    mode: 'live',
+    stage: 'live',
+    status: 'paused',
     startedBarsAgo: 9,
-    note: 'Backtest showed a rough hit rate — parked until the exit window is retuned.',
+    note: 'Staged for live trading after the daily breakout backtest.',
   },
   {
-    name: 'SOL mean reversion',
-    strategyKey: 'mean-reversion',
-    symbols: ['SOL-USD'],
+    name: 'INFY trend · BSE',
+    strategyKey: 'momentum',
+    symbols: ['INFY'],
     timeframe: '1h',
     capital: 8_000,
     riskPct: 15,
-    mode: 'paper',
-    stage: 'draft',
-    status: 'stopped',
-    startedBarsAgo: 6,
-    note: 'Draft: parameters still being tuned before the first paper run.',
+    mode: 'live',
+    stage: 'live',
+    status: 'paused',
+    startedBarsAgo: 40,
+    note: 'Staged for BSE cash equities through the Upstox adapter — add a real access token to route it.',
   },
   {
     name: 'Multi-symbol market making',
@@ -88,9 +94,78 @@ const BOT_SEEDS: BotSeed[] = [
     stage: 'live',
     status: 'paused',
     startedBarsAgo: 40,
-    note: 'Staged for live: no exchange adapter is wired up yet, so it stays paused.',
+    note: 'Staged for live: it routes across venues once more than one connection is attached.',
   },
 ]
+
+/**
+ * Insert the demo fleet for a workspace. Bots are backdated so the lifecycle
+ * board reads like a real desk, but they stay paused (no live adapter is
+ * assumed) and carry one launch equity point so their curves are honest.
+ */
+export async function insertDemoBots(
+  db: D1Database,
+  owner: string,
+  connectionId: string | null,
+  t = Date.now(),
+  bseConnectionId: string | null = null,
+): Promise<void> {
+  const statements: D1PreparedStatement[] = []
+  BOT_SEEDS.forEach((spec, index) => {
+    const strategy = strategyBy(spec.strategyKey)
+    if (!strategy) return
+    const tfMs = TIMEFRAME_MS[spec.timeframe]
+    const createdAt = t - spec.startedBarsAgo * tfMs
+    const botId = id()
+    const params = JSON.stringify(defaultParams(strategy))
+    // A BSE symbol routes through the BSE demo venue when one is saved, so the
+    // demo fleet exercises the live adapter seam too.
+    const venueId = spec.symbols.some((symbol) => BSE_INSTRUMENTS[symbol]) && bseConnectionId ? bseConnectionId : connectionId
+    statements.push(
+      db
+        .prepare(
+          `INSERT INTO bots (id, owner_sub, name, strategy_key, symbols, timeframe, params, capital, risk_pct, mode, stage, status,
+             position, connection_id, venue_ids, cash, equity, initial_equity, realized_pnl, round_trips, wins, created_at, started_at, last_tick_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, ?, ?, ?, ?)`,
+        )
+        .bind(
+          botId,
+          owner,
+          spec.name,
+          spec.strategyKey,
+          JSON.stringify(spec.symbols),
+          spec.timeframe,
+          params,
+          spec.capital,
+          spec.riskPct,
+          spec.mode,
+          spec.stage,
+          spec.status,
+          index,
+          venueId,
+          JSON.stringify(venueId ? [venueId] : []),
+          spec.capital,
+          spec.capital,
+          spec.capital,
+          createdAt,
+          createdAt,
+          createdAt,
+          createdAt,
+        ),
+    )
+    statements.push(
+      db
+        .prepare(`INSERT INTO bot_events (id, owner_sub, bot_id, level, message, created_at) VALUES (?, ?, ?, 'info', ?, ?)`)
+        .bind(id(), owner, botId, spec.note ?? `Created with ${strategy.name} on ${spec.symbols.join(', ')} (${spec.timeframe}).`, createdAt),
+    )
+    statements.push(
+      db
+        .prepare(`INSERT INTO equity_points (bot_id, owner_sub, at, value) VALUES (?, ?, ?, ?)`)
+        .bind(botId, owner, createdAt, spec.capital),
+    )
+  })
+  for (let i = 0; i < statements.length; i += 40) await db.batch(statements.slice(i, i + 40))
+}
 
 const BACKTEST_SEEDS: { name: string; strategyKey: string; symbol: string; timeframe: BotSeed['timeframe']; capital: number; days: number }[] = [
   { name: 'Momentum BTC · 90 days', strategyKey: 'momentum', symbol: 'BTC-USD', timeframe: '1h', capital: 10_000, days: 90 },
@@ -103,107 +178,39 @@ export async function seedWorkspace(db: D1Database, owner: string) {
 
   // Two demo connections so a fresh workspace can test the picker and live
   // routing immediately — throwaway credentials the simulated venue accepts.
+  // Their secrets are encrypted at rest like every other connection's.
+  const keys = await loadSecretKeys(db, owner)
   const connectionId = id()
   statements.push(
     db
       .prepare(
         `INSERT INTO connections (id, owner_sub, name, exchange, api_key, api_secret, mode, created_at) VALUES (?, ?, ?, ?, ?, ?, 'paper', ?)`,
       )
-      .bind(connectionId, owner, 'Demo · Alpaca paper', 'Alpaca', 'HTFDEMOALPACA0001', 'demo-secret-not-real', t - 30 * DAY),
+      .bind(connectionId, owner, 'Demo · Alpaca paper', 'Alpaca', 'HTFDEMOALPACA0001', await encryptSecret(keys, 'demo-secret-not-real'), t - 30 * DAY),
   )
   statements.push(
     db
       .prepare(
         `INSERT INTO connections (id, owner_sub, name, exchange, api_key, api_secret, mode, created_at) VALUES (?, ?, ?, ?, ?, ?, 'paper', ?)`,
       )
-      .bind(id(), owner, 'Demo · Binance paper', 'Binance', 'HTFDEMOBINANCE001', 'demo-secret-not-real', t - 29 * DAY),
+      .bind(id(), owner, 'Demo · Binance paper', 'Binance', 'HTFDEMOBINANCE001', await encryptSecret(keys, 'demo-secret-not-real'), t - 29 * DAY),
   )
-
-  const seeded: Row[] = []
-  BOT_SEEDS.forEach((spec, index) => {
-    const strategy = strategyBy(spec.strategyKey)
-    if (!strategy) return
-    const tfMs = TIMEFRAME_MS[spec.timeframe]
-    const createdAt = t - spec.startedBarsAgo * tfMs
-    const botId = id()
-    const params = JSON.stringify(defaultParams(strategy))
-    const row: Row = {
-      id: botId,
-      owner_sub: owner,
-      name: spec.name,
-      strategy_key: spec.strategyKey,
-      symbols: JSON.stringify(spec.symbols),
-      timeframe: spec.timeframe,
-      params,
-      capital: spec.capital,
-      risk_pct: spec.riskPct,
-      mode: spec.mode,
-      stage: spec.stage,
-      status: spec.status,
-      position: BOT_SEEDS.length - index,
-      connection_id: spec.mode === 'live' ? connectionId : null,
-      cash: spec.capital,
-      equity: spec.capital,
-      initial_equity: spec.capital,
-      realized_pnl: 0,
-      round_trips: 0,
-      wins: 0,
-      created_at: createdAt,
-      started_at: spec.status === 'stopped' ? null : createdAt,
-      last_tick_at: spec.status === 'running' ? null : createdAt,
-      updated_at: createdAt,
-      strategy_name: strategy.name,
-      open_positions: 0,
-      connection_name: spec.mode === 'live' ? 'Demo · Alpaca paper' : null,
-      last_event: null,
-    }
-    seeded.push(row)
-
-    statements.push(
-      db
-        .prepare(
-          `INSERT INTO bots (id, owner_sub, name, strategy_key, symbols, timeframe, params, capital, risk_pct, mode, stage, status,
-             position, connection_id, cash, equity, initial_equity, realized_pnl, round_trips, wins, created_at, started_at, last_tick_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, ?, ?, ?, ?)`,
-        )
-        .bind(
-          botId,
-          owner,
-          spec.name,
-          spec.strategyKey,
-          row.symbols as string,
-          spec.timeframe,
-          params,
-          spec.capital,
-          spec.riskPct,
-          spec.mode,
-          spec.stage,
-          spec.status,
-          index,
-          row.connection_id as string | null,
-          spec.capital,
-          spec.capital,
-          spec.capital,
-          createdAt,
-          row.started_at as number | null,
-          row.last_tick_at as number | null,
-          createdAt,
-        ),
-    )
-    statements.push(
-      db
-        .prepare(`INSERT INTO bot_events (id, owner_sub, bot_id, level, message, created_at) VALUES (?, ?, ?, 'info', ?, ?)`)
-        .bind(id(), owner, botId, spec.note ?? `Created with ${strategy.name} on ${spec.symbols.join(', ')} (${spec.timeframe}).`, createdAt),
-    )
-  })
+  // A BSE sandbox venue so the demo fleet has one routable live adapter. The
+  // token is a placeholder: it fails authentication until real keys are pasted.
+  const bseConnectionId = id()
+  statements.push(
+    db
+      .prepare(
+        `INSERT INTO connections (id, owner_sub, name, exchange, api_key, api_secret, mode, environment, created_at) VALUES (?, ?, ?, ?, ?, ?, 'live', 'sandbox', ?)`,
+      )
+      .bind(bseConnectionId, owner, 'Demo · BSE sandbox', 'BSE (via Upstox)', 'HTFDEMOBSE0001', await encryptSecret(keys, 'sandbox-demo-token-not-real'), t - 28 * DAY),
+  )
 
   for (let i = 0; i < statements.length; i += 40) await db.batch(statements.slice(i, i + 40))
 
-  // Run the engine over the seeded history so fills, events and curves are real.
-  for (const row of seeded) {
-    const bot = mapBot(row)
-    if (bot.status === 'running') await advanceBot(db, owner, bot, { at: t })
-  }
+  // The demo fleet is live-mode and paused, so no engine replay: seeding never
+  // places (or pretends to place) an order.
+  await insertDemoBots(db, owner, connectionId, t, bseConnectionId)
 
   for (const spec of BACKTEST_SEEDS) {
     try {
@@ -248,7 +255,7 @@ export async function seedWorkspace(db: D1Database, owner: string) {
 
 export async function clearWorkspace(db: D1Database, owner: string) {
   await db.batch(
-    ['bot_events', 'equity_points', 'trades', 'positions', 'bots', 'backtests', 'connections'].map((table) =>
+    ['bot_events', 'equity_points', 'trades', 'positions', 'bots', 'backtests', 'connections', 'connection_keys'].map((table) =>
       db.prepare(`DELETE FROM ${table} WHERE owner_sub = ?`).bind(owner),
     ),
   )

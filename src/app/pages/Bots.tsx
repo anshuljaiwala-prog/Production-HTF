@@ -4,6 +4,9 @@ import { useNavigate, useSearchParams } from 'react-router'
 
 import { BoardPanel } from './Board'
 import { EdgePanel } from './Edge'
+import { FleetPatternPanel } from './Patterns'
+import { ToolboxPanel } from './Toolbox'
+import { StrategyBookPanel } from './Book'
 import { BotImportDialog } from '../components/forms'
 import { CompareBars } from '../components/charts'
 import { Badge, Button, Card, EmptyState, PageHeader, Skeleton } from '../components/ui'
@@ -27,10 +30,13 @@ const FILTERS: { key: BotActivity | 'all'; label: string }[] = [
   { key: 'hangar', label: 'In hangar' },
   { key: 'grounded', label: 'Grounded' },
 ]
-const TABS: { key: 'list' | 'board' | 'edge'; label: string }[] = [
+const TABS: { key: 'list' | 'board' | 'edge' | 'patterns' | 'toolbox' | 'book'; label: string }[] = [
   { key: 'list', label: 'Bot list' },
   { key: 'board', label: 'Lifecycle board' },
   { key: 'edge', label: 'Edge ranking' },
+  { key: 'patterns', label: 'Pattern ranking' },
+  { key: 'toolbox', label: 'Tool box' },
+  { key: 'book', label: 'Strategy book' },
 ]
 
 export function Bots() {
@@ -39,7 +45,8 @@ export function Bots() {
   const [params, setParams] = useSearchParams()
   const [filter, setFilter] = useState<BotActivity | 'all'>('all')
   const [importing, setImporting] = useState(false)
-  const view = params.get('tab') === 'board' ? 'board' : params.get('tab') === 'edge' ? 'edge' : 'list'
+  const tab = params.get('tab')
+  const view = (['board', 'edge', 'patterns', 'toolbox', 'book'] as const).includes(tab as never) ? (tab as typeof TABS[number]['key']) : 'list'
 
   const items = useMemo(() => data?.items ?? [], [data])
   const bots = useMemo(() => items.filter((bot) => filter === 'all' || activityOf(bot) === filter), [items, filter])
@@ -51,11 +58,16 @@ export function Bots() {
         title="Bots"
         subtitle={
           data
-            ? view === 'board'
-              ? 'Drag bots across their lifecycle: draft → backtest → paper → live.'
-              : view === 'edge'
-                ? 'Ranked by market-edge accuracy — whose entry signals predict the next bar best.'
-                : `${items.length} launched · ${active} active — each read fast-forwards the fleet`
+            ? view === 'board'                    ? 'Drag bots across their lifecycle: draft → backtest → paper → live.'
+                    : view === 'edge'
+                      ? 'Ranked by market-edge accuracy — whose entry signals predict the next bar best.'
+                      : view === 'patterns'
+                        ? 'Which bots are trading crash, hype or squeeze markets right now, strongest tape first.'
+                        : view === 'toolbox'
+                          ? 'Trading execution plans — the bot configuration a recognised pattern calls for, ready to deploy.'
+                          : view === 'book'
+                            ? 'Which plan fires for each recognised regime — and the patterns the book would trade right now.'
+                            : `${items.length} launched · ${active} active — each read fast-forwards the fleet`
             : undefined
         }
         actions={
@@ -98,6 +110,12 @@ export function Bots() {
         </div>
       ) : view === 'edge' ? (
         <EdgePanel />
+      ) : view === 'patterns' ? (
+        <FleetPatternPanel />
+      ) : view === 'toolbox' ? (
+        <ToolboxPanel />
+      ) : view === 'book' ? (
+        <StrategyBookPanel />
       ) : (
         <>
           <BotCharts items={items} isLoading={isLoading} />
@@ -123,18 +141,18 @@ export function Bots() {
         <table className="w-full table-fixed text-left text-[13.5px]">
           <thead>
             <tr className="h-10 border-b border-line bg-bg/60 text-[12.5px] text-muted">
-              <th className="w-[28%] px-4 font-medium">Bot</th>
-              <th className="hidden w-[14%] px-4 font-medium md:table-cell">Symbols</th>
-              <th className="hidden w-[12%] px-4 font-medium sm:table-cell">Stage</th>
-              <th className="w-[14%] px-4 font-medium">Status</th>
-              <th className="w-[14%] px-4 text-right font-medium">Equity</th>
-              <th className="hidden w-[12%] px-4 text-right font-medium md:table-cell">P&L</th>
-              <th className="hidden w-[14%] px-4 font-medium lg:table-cell">Last event</th>
+              <th scope="col" className="w-[28%] px-4 font-medium">Bot</th>
+              <th scope="col" className="hidden w-[14%] px-4 font-medium md:table-cell">Symbols</th>
+              <th scope="col" className="hidden w-[12%] px-4 font-medium sm:table-cell">Stage</th>
+              <th scope="col" className="w-[14%] px-4 font-medium">Status</th>
+              <th scope="col" className="w-[14%] px-4 text-right font-medium">Equity</th>
+              <th scope="col" className="hidden w-[12%] px-4 text-right font-medium md:table-cell">P&L</th>
+              <th scope="col" className="hidden w-[14%] px-4 font-medium lg:table-cell">Last event</th>
             </tr>
           </thead>
           <tbody className="divide-y divide-line">
             {bots.map((bot) => {
-              const pnl = bot.initialEquity > 0 ? ((bot.equity - bot.initialEquity) / bot.initialEquity) * 100 : 0
+              const pnl = bot.capital > 0 ? ((bot.equity - bot.capital) / bot.capital) * 100 : 0
               return (
                 <tr key={bot.id} onClick={() => navigate(`/bots/${bot.id}`)} className="h-13 cursor-pointer transition-colors hover:bg-surface-2/60">
                   <td className="truncate px-4">
@@ -226,7 +244,7 @@ function BotCharts({ items, isLoading }: { items: Bot[]; isLoading: boolean }) {
             items={items.map((bot) => ({
               label: bot.name,
               caption: `${activityOf(bot)} · ${bot.symbols[0]}`,
-              value: bot.initialEquity > 0 ? ((bot.equity - bot.initialEquity) / bot.initialEquity) * 100 : 0,
+              value: bot.capital > 0 ? ((bot.equity - bot.capital) / bot.capital) * 100 : 0,
             }))}
           />
         </div>

@@ -22,7 +22,8 @@ export interface SignalContext {
 }
 
 export interface Signal {
-  action: 'buy' | 'sell' | 'hold'
+  /** `short` opens a negative book, `cover` closes it. */
+  action: 'buy' | 'sell' | 'short' | 'cover' | 'hold'
   reason?: string
 }
 
@@ -61,6 +62,15 @@ function highest(bars: Bar[], n: number): number {
 
 function lowest(bars: Bar[], n: number): number {
   return Math.min(...bars.slice(-n).map((b) => b.l))
+}
+
+/** Volume's distance from its own mean in standard deviations over `n` bars. */
+function volumeZ(volumes: number[], n: number): number {
+  const window = volumes.slice(-n)
+  if (window.length < 2) return 0
+  const mean = window.reduce((s, v) => s + v, 0) / window.length
+  const sd = stdev(window)
+  return sd > 0 ? (window.at(-1)! - mean) / sd : 0
 }
 
 /** Gain/loss of the current mark against the average entry, in percent. */
@@ -262,6 +272,54 @@ export const STRATEGIES: StrategyDef[] = [
       const steps = Math.max(1, Math.round(num(ctx.params.inventorySteps, 3)))
       const slot = Math.floor(bars.at(-1)!.t / ctx.tfMs) % steps
       if (gain <= -spread && slot === 0) return { action: 'buy', reason: `restock at ${gain.toFixed(2)}%` }
+      return { action: 'hold' }
+    },
+  },
+  {
+    key: 'crash-short',
+    name: 'Crash Short Hedge',
+    summary: 'Short downside dislocations confirmed by volume, cover when price re-centres.',
+    description:
+      'Enters short when price sits several standard deviations under its mean while volume expands — the crash signature — and covers when the move re-centres or the stop is hit. Needs a venue that supports shorting.',
+    risk: 'high',
+    tags: ['Short', 'Dislocation'],
+    timeframes: ['15m', '1h', '4h', '1d'],
+    lookback: 120,
+    params: [
+      { key: 'lookback', label: 'Lookback', type: 'number', default: 20, min: 5, max: 200, step: 1, unit: 'bars' },
+      { key: 'entryZ', label: 'Short at z below', type: 'number', default: 2, min: 0.5, max: 5, step: 0.1 },
+      { key: 'volumeZ', label: 'Volume confirmation (z)', type: 'number', default: 1.5, min: 0, max: 5, step: 0.1 },
+      { key: 'exitZ', label: 'Cover at z above', type: 'number', default: -0.5, min: -3, max: 3, step: 0.1 },
+      { key: 'stopLossPct', label: 'Stop loss', type: 'number', default: 6, min: 0, max: 100, step: 0.5, unit: '%', hint: '0 disables' },
+    ],
+    signal(ctx) {
+      const bars = ctx.bars
+      const n = Math.round(num(ctx.params.lookback, 20))
+      if (bars.length < n + 2) return { action: 'hold' }
+      const closes = bars.map((b) => b.c)
+      const volumes = bars.map((b) => b.v)
+      const window = closes.slice(-n)
+      const mean = sma(closes, n)
+      const sd = stdev(window)
+      if (sd <= 0) return { action: 'hold' }
+      const z = (closes.at(-1)! - mean) / sd
+      const stop = num(ctx.params.stopLossPct, 6)
+
+      // A short is open: measure its loss against the entry, not against price.
+      if (ctx.position && ctx.position.qty < 0) {
+        const rise = ((closes.at(-1)! - ctx.position.avgPrice) / ctx.position.avgPrice) * 100
+        if (stop > 0 && rise >= stop) return { action: 'cover', reason: `stop loss at +${rise.toFixed(1)}%` }
+        const coverAt = num(ctx.params.exitZ, -0.5)
+        return z >= coverAt ? { action: 'cover', reason: `re-centred at z ${z.toFixed(2)}` } : { action: 'hold' }
+      }
+      if (ctx.position) return { action: 'hold' }
+
+      const volZ = volumeZ(volumes, n)
+      const entry = num(ctx.params.entryZ, 2)
+      const needsVolume = num(ctx.params.volumeZ, 1.5)
+      if (z <= -entry && volZ >= needsVolume) {
+        return { action: 'short', reason: `downside dislocation z ${z.toFixed(2)} on volume z ${volZ.toFixed(2)}` }
+      }
       return { action: 'hold' }
     },
   },
@@ -489,10 +547,12 @@ export function measureAccuracy(strategyKey: string, params: Record<string, Para
       params,
       tfMs,
     })
-    if (signal.action !== 'buy') continue
+    // A buy predicts up, a short predicts down; both count as directional calls.
+    if (signal.action !== 'buy' && signal.action !== 'short') continue
     entryBars++
-    signalSumPct += forwardPct
-    if (forwardPct > 0) correct++
+    const callReturnPct = signal.action === 'short' ? -forwardPct : forwardPct
+    signalSumPct += callReturnPct
+    if (callReturnPct > 0) correct++
   }
   if (entryBars === 0) return { ...fallback, sample: marketBars, rating: null }
   const directionalAccuracy = (correct / entryBars) * 100

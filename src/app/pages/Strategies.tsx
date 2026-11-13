@@ -163,7 +163,7 @@ export function Strategies() {
         onConfirm={() => removing && remove.mutate(removing)}
         loading={remove.isPending}
         title="Discard this uploaded strategy?"
-        description="In-memory storage is not durable — the payload is gone once it is removed. Bots already launched with it keep running with their own copy of the rules."
+        description="Every stored version of this strategy is removed from D1. Bots already launched with it keep running with their own copy of the rules."
       />
     </div>
   )

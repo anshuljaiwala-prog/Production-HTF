@@ -25,7 +25,7 @@ const buttonBase =
   'inline-flex shrink-0 select-none items-center justify-center gap-1.5 whitespace-nowrap rounded-control font-medium transition-[background-color,color,box-shadow,transform] duration-150 active:scale-[0.98] disabled:pointer-events-none disabled:opacity-50 [&_svg]:size-4 [&_svg]:shrink-0'
 const buttonVariants: Record<ButtonVariant, string> = {
   primary: 'bg-fg text-bg shadow-[inset_0_1px_0_rgb(255_255_255/0.12)] hover:opacity-90',
-  secondary: 'border border-line-strong bg-surface text-fg shadow-[0_1px_1px_rgb(20_20_24/0.04)] hover:bg-surface-2',
+  secondary: 'border border-control bg-surface text-fg shadow-[0_1px_1px_rgb(20_20_24/0.04)] hover:bg-surface-2',
   ghost: 'text-muted hover:bg-surface-2 hover:text-fg',
   danger: 'bg-danger text-white hover:bg-[#bf3b26]',
 }
@@ -52,7 +52,7 @@ export function Button({
 }
 
 export const inputClass =
-  'h-9 w-full min-w-0 rounded-control border border-line-strong bg-surface px-3 text-[13.5px] text-fg placeholder:text-faint transition-[border-color,box-shadow] focus:border-accent focus:outline-none focus:ring-[3px] focus:ring-accent/15 disabled:opacity-60'
+  'h-9 w-full min-w-0 rounded-control border border-control bg-surface px-3 text-[13.5px] text-fg placeholder:text-faint transition-[border-color,box-shadow] focus:border-accent focus:outline-none focus:ring-[3px] focus:ring-accent/15 disabled:opacity-60'
 
 export function Input({ className, ...rest }: ComponentPropsWithoutRef<'input'>) {
   return <input className={cx(inputClass, className)} {...rest} />
@@ -78,7 +78,7 @@ export function Checkbox({ className, ...rest }: ComponentPropsWithoutRef<'input
     <span className={cx('relative inline-grid size-4.5 shrink-0 place-items-center', className)}>
       <input
         type="checkbox"
-        className="peer absolute inset-0 size-full cursor-pointer appearance-none rounded-[6px] border border-line-strong bg-surface transition-colors checked:border-fg checked:bg-fg disabled:cursor-default"
+        className="peer absolute inset-0 size-full cursor-pointer appearance-none rounded-[6px] border border-control bg-surface transition-colors checked:border-fg checked:bg-fg disabled:cursor-default"
         {...rest}
       />
       <svg viewBox="0 0 16 16" className="pointer-events-none relative size-3 opacity-0 transition-opacity peer-checked:opacity-100" fill="none" stroke="white" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
@@ -198,11 +198,38 @@ export function Card({ className, children, ...rest }: ComponentPropsWithoutRef<
 // Dialog and Drawer share the overlay: Escape or backdrop closes, scroll is
 // locked while open, focus moves to the first field.
 
+const FOCUSABLE =
+  'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
+
 function useOverlay(open: boolean, onClose: () => void) {
   const ref = useRef<HTMLDivElement>(null)
   useEffect(() => {
     if (!open) return
-    const onKey = (e: KeyboardEvent) => e.key === 'Escape' && onClose()
+    // Escape closes, and Tab cycles inside the overlay: an aria-modal dialog
+    // that lets focus fall through to the page behind it strands keyboard
+    // users outside the thing they can see (WCAG 2.4.3).
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        onClose()
+        return
+      }
+      if (e.key !== 'Tab') return
+      const root = ref.current
+      if (!root) return
+      const items = [...root.querySelectorAll<HTMLElement>(FOCUSABLE)].filter((el) => el.offsetParent !== null || el === document.activeElement)
+      if (items.length === 0) return
+      const first = items[0]
+      const last = items[items.length - 1]
+      const active = document.activeElement as HTMLElement | null
+      const outside = !active || !root.contains(active)
+      if (e.shiftKey && (outside || active === first)) {
+        e.preventDefault()
+        last.focus()
+      } else if (!e.shiftKey && (outside || active === last)) {
+        e.preventDefault()
+        first.focus()
+      }
+    }
     document.addEventListener('keydown', onKey)
     const previous = document.activeElement as HTMLElement | null
     const timer = window.setTimeout(() => {
@@ -449,7 +476,14 @@ export function ToastProvider({ children }: { children: ReactNode }) {
   return (
     <ToastContext.Provider value={push}>
       {children}
-      <div className="pointer-events-none fixed inset-x-0 bottom-5 z-[60] flex flex-col items-center gap-2">
+      {/* Announced without stealing focus: toasts confirm an action the user
+          just took, so they belong in a polite live region. */}
+      <div
+        role="status"
+        aria-live="polite"
+        aria-atomic="false"
+        className="pointer-events-none fixed inset-x-0 bottom-5 z-[60] flex flex-col items-center gap-2"
+      >
         <AnimatePresence>
           {toasts.map((t) => (
             <motion.div
@@ -541,6 +575,7 @@ export function DataTable<T>({
             {columns.map((col) => (
               <th
                 key={col.key}
+                scope="col"
                 className={cx(
                   'h-10 px-4 text-[12px] font-medium text-muted',
                   col.width,

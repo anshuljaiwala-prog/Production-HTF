@@ -1,4 +1,4 @@
-import { ASSET_CLASSES, TIMEFRAMES, type CustomStrategySummary, type ParamDef, type ParamValue, type Strategy, type SymbolMeta } from '../../shared/types'
+import { ASSET_CLASSES, MAX_TRACKED_SYMBOLS, TIMEFRAMES, type CustomStrategySummary, type ParamDef, type ParamValue, type Strategy, type SymbolMeta } from '../../shared/types'
 import { Checkbox, Field, Input, Select, useFieldId } from './ui'
 
 // Forms built from the strategy param schema, so the catalog, the launch
@@ -89,8 +89,12 @@ export function ParamFields({
   )
 }
 
-/** Symbol toggles grouped by asset class with a class label per group. */
+/** Symbol toggles grouped by asset class with a class label per group. The
+ * server tracks at most MAX_TRACKED_SYMBOLS markets per bot, so unselected
+ * chips disable at the cap instead of letting the form build a selection the
+ * ingress would reject. */
 export function SymbolPicker({ symbols, value, onChange }: { symbols: SymbolMeta[]; value: string[]; onChange: (next: string[]) => void }) {
+  const atCap = value.length >= MAX_TRACKED_SYMBOLS
   const groups = ASSET_CLASSES.map(({ key, label, hint }) => ({
     key,
     label,
@@ -108,17 +112,21 @@ export function SymbolPicker({ symbols, value, onChange }: { symbols: SymbolMeta
           <div className="flex flex-wrap gap-1.5">
             {group.items.map(({ symbol, kind, label }) => {
               const active = value.includes(symbol)
+              const blocked = atCap && !active
               return (
                 <button
                   key={symbol}
                   type="button"
                   aria-pressed={active}
-                  title={kind === 'option' && label ? label : undefined}
+                  disabled={blocked}
+                  title={blocked ? `Tracks up to ${MAX_TRACKED_SYMBOLS} markets — remove one first` : kind === 'option' && label ? label : undefined}
                   onClick={() => onChange(active ? value.filter((s) => s !== symbol) : [...value, symbol])}
                   className={
                     active
                       ? 'h-8 rounded-tile bg-fg px-3 text-[12.5px] font-medium text-bg'
-                      : 'h-8 rounded-tile border border-line-strong bg-surface px-3 text-[12.5px] text-muted transition-colors hover:text-fg'
+                      : blocked
+                        ? 'h-8 rounded-tile border border-line bg-surface px-3 text-[12.5px] text-faint opacity-60'
+                        : 'h-8 rounded-tile border border-control bg-surface px-3 text-[12.5px] text-muted transition-colors hover:text-fg'
                   }
                 >
                   {symbol}
@@ -128,7 +136,10 @@ export function SymbolPicker({ symbols, value, onChange }: { symbols: SymbolMeta
           </div>
         </div>
       ))}
-      <span className="text-[12px] text-faint">Pick up to six.</span>
+      <span className="text-[12px] text-faint">
+        {value.length} of {MAX_TRACKED_SYMBOLS} tracked
+        {atCap ? ' — remove a market to add another' : ''}
+      </span>
     </div>
   )
 }

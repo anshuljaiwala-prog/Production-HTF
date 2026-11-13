@@ -105,14 +105,14 @@ export function EdgePanel() {
         <table className="w-full min-w-[860px] table-fixed text-left text-[13px]">
           <thead>
             <tr className="h-10 border-b border-line bg-bg/60 text-[12.5px] text-muted">
-              <th className="w-[6%] px-4 font-medium">#</th>
-              <th className="w-[24%] px-4 font-medium">Bot</th>
-              <th className="w-[16%] px-4 font-medium">Market</th>
-              <th className="w-[13%] px-4 text-right font-medium">Accuracy</th>
-              <th className="w-[13%] px-4 text-right font-medium">Edge vs market</th>
-              <th className="w-[13%] px-4 text-right font-medium">Signal return</th>
-              <th className="w-[8%] px-4 text-right font-medium">Signals</th>
-              <th className="w-[13%] px-4 font-medium">Rating</th>
+              <th scope="col" className="w-[6%] px-4 font-medium">#</th>
+              <th scope="col" className="w-[24%] px-4 font-medium">Bot</th>
+              <th scope="col" className="w-[16%] px-4 font-medium">Market</th>
+              <th scope="col" className="w-[13%] px-4 text-right font-medium">Accuracy</th>
+              <th scope="col" className="w-[13%] px-4 text-right font-medium">Edge vs market</th>
+              <th scope="col" className="w-[13%] px-4 text-right font-medium">Signal return</th>
+              <th scope="col" className="w-[8%] px-4 text-right font-medium">Signals</th>
+              <th scope="col" className="w-[13%] px-4 font-medium">Rating</th>
             </tr>
           </thead>
           <tbody className="divide-y divide-line">

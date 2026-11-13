@@ -1,12 +1,37 @@
 import { Upload } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
+import { useNavigate } from 'react-router'
 
 import { TIMEFRAMES, type ParamValue, type Strategy, type Timeframe } from '../../../shared/types'
-import { importBots, useApiMutation, useStrategies, type LaunchInput } from '../../lib/api'
+import { importBots, useApiMutation, useStrategies, type ImportIntent, type LaunchInput } from '../../lib/api'
 import { Badge, Button, Dialog, useToast } from '../ui'
 import { paramDefaults } from '../form-fields'
 
 // --- Bot config import -----------------------------------------------------
+
+/** Where an uploaded batch goes. All three create the bot through the same
+ * launch path as a live launch; backtest/train additionally queue runs from
+ * the stored config (simulation pot, never the operator's wallet). */
+const INTENTS: { key: ImportIntent; label: string; hint: string; description: string }[] = [
+  {
+    key: 'live',
+    label: 'Live',
+    hint: 'Paper or live bots, paused for review',
+    description: 'Upload a JSON file of bot configs — valid rows launch as paper bots, paused so you can review them.',
+  },
+  {
+    key: 'backtest',
+    label: 'Backtest',
+    hint: 'Also queue a backtest from each stored config',
+    description: 'Configs are created through the same launch pipeline as live bots (parked in paper), and each one queues a backtest on stored history — simulation money, never your wallet.',
+  },
+  {
+    key: 'train',
+    label: 'Train',
+    hint: 'Also sweep each config on historical data',
+    description: 'Configs are created through the same launch pipeline as live bots (parked in paper), and each is trained — a parameter sweep with in-window and hold-out scores.',
+  },
+]
 
 // A row as read from the file — deliberately looser than LaunchInput; rows
 // become LaunchInputs only after passing validateRow.
@@ -82,9 +107,11 @@ function validateRow(row: ImportedRow, catalog: { strategies: Strategy[] } | und
 
 export function BotImportDialog({ open, onClose }: { open: boolean; onClose: () => void }) {
   const toast = useToast()
+  const navigate = useNavigate()
   const { data: catalog } = useStrategies()
   const fileInput = useRef<HTMLInputElement>(null)
   const [fileName, setFileName] = useState('')
+  const [intent, setIntent] = useState<ImportIntent>('live')
   const [rows, setRows] = useState<ImportedRow[] | null>(null)
   const [parseError, setParseError] = useState('')
   const [dragging, setDragging] = useState(false)
@@ -93,6 +120,7 @@ export function BotImportDialog({ open, onClose }: { open: boolean; onClose: () 
     if (open) {
       setRows(null)
       setFileName('')
+      setIntent('live')
       setParseError('')
       setDragging(false)
     }
@@ -151,11 +179,23 @@ export function BotImportDialog({ open, onClose }: { open: boolean; onClose: () 
   const importable = (rows ?? []).filter((row) => row._valid)
   const problems = (rows ?? []).filter((row) => !row._valid)
 
-  const run = useApiMutation((input: LaunchInput[]) => importBots(input), ['bots', 'bot', 'dashboard', 'search', 'portfolio'], {
+  const run = useApiMutation((input: { items: LaunchInput[]; intent: ImportIntent }) => importBots(input.items, input.intent), ['bots', 'bot', 'dashboard', 'search', 'portfolio'], {
     onSuccess: (result) => {
       const skipped = result.failed.length
-      toast(`Imported ${result.launched.length} bot${result.launched.length === 1 ? '' : 's'} (paused)${skipped ? ` · ${skipped} skipped` : ''}`)
-      onClose()
+      const runErrors = result.runs.errors.length
+      if (result.intent === 'backtest') {
+        toast(`Imported ${result.launched.length} bot${result.launched.length === 1 ? '' : 's'} · queued ${result.runs.queued} backtest${result.runs.queued === 1 ? '' : 's'}${skipped || runErrors ? ` · ${Math.max(skipped, runErrors)} not queued` : ''}`, skipped || runErrors ? 'danger' : undefined)
+        onClose()
+        navigate('/training?tab=backtests')
+      } else if (result.intent === 'train') {
+        const trained = result.runs.training.length
+        toast(`Imported ${result.launched.length} bot${result.launched.length === 1 ? '' : 's'} · trained ${trained}${skipped || runErrors ? ` · ${Math.max(skipped, runErrors)} not trained` : ''}`, skipped || runErrors ? 'danger' : undefined)
+        onClose()
+        navigate('/training')
+      } else {
+        toast(`Imported ${result.launched.length} bot${result.launched.length === 1 ? '' : 's'} (paused)${skipped ? ` · ${skipped} skipped` : ''}`)
+        onClose()
+      }
     },
   })
 
@@ -167,10 +207,14 @@ export function BotImportDialog({ open, onClose }: { open: boolean; onClose: () 
     params: row.params,
     capital: row.capital as number,
     riskPct: row.riskPct ?? 25,
-    mode: row.mode,
+    // Backtest/train runs draw on simulation money, so a live-routed row is
+    // parked as paper — it still imported, but never pretends to trade live.
+    mode: intent === 'live' ? row.mode : 'paper',
     connectionId: row.connectionId ?? null,
     ...(row.rules !== undefined ? { rules: row.rules } : {}),
   })
+
+const dialog = INTENTS.find((entry) => entry.key === intent) ?? INTENTS[0]
 
   return (
     <Dialog
@@ -178,7 +222,7 @@ export function BotImportDialog({ open, onClose }: { open: boolean; onClose: () 
       onClose={onClose}
       width={640}
       title="Import bots"
-      description="Upload a JSON file of bot configs — valid rows launch as paper bots, paused so you can review them."
+      description={dialog.description}
       footer={
         <>
           <Button onClick={downloadSample} type="button">Download sample</Button>
@@ -188,14 +232,39 @@ export function BotImportDialog({ open, onClose }: { open: boolean; onClose: () 
             type="button"
             disabled={importable.length === 0 || run.isPending}
             loading={run.isPending}
-            onClick={() => importable.length > 0 && run.mutate(importable.map(asLaunchInput))}
+            onClick={() => importable.length > 0 && run.mutate({ items: importable.map(asLaunchInput), intent })}
           >
-            Import {importable.length} bot{importable.length === 1 ? '' : 's'}
+            {intent === 'live'
+              ? `Import ${importable.length} bot${importable.length === 1 ? '' : 's'}`
+              : intent === 'backtest'
+                ? `Import ${importable.length} · queue backtests`
+                : `Import ${importable.length} · train configs`}
           </Button>
         </>
       }
     >
       <div className="grid gap-4">
+        {/* Destination: the three places an uploaded batch can go */}
+        <div className="grid">
+          <div className="flex items-baseline justify-between">
+            <span className="text-[12.5px] font-medium text-muted">Destination</span>
+            <span className="text-[11.5px] text-faint">{dialog.hint}</span>
+          </div>
+          <div role="radiogroup" aria-label="Import destination" className="mt-1.5 flex flex-wrap gap-1.5">
+            {INTENTS.map((entry) => (
+              <button
+                key={entry.key}
+                type="button"
+                role="radio"
+                aria-checked={intent === entry.key}
+                onClick={() => setIntent(entry.key)}
+                className={`rounded-full px-3.5 py-1.5 text-[12.5px] font-medium transition-colors ${intent === entry.key ? 'bg-fg text-bg' : 'border border-control bg-surface text-muted hover:bg-surface-2'}`}
+              >
+                {entry.label}
+              </button>
+            ))}
+          </div>
+        </div>
         {rows === null ? (
           <div
             role="button"

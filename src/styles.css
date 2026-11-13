@@ -12,18 +12,23 @@
   --color-raised: #ebebef;
   --color-line: #e7e7ec;
   --color-line-strong: #d7d7df;
+  /* Control borders are the one boundary that has to be perceivable on its
+   * own (WCAG 1.4.11): dividers can stay soft, inputs and buttons cannot. */
+  --color-control: #8a8a95;
   --color-fg: #141418;
-  --color-muted: #6a6a76;
-  --color-faint: #9b9ba6;
+  /* Text tiers clear 4.5:1 on surface, surface-2 and raised, so captions stay
+   * readable rather than merely faint. */
+  --color-muted: #5b5b66;
+  --color-faint: #696973;
   --color-accent: #5a55de;
   --color-accent-soft: #eeedfc;
-  --color-success: #1d9a66;
+  --color-success: #17794f;
   --color-success-soft: #e5f6ed;
-  --color-warning: #c27a12;
+  --color-warning: #8f5a0b;
   --color-warning-soft: #fdf1df;
-  --color-danger: #d4462f;
+  --color-danger: #b83a24;
   --color-danger-soft: #fdebe8;
-  --color-info: #2f77d1;
+  --color-info: #2461ae;
   --color-info-soft: #e8f1fd;
 
   --radius-control: 12px;
@@ -45,11 +50,12 @@
   --color-raised: #26262e;
   --color-line: #26262e;
   --color-line-strong: #383843;
+  --color-control: #767684;
   --color-fg: #eaeaef;
-  --color-muted: #9b9ba6;
-  --color-faint: #6c6c78;
+  --color-muted: #a8a8b4;
+  --color-faint: #8e8e9a;
   --color-accent: #8a85f5;
-  --color-accent-soft: #302e66;
+  --color-accent-soft: #25234d;
   --color-success: #3bb982;
   --color-success-soft: #16342a;
   --color-warning: #e0a24b;
@@ -173,4 +179,49 @@ html[data-theme='dark'] {
 @utility t-num {
   font-variant-numeric: tabular-nums;
   letter-spacing: -0.015em;
+}
+
+/* Interactive bar control (risk, funding): the element receives its track
+ * fill as an inline `background` gradient scaled by the filled share, while
+ * the native thumb is restyled here so dragging reads on every browser.
+ * Keyboard focus keeps the same ring as the other controls. */
+@utility range-bar {
+  appearance: none;
+  -webkit-appearance: none;
+  height: 10px;
+  width: 100%;
+  border-radius: 999px;
+  outline: none;
+  cursor: pointer;
+
+  &:focus-visible {
+    box-shadow: 0 0 0 3px rgb(from var(--color-accent) r g b / 0.35);
+  }
+
+  &::-webkit-slider-thumb,
+  &::-moz-range-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    height: 18px;
+    width: 18px;
+    border-radius: 999px;
+    background:
+      linear-gradient(-45deg, transparent 62%, var(--color-bg) 66%) 0 0 / 6px 6px repeat,
+      var(--color-surface);
+    border: 1px solid var(--color-line-strong);
+    box-shadow: 0 1px 3px rgb(20 20 24 / 0.35);
+    cursor: grab;
+    transition: transform 120ms ease;
+  }
+
+  &:active::-webkit-slider-thumb,
+  &:active::-moz-range-thumb {
+    transform: scale(1.12);
+    cursor: grabbing;
+  }
+
+  &:disabled {
+    opacity: 0.55;
+    cursor: not-allowed;
+  }
 }

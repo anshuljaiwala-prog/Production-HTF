@@ -5,22 +5,36 @@ import { Button, Dialog, Field, useToast } from '../ui'
 import { FieldInput, FieldSelect } from '../form-fields'
 import type { Connection } from '../../../shared/types'
 
-type FormState = { name: string; exchange: string; apiKey: string; apiSecret: string; mode: 'paper' | 'live' }
+type FormState = {
+  name: string
+  exchange: string
+  apiKey: string
+  apiSecret: string
+  mode: 'paper' | 'live'
+  environment: 'sandbox' | 'production'
+}
 
 export function ConnectionForm({ open, onClose, connection = null }: { open: boolean; onClose: () => void; connection?: Connection | null }) {
   const toast = useToast()
   const { data: catalog } = useConnections()
   const editing = connection !== null
-  const [form, setForm] = useState<FormState>({ name: '', exchange: 'Alpaca', apiKey: '', apiSecret: '', mode: 'paper' })
+  const [form, setForm] = useState<FormState>({ name: '', exchange: 'Alpaca', apiKey: '', apiSecret: '', mode: 'paper', environment: 'production' })
 
   // Create starts blank; edit starts from the stored (masked-only) row — the
   // key/secret fields stay empty and mean "keep the saved credential".
   useEffect(() => {
     if (!open) return
     if (connection) {
-      setForm({ name: connection.name, exchange: connection.exchange, apiKey: '', apiSecret: '', mode: connection.mode })
+      setForm({
+        name: connection.name,
+        exchange: connection.exchange,
+        apiKey: '',
+        apiSecret: '',
+        mode: connection.mode,
+        environment: connection.environment ?? 'production',
+      })
     } else {
-      setForm({ name: '', exchange: catalog?.exchanges[1] ?? 'Alpaca', apiKey: '', apiSecret: '', mode: 'paper' })
+      setForm({ name: '', exchange: catalog?.exchanges[1] ?? 'Alpaca', apiKey: '', apiSecret: '', mode: 'paper', environment: 'production' })
     }
   }, [open, connection, catalog])
 
@@ -81,7 +95,10 @@ export function ConnectionForm({ open, onClose, connection = null }: { open: boo
             placeholder={editing ? connection.keyMasked : undefined}
           />
         </Field>
-        <Field label={editing ? 'API secret (leave blank to keep the saved secret)' : 'API secret'}>
+        <Field
+          label={editing ? 'API secret (leave blank to keep the saved secret)' : 'API secret'}
+          hint="BSE connections: paste the Upstox access token here. Production tokens rotate daily; sandbox tokens last 30 days."
+        >
           <FieldInput
             required={!editing}
             type="password"
@@ -90,12 +107,20 @@ export function ConnectionForm({ open, onClose, connection = null }: { open: boo
             onChange={(e) => setForm({ ...form, apiSecret: e.target.value })}
           />
         </Field>
-        <Field label="Default mode" hint="v1 executes in paper mode only — no live adapter is wired up yet.">
-          <FieldSelect value={form.mode} onChange={(e) => setForm({ ...form, mode: e.target.value as 'paper' | 'live' })}>
-            <option value="paper">Paper</option>
-            <option value="live">Live</option>
-          </FieldSelect>
-        </Field>
+        <div className="grid grid-cols-2 gap-3">
+          <Field label="Default mode" hint="What bots on this account start as.">
+            <FieldSelect value={form.mode} onChange={(e) => setForm({ ...form, mode: e.target.value as 'paper' | 'live' })}>
+              <option value="paper">Paper</option>
+              <option value="live">Live</option>
+            </FieldSelect>
+          </Field>
+          <Field label="Environment" hint="Sandbox rehearses against the venue's test API; production places real orders.">
+            <FieldSelect value={form.environment} onChange={(e) => setForm({ ...form, environment: e.target.value as 'sandbox' | 'production' })}>
+              <option value="production">Production</option>
+              <option value="sandbox">Sandbox / testnet</option>
+            </FieldSelect>
+          </Field>
+        </div>
         {save.error && <p className="text-[13px] text-danger">{save.error.message}</p>}
       </form>
     </Dialog>

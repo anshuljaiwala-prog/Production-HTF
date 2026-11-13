@@ -1,13 +1,15 @@
 import { ArrowDownRight, ArrowLeft, ArrowUpRight, Pause, Play, PowerOff, Trash2 } from 'lucide-react'
-import { useState } from 'react'
-import { useQuery } from '@tanstack/react-query'
+import { useEffect, useState } from 'react'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Link, useNavigate, useParams } from 'react-router'
 
 import { AreaChart, BarChart, CandleChart, ChartNote, DrawdownChart, Sparkline } from '../components/charts'
-import { Badge, Button, Card, ConfirmDialog, DataTable, EmptyState, Live, Skeleton, useToast, type DataColumn } from '../components/ui'
-import { controlBot, deleteBot, fetchMarketHistory, patchBot, useApiMutation, useBot, useBotAccuracy } from '../lib/api'
+import { PatternScan } from '../components/PatternScan'
+import { RangeBar, riskTier } from '../components/controls'
+import { Badge, Button, Card, ConfirmDialog, DataTable, EmptyState, Input, Live, Skeleton, useToast, type DataColumn } from '../components/ui'
+import { adjustFunding, ApiError, controlBot, deleteBot, fetchMarketHistory, patchBot, useApiMutation, useBot, useBotAccuracy } from '../lib/api'
 import { cx } from '../lib/cx'
-import { money, relativeTime, shortDate } from '../lib/format'
+import { money, elapsed, relativeTime, shortDate } from '../lib/format'
 import { BOT_STAGES, TIMEFRAMES, activityOf, type AccuracyStat, type Bot, type BotStage, type BotEvent, type Position, type Timeframe, type Trade } from '../../shared/types'
 
 /* Increment labels for the timeframe scroller (TIMEFRAMES labels read in words). */
@@ -71,9 +73,19 @@ export function BotDetail() {
   }
 
   const { bot, positions, trades, events, equity } = data
-  const pnl = bot.equity - bot.initialEquity
-  const pnlPct = bot.initialEquity > 0 ? (pnl / bot.initialEquity) * 100 : 0
+  // Funding moves capital and equity together, so P&L is measured against
+  // capital (the funded basis) — a deposit must never manufacture profit.
+  const pnl = bot.equity - bot.capital
+  const pnlPct = bot.capital > 0 ? (pnl / bot.capital) * 100 : 0
   const winRate = bot.roundTrips > 0 ? (bot.wins / bot.roundTrips) * 100 : null
+  // State provenance: how long the bot has sat in its current state. A
+  // running bot counts from its first start; a parked one (training/hangar)
+  // counts from the latest control change — updatedAt is written by the
+  // same transaction that logs the "Grounded/Paused/Resumed" event.
+  const stateNote =
+    bot.status === 'running'
+      ? `running · up ${elapsed(bot.startedAt ?? bot.createdAt)}`
+      : `held · ${activityOf(bot)} for ${elapsed(bot.updatedAt)}`
   const curve = sample(equity).map((point) => ({
     label: new Date(point.t).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit' }),
     value: point.value,
@@ -150,6 +162,10 @@ export function BotDetail() {
           <span>{bot.symbols.join(' · ')}</span>
           <span aria-hidden>·</span>
           <span>{bot.startedAt ? `first started ${relativeTime(bot.startedAt)}` : `created ${shortDate(bot.createdAt)}`}</span>
+          <span aria-hidden>·</span>
+          {/* Uptime for the current state: what the run events panel is
+              titled with, mirrored here so the operator bar reads alone. */}
+          <span className={cx('t-num', bot.status === 'running' ? 'text-success' : 'text-faint')}>{stateNote}</span>
         </div>
       </div>
 
@@ -167,6 +183,11 @@ export function BotDetail() {
           </Card>
         ))}
       </div>
+
+      {/* Operator levers for this bot: the two numbers an operator reaches for
+          mid-flight — what the engine may risk per entry, and how much of
+          the operator's money the bot holds. */}
+      <OperatorControls botId={id!} bot={bot} />
 
       <div className="mt-3 grid gap-3 lg:grid-cols-3">
         <Card className="p-5 lg:col-span-2">
@@ -191,11 +212,15 @@ export function BotDetail() {
         </Card>
 
         <Card className="p-5">
-          <EventStream events={events} />
+          <EventStream events={events} stateNote={stateNote} />
         </Card>
       </div>
 
       <MarketPanel bot={bot} trades={trades} running={bot.status === 'running'} />
+
+      {/* Multi-market read: every tracked symbol's regime, the historic crash
+          or hype its tape resembles, and the live events it is linked to. */}
+      <PatternScan botId={id} running={bot.status === 'running'} />
 
       <div className="grid gap-3 lg:grid-cols-2">
         <Card className="p-5">
@@ -295,9 +320,188 @@ export function BotDetail() {
   )
 }
 
+/** Operator levers for one bot, driven by the endpoints the rest of the app
+ * already enforces: the interactive risk bar PATCHes risk_pct (a running bot
+ * must pause first — the server 409s otherwise and the bar says so), and the
+ * money-held bar moves capital in or out through /cashflow, with the same
+ * rule that a withdrawal is capped by idle cash. Funding moves capital and
+ * equity together, so neither slider touches recorded P&L. */
+function OperatorControls({ botId, bot }: { botId: string; bot: Bot }) {
+  const toast = useToast()
+  const client = useQueryClient()
+
+  // Risk: local while dragging, PATCHed on Apply so a slider sweep cannot
+  // spam the API with intermediate values.
+  const [risk, setRisk] = useState(bot.riskPct)
+  const riskDirty = risk !== bot.riskPct
+  const saveRisk = useApiMutation((next: number) => patchBot(botId, { riskPct: next }), ['bot', 'bots', 'portfolio', 'dashboard'], {
+    onSuccess: () => toast(`Risk set to ${risk}% per entry`),
+    onError: (error) => toast(error instanceof Error ? error.message : 'Risk change failed', 'danger'),
+  })
+  // Seed from the server each time the bot's stored risk changes (after a
+  // round trip or another operator's edit) — dragging may sit at any local
+  // value in between.
+  useEffect(() => setRisk(bot.riskPct), [bot.riskPct])
+  const tier = riskTier(risk)
+  const perEntry = bot.equity * (risk / 100)
+  const running = bot.status === 'running'
+
+  // Money held: the slider targets an amount held — applying it computes the
+  // delta once, against the values shown, and sends one deposit/withdraw so
+  // the ledger moves like every other funding adjustment.
+  const [target, setTarget] = useState(() => Math.max(100, Math.round(bot.equity)))
+  useEffect(() => setTarget(Math.max(100, Math.round(bot.equity))), [bot.equity])
+  // Positions cannot be withdrawn through funding — only idle cash leaves —
+  // so the bar's floor is the value already sitting in open positions.
+  const invested = Math.max(0, bot.equity - bot.cash)
+  // The bar moves in $100 steps and lets an operator fund a bot up to $10k
+  // above what it currently holds — deposits above that go through Settings.
+  const step = 100
+  const FUNDING_HEADROOM = 10_000
+  const minHeld = Math.max(100, Math.ceil(invested))
+  const maxHeld = Math.max(minHeld + step, Math.ceil(bot.equity + FUNDING_HEADROOM))
+  const delta = Math.round((Math.min(maxHeld, Math.max(minHeld, target)) - bot.equity) * 100) / 100
+  const depositing = delta > 0
+  const withdrawing = delta < 0
+  const overIdle = withdrawing && -delta > bot.cash + 1e-6
+  const move = useMutation({
+    mutationFn: () => adjustFunding(botId, { amount: delta, note: depositing ? 'Held-amount top up from bot page' : 'Held-amount reduction from bot page' }),
+    onSuccess: (_result) => {
+      toast(depositing ? `Deposited ${money(Math.abs(delta))}` : `Withdrew ${money(Math.abs(delta))}`)
+      void Promise.all(['bot', 'bots', 'portfolio', 'dashboard'].map((key) => client.invalidateQueries({ queryKey: [key] })))
+    },
+    onError: (error) => toast(error instanceof ApiError ? error.message : 'Funding adjustment failed', 'danger'),
+  })
+  const noChange = Math.abs(delta) < 1
+
+  // Starting capital: an operator edit is funding, so the server moves cash
+  // and equity by the same delta and trading P&L stays exactly as recorded.
+  const [capitalInput, setCapitalInput] = useState(String(Math.round(bot.capital)))
+  useEffect(() => setCapitalInput(String(Math.round(bot.capital))), [bot.capital])
+  const capitalValue = Number(capitalInput)
+  const capitalDirty = Number.isFinite(capitalValue) && capitalValue >= 100 && Math.abs(capitalValue - bot.capital) >= 0.01
+  const saveCapital = useApiMutation((next: number) => patchBot(botId, { capital: next }), ['bot', 'bots', 'portfolio', 'dashboard'], {
+    onSuccess: (_result, next) => toast(`Starting capital set to ${money(next)} — funding only, P&L unchanged`),
+    onError: (error) => toast(error instanceof ApiError ? error.message : 'Capital change failed', 'danger'),
+  })
+
+  return (
+    <Card className="mt-3 p-5">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div>
+          <h2 className="text-[14px] font-semibold">Risk &amp; money held</h2>
+          <p className="mt-0.5 text-[12px] text-faint">Levers for this bot only — funding never changes recorded P&amp;L.</p>
+        </div>
+        <div className="flex items-center gap-2 text-right text-[12.5px] t-num">
+          <span className="text-faint">held {money(bot.equity)}</span>
+          <span aria-hidden>·</span>
+          <span className="text-faint">cash {money(bot.cash)}</span>
+          <span aria-hidden>·</span>
+          <span className="text-faint">open {money(invested)}</span>
+        </div>
+      </div>
+
+      <div className="mt-4 grid gap-5 lg:grid-cols-2 lg:divide-x lg:divide-line">
+        {/* Risk bar ------------------------------------------------------ */}
+        <div className="lg:pr-5">
+          <div className="flex items-center justify-between gap-3">
+            <span className="text-[12.5px] font-medium text-muted">Risk the bot can take</span>
+            <span className="flex items-center gap-2">
+              <span className={cx('t-num text-[12.5px] font-medium capitalize', tier.tone === 'success' ? 'text-success' : tier.tone === 'warning' ? 'text-warning' : 'text-danger')}>
+                {tier.label}
+              </span>
+              <span className="t-num text-[13px] font-semibold">{risk}%</span>
+            </span>
+          </div>
+          <div className="mt-2.5">
+            <RangeBar min={1} max={100} step={1} value={risk} onChange={setRisk} fillVar={tier.fillVar} ariaLabel="Risk per entry" />
+          </div>
+          <p className="mt-2 text-[11.5px] leading-relaxed text-faint">
+            {running
+              ? 'The bot is trading — pause it first, then drag. A running bot\'s risk is frozen so no trade is sized by a rule that changed mid-decision.'
+              : `Each entry commits up to ${money(perEntry)} of equity (${risk}% of what the bot holds).`}
+          </p>
+          {!running && riskDirty && (
+            <div className="mt-2 flex items-center gap-2">
+              <Button size="sm" variant="primary" loading={saveRisk.isPending} onClick={() => saveRisk.mutate(risk)}>
+                Apply risk
+              </Button>
+              <Button size="sm" onClick={() => setRisk(bot.riskPct)} disabled={saveRisk.isPending}>
+                Reset
+              </Button>
+              <span className="text-[12px] text-faint">{bot.riskPct}% → {risk}% (was applied to future entries only)</span>
+            </div>
+          )}
+        </div>
+
+        {/* Money-held bar ------------------------------------------------ */}
+        <div className="lg:pl-5">
+          <div className="flex items-center justify-between gap-3">
+            <span className="text-[12.5px] font-medium text-muted">Money the bot holds</span>
+            <span className="t-num text-[13px] font-semibold">{money(Math.min(maxHeld, Math.max(minHeld, target)))}</span>
+          </div>
+          <div className="mt-2.5">
+            <RangeBar
+              min={minHeld}
+              max={maxHeld}
+              step={step}
+              value={Math.min(maxHeld, Math.max(minHeld, target))}
+              onChange={setTarget}
+              fillVar="accent"
+              ariaLabel="Target money held"
+            />
+          </div>
+          <p className="mt-2 text-[11.5px] leading-relaxed text-faint">
+            Drag to a target and apply — the bot receives a deposit or sends back a withdrawal.
+            {withdrawing && overIdle
+              ? ` Only ${money(bot.cash)} is idle cash; open positions would have to close first.`
+              : ' Positions stay with the bot either way.'}
+          </p>
+          {!noChange && (
+            <div className="mt-2 flex items-center gap-2">
+              <Button size="sm" variant="primary" loading={move.isPending} disabled={overIdle} onClick={() => move.mutate()}>
+                {depositing ? `Deposit ${money(delta)}` : `Withdraw ${money(-delta)}`}
+              </Button>
+              <Button size="sm" onClick={() => setTarget(Math.round(bot.equity))} disabled={move.isPending}>
+                Reset
+              </Button>
+              {overIdle && <span className="text-[12px] text-warning">Exceeds idle cash — close positions first.</span>}
+            </div>
+          )}
+
+          <div className="mt-4 border-t border-line pt-3">
+            <div className="flex items-center justify-between gap-3">
+              <span className="text-[12.5px] font-medium text-muted">Starting capital</span>
+              <span className="t-num text-[13px] font-semibold">{money(bot.capital)}</span>
+            </div>
+            <div className="mt-2 flex items-center gap-2">
+              <Input
+                type="number"
+                min={100}
+                step={100}
+                value={capitalInput}
+                aria-label="Starting capital"
+                onChange={(e) => setCapitalInput(e.target.value)}
+                className="h-8 w-[150px] text-[13px]"
+              />
+              <Button size="sm" variant="primary" disabled={!capitalDirty} loading={saveCapital.isPending} onClick={() => saveCapital.mutate(capitalValue)}>
+                Set capital
+              </Button>
+              {capitalDirty && !Number.isFinite(capitalValue) && <span className="text-[12px] text-warning">Minimum $100.</span>}
+            </div>
+            <p className="mt-1.5 text-[11.5px] leading-relaxed text-faint">
+              An edit is funding: cash and equity move by the same amount, so trading P&amp;L (equity − capital) is preserved and the change lands in the ledger.
+            </p>
+          </div>
+        </div>
+      </div>
+    </Card>
+  )
+}
+
 /** Run-event feed with a level filter (all · signals · fills · info ·
- * warnings · errors) so operators can pull one thread out of the stream. */
-function EventStream({ events }: { events: BotEvent[] }) {
+ * warns · errors), so a busy bot's stream stays readable. */
+function EventStream({ events, stateNote }: { events: BotEvent[]; stateNote?: string }) {
   const [level, setLevel] = useState<'all' | BotEvent['level']>('all')
   const levels: { key: 'all' | BotEvent['level']; label: string; hint?: string }[] = [
     { key: 'all', label: 'All' },
@@ -311,7 +515,12 @@ function EventStream({ events }: { events: BotEvent[] }) {
   return (
     <>
       <div className="flex items-center justify-between gap-2">
-        <h2 className="text-[14px] font-semibold">Run events</h2>
+        <div className="min-w-0">
+          <h2 className="text-[14px] font-semibold">Run events</h2>
+          {/* Training/hangar bots have no fills to watch — the state clock is
+              the most useful line here: this is the state this stream means. */}
+          {stateNote && <p className="truncate text-[11.5px] text-faint">{stateNote}</p>}
+        </div>
         <span className="text-[12.5px] t-num text-faint">{filtered.length}/{events.length}</span>
       </div>
       <div className="mt-2.5 flex flex-wrap gap-1" role="group" aria-label="Filter events by level">

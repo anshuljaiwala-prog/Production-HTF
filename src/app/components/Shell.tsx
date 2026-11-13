@@ -1,4 +1,4 @@
-import { Bot, Check, FlaskConical, GraduationCap, LayoutGrid, Menu as MenuIcon, Moon, Plug, Search, Settings, Sun, Wallet, X } from 'lucide-react'
+import { Bot, Check, FlaskConical, Globe, GraduationCap, LayoutGrid, Menu as MenuIcon, Moon, Plug, Search, Settings, Sun, Wallet, X } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { NavLink, Outlet, useLocation } from 'react-router'
 
@@ -14,6 +14,7 @@ const links = [
   { to: '/strategies', label: 'Strategies', icon: FlaskConical },
   { to: '/training', label: 'Training', icon: GraduationCap },
   { to: '/portfolio', label: 'Portfolio', icon: Wallet },
+  { to: '/environment', label: 'Environment', icon: Globe },
   { to: '/connections', label: 'Connections', icon: Plug },
 ]
 
@@ -26,6 +27,15 @@ export function Shell() {
   const location = useLocation()
 
   useEffect(() => setMobileOpen(false), [location.pathname])
+
+  // The mobile drawer is a modal surface: Escape has to close it, the same
+  // way the desktop dialogs do.
+  useEffect(() => {
+    if (!mobileOpen) return
+    const onKey = (e: KeyboardEvent) => e.key === 'Escape' && setMobileOpen(false)
+    document.addEventListener('keydown', onKey)
+    return () => document.removeEventListener('keydown', onKey)
+  }, [mobileOpen])
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -62,7 +72,7 @@ export function Shell() {
       <button
         type="button"
         onClick={() => setPaletteOpen(true)}
-        className="mt-3 flex h-9 items-center gap-2 rounded-control border border-line-strong bg-surface px-2.5 text-[13px] text-muted shadow-[0_1px_1px_rgb(20_20_24/0.04)] transition-colors hover:bg-surface-2"
+        className="mt-3 flex h-9 items-center gap-2 rounded-control border border-control bg-surface px-2.5 text-[13px] text-muted shadow-[0_1px_1px_rgb(20_20_24/0.04)] transition-colors hover:bg-surface-2"
       >
         <Search className="size-4" />
         <span className="flex-1 text-left">Search</span>
@@ -115,7 +125,7 @@ export function Shell() {
             aria-label={theme === 'dark' ? 'Switch to light theme' : 'Switch to dark theme'}
             title={theme === 'dark' ? 'Switch to light theme' : 'Switch to dark theme'}
             onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}
-            className="flex h-8 w-8 shrink-0 items-center justify-center rounded-control border border-line bg-surface text-muted transition-colors hover:text-fg"
+            className="flex h-8 w-8 shrink-0 items-center justify-center rounded-control border border-control bg-surface text-muted transition-colors hover:text-fg"
           >
             {theme === 'dark' ? <Sun className="size-4" /> : <Moon className="size-4" />}
           </button>
@@ -147,11 +157,26 @@ export function Shell() {
 
   return (
     <div className="flex h-full">
+      {/* First tab stop: keyboard users skip the sidebar instead of tabbing
+          every link on every page. */}
+      <a
+        href="#main"
+        className="sr-only focus:not-sr-only focus:absolute focus:left-3 focus:top-3 focus:z-50 focus:rounded-control focus:border focus:border-control focus:bg-surface focus:px-3.5 focus:py-2 focus:text-[13px] focus:font-medium focus:shadow-pop"
+      >
+        Skip to content
+      </a>
       <aside className="hidden w-[236px] shrink-0 lg:block">{sidebar}</aside>
 
       {/* Mobile top bar */}
       <div className="fixed inset-x-0 top-0 z-30 flex h-12 items-center justify-between border-b border-line bg-bg/90 px-3 backdrop-blur lg:hidden">
-        <button type="button" aria-label="Open menu" onClick={() => setMobileOpen(true)} className="grid size-9 place-items-center rounded-control">
+        <button
+          type="button"
+          aria-label="Open menu"
+          aria-expanded={mobileOpen}
+          aria-controls="mobile-nav"
+          onClick={() => setMobileOpen(true)}
+          className="grid size-9 place-items-center rounded-control"
+        >
           <MenuIcon className="size-5" />
         </button>
         <span className="text-[14px] font-semibold">HTF</span>
@@ -162,7 +187,14 @@ export function Shell() {
       {mobileOpen && (
         <div className="fixed inset-0 z-40 lg:hidden" onClick={() => setMobileOpen(false)}>
           <div className="absolute inset-0 bg-fg/20" />
-          <aside className="absolute inset-y-0 left-0 w-[280px] bg-bg shadow-dialog" onClick={(e) => e.stopPropagation()}>
+          <aside
+            id="mobile-nav"
+            role="dialog"
+            aria-modal="true"
+            aria-label="Navigation"
+            className="absolute inset-y-0 left-0 w-[280px] bg-bg shadow-dialog"
+            onClick={(e) => e.stopPropagation()}
+          >
             <button type="button" aria-label="Close menu" onClick={() => setMobileOpen(false)} className="absolute right-3 top-3 grid size-9 place-items-center rounded-control">
               <X className="size-5" />
             </button>
@@ -171,7 +203,7 @@ export function Shell() {
         </div>
       )}
 
-      <main className="min-w-0 flex-1 pt-12 lg:p-2 lg:pl-0 lg:pt-2">
+      <main id="main" tabIndex={-1} className="min-w-0 flex-1 pt-12 focus:outline-none lg:p-2 lg:pl-0 lg:pt-2">
         <div className="scrollbar-thin h-full overflow-y-auto bg-surface lg:rounded-card lg:border lg:border-line">
           <Outlet />
         </div>

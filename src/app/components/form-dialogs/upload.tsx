@@ -70,7 +70,7 @@ export function UploadStrategyDialog({
         versions: result.strategy.versions,
         lookback: result.strategy.lookback,
       })
-      toast(`Uploaded "${result.strategy.name}" · in-memory (${result.strategy.rules} rules, lookback ${result.strategy.lookback})`)
+      toast(`Uploaded "${result.strategy.name}" · saved to D1, version ${result.strategy.version} of ${result.strategy.versions} (${result.strategy.rules} rules, lookback ${result.strategy.lookback})`)
       onClose()
       onUploaded?.(result.strategy.id)
     },
@@ -87,7 +87,7 @@ export function UploadStrategyDialog({
       onClose={onClose}
       width={640}
       title="Upload a strategy (JSON payload)"
-      description="Entry/exit conditions on rsi, ema, zscore, donchian and momentum metrics. Stored in worker memory — a restart clears it, re-upload to restore."
+      description="Entry/exit conditions on rsi, ema, zscore, donchian and momentum metrics. Stored in D1 with version history — re-uploading the same name keeps the earlier versions."
       footer={
         <>
           <Button type="button" onClick={() => setPayload(RULES_SKELETON)}>Load a working skeleton</Button>

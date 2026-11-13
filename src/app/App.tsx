@@ -1,20 +1,34 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { useEffect } from 'react'
+import { lazy, Suspense, useEffect } from 'react'
 import { BrowserRouter, Navigate, Route, Routes, useLocation } from 'react-router'
 
 import { Shell } from './components/Shell'
 import { Spinner, ToastProvider } from './components/ui'
 import { capturePageview, identifyUser } from './lib/analytics'
 import { ApiError, useMe } from './lib/api'
-import { BotDetail } from './pages/BotDetail'
-import { Bots } from './pages/Bots'
-import { Connections } from './pages/Connections'
-import { Dashboard } from './pages/Dashboard'
-import { Portfolio } from './pages/Portfolio'
-import { Settings } from './pages/Settings'
-import { SetupNeeded, SignIn } from './pages/SignIn'
-import { Strategies } from './pages/Strategies'
-import { Training } from './pages/Training'
+
+// Route components are code-split: each page ships as its own chunk and loads
+// on first navigation, so the main bundle stays below a single 300 kB file.
+const BotDetail = lazy(() => import('./pages/BotDetail').then((m) => ({ default: m.BotDetail })))
+const Bots = lazy(() => import('./pages/Bots').then((m) => ({ default: m.Bots })))
+const Connections = lazy(() => import('./pages/Connections').then((m) => ({ default: m.Connections })))
+const Dashboard = lazy(() => import('./pages/Dashboard').then((m) => ({ default: m.Dashboard })))
+const Environment = lazy(() => import('./pages/Environment').then((m) => ({ default: m.Environment })))
+const Portfolio = lazy(() => import('./pages/Portfolio').then((m) => ({ default: m.Portfolio })))
+const Settings = lazy(() => import('./pages/Settings').then((m) => ({ default: m.Settings })))
+const SignIn = lazy(() => import('./pages/SignIn').then((m) => ({ default: m.SignIn })))
+const SetupNeeded = lazy(() => import('./pages/SignIn').then((m) => ({ default: m.SetupNeeded })))
+const Strategies = lazy(() => import('./pages/Strategies').then((m) => ({ default: m.Strategies })))
+const Training = lazy(() => import('./pages/Training').then((m) => ({ default: m.Training })))
+
+/** Reads the same spinner the Gate shows while /api/me resolves. */
+function SplitFallback() {
+  return (
+    <div className="grid h-full place-items-center">
+      <Spinner />
+    </div>
+  )
+}
 
 const client = new QueryClient({
   defaultOptions: { queries: { retry: 1, refetchOnWindowFocus: false, staleTime: 15_000 } },
@@ -44,33 +58,33 @@ function Gate() {
     if (me.data) identifyUser(me.data)
   }, [me.data])
   if (me.isLoading) {
-    return (
-      <div className="grid h-full place-items-center">
-        <Spinner />
-      </div>
-    )
+    return <SplitFallback />
   }
   if (me.error instanceof ApiError) {
     if (me.error.status === 401) return <SignIn />
     if (me.error.status === 503) return <SetupNeeded message={me.error.message} />
   }
   if (me.error) return <SetupNeeded message={me.error.message} />
+  // One fallback covers every lazily imported route chunk: the shell streams
+  // in first, each page fills the outlet as its own file lands.
   return (
-    <Routes>
-      <Route element={<Shell />}>
-        <Route index element={<Dashboard />} />
-        <Route path="bots" element={<Bots />} />
-        <Route path="bots/:id" element={<BotDetail />} />
-        <Route path="board" element={<Navigate to="/bots?tab=board" replace />} />
-        <Route path="strategies" element={<Strategies />} />
-        <Route path="training" element={<Training />} />
-        <Route path="backtests" element={<BacktestsRedirect />} />
-        <Route path="connections" element={<Connections />} />
-        <Route path="portfolio" element={<Portfolio />} />
-        <Route path="settings" element={<Settings />} />
-        <Route path="*" element={<Navigate to="/" replace />} />
-      </Route>
-    </Routes>
+    <Suspense fallback={<SplitFallback />}>
+      <Routes>
+        <Route element={<Shell />}>
+          <Route index element={<Dashboard />} />          <Route path="bots" element={<Bots />} />
+          <Route path="bots/:id" element={<BotDetail />} />
+          <Route path="backtests" element={<BacktestsRedirect />} />
+          <Route path="board" element={<Navigate to="/bots?tab=board" replace />} />
+          <Route path="strategies" element={<Strategies />} />
+          <Route path="training" element={<Training />} />
+          <Route path="connections" element={<Connections />} />
+          <Route path="portfolio" element={<Portfolio />} />
+          <Route path="environment" element={<Environment />} />
+          <Route path="settings" element={<Settings />} />
+          <Route path="*" element={<Navigate to="/" replace />} />
+        </Route>
+      </Routes>
+    </Suspense>
   )
 }
 

@@ -111,14 +111,14 @@ export function Backtests({ embedded = false }: { embedded?: boolean }) {
           <table className="w-full min-w-[900px] table-fixed text-left text-[13.5px]">
             <thead>
               <tr className="h-10 border-b border-line bg-bg/60 text-[12.5px] text-muted">
-                <th className="w-[26%] px-4 font-medium">Run</th>
-                <th className="w-[16%] px-4 font-medium">Market</th>
-                <th className="w-[14%] px-4 font-medium">Period</th>
-                <th className="w-[11%] px-4 text-right font-medium">Return</th>
-                <th className="w-[11%] px-4 text-right font-medium">Max DD</th>
-                <th className="w-[9%] px-4 text-right font-medium">Sharpe</th>
-                <th className="w-[9%] px-4 text-right font-medium">Win rate</th>
-                <th className="w-[8%] px-4 text-right font-medium">Fills</th>
+                <th scope="col" className="w-[26%] px-4 font-medium">Run</th>
+                <th scope="col" className="w-[16%] px-4 font-medium">Market</th>
+                <th scope="col" className="w-[14%] px-4 font-medium">Period</th>
+                <th scope="col" className="w-[11%] px-4 text-right font-medium">Return</th>
+                <th scope="col" className="w-[11%] px-4 text-right font-medium">Max DD</th>
+                <th scope="col" className="w-[9%] px-4 text-right font-medium">Sharpe</th>
+                <th scope="col" className="w-[9%] px-4 text-right font-medium">Win rate</th>
+                <th scope="col" className="w-[8%] px-4 text-right font-medium">Fills</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-line">
@@ -294,8 +294,11 @@ function BacktestDrawer({
                 return (
                   <>
                     <p className="mt-1 text-[12.5px] text-muted">
-                      The simulated feed this run replayed — {backtest.symbol} · {backtest.timeframe} · {bars} bars
-                      {bucketed ? `, bucketed into ${candles.length} candles for display` : ''}. Markers are the run's fills.
+                      {market.isLoading
+                        ? `Loading the simulated feed this run replayed — ${backtest.symbol} · ${backtest.timeframe}…`
+                        : `The simulated feed this run replayed — ${backtest.symbol} · ${backtest.timeframe} · ${bars} bars${
+                            bucketed ? `, bucketed into ${candles.length} candles for display` : ''
+                          }. Markers are the run's fills.`}
                     </p>
                     <div className="mt-1 flex flex-wrap items-center gap-3 text-[11.5px] text-faint">
                       <span className="inline-flex items-center gap-1">
@@ -382,7 +385,9 @@ function BacktestDrawer({
                         height={130}
                       />
                     ) : (
-                      <p className="py-6 text-center text-[13px] text-muted">The strategy never closed a trade</p>
+                      <p className="py-6 text-center text-[13px] text-muted">
+                        {detail.isLoading ? 'Loading trades…' : 'The strategy never closed a trade'}
+                      </p>
                     )
                   })()}
                 </div>
@@ -392,7 +397,9 @@ function BacktestDrawer({
             <div>
               <div className="flex items-center justify-between">
                 <h3 className="text-[13.5px] font-semibold">Trades</h3>
-                <span className="text-[12px] text-faint">{backtest.trades.length} fills</span>
+                <span className="text-[12px] text-faint">
+                  {detail.isLoading ? 'loading…' : `${backtest.trades.length} fills`}
+                </span>
               </div>
               <div className="mt-2 max-h-[320px] overflow-y-auto rounded-card border border-line">
                 <table className="w-full table-fixed text-left text-[13px]">
@@ -412,7 +419,11 @@ function BacktestDrawer({
                     ))}
                   </tbody>
                 </table>
-                {backtest.trades.length === 0 && <p className="py-6 text-center text-[13px] text-muted">The strategy never traded</p>}
+                {backtest.trades.length === 0 && (
+                  <p className="py-6 text-center text-[13px] text-muted">
+                    {detail.isLoading ? 'Loading trades…' : 'The strategy never traded'}
+                  </p>
+                )}
               </div>
             </div>
           </div>

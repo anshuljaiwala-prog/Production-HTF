@@ -1,0 +1,209 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>HTF — Function &amp; UI/UX Walkthrough</title>
+<style>
+  @page { size: A4; margin: 18mm 16mm; }
+  :root { --ink:#16161a; --mute:#5c5c66; --line:#e4e4ea; --accent:#3d5afe; --code-bg:#f4f4f8; }
+  * { box-sizing: border-box; }
+  body { font: 10.5pt/1.55 "Segoe UI", system-ui, sans-serif; color: var(--ink); margin: 0; }
+  h1 { font-size: 22pt; letter-spacing: -.02em; margin: 0 0 4px; }
+  .sub { color: var(--mute); font-size: 10pt; margin-bottom: 22px; }
+  h2 { font-size: 14pt; margin: 26px 0 6px; padding-bottom: 4px; border-bottom: 2px solid var(--ink); page-break-after: avoid; }
+  h3 { font-size: 11.5pt; margin: 16px 0 4px; color: var(--accent); page-break-after: avoid; }
+  h4 { font-size: 10.5pt; margin: 10px 0 2px; page-break-after: avoid; }
+  p, li { margin: 3px 0; }
+  ul { margin: 4px 0 8px; padding-left: 18px; }
+  code { font: 9pt/1.4 "Cascadia Code", Consolas, monospace; background: var(--code-bg); padding: 1px 4px; border-radius: 3px; }
+  li code { background: none; padding: 0; }
+  table { width: 100%; border-collapse: collapse; margin: 8px 0 12px; font-size: 9.5pt; page-break-inside: avoid; }
+  th, td { border: 1px solid var(--line); padding: 5px 7px; text-align: left; vertical-align: top; }
+  th { background: var(--code-bg); }
+  .fn { font-weight: 600; }
+  .path { color: var(--mute); font: 9pt Consolas, monospace; }
+  .note { background: #fffbe8; border-left: 3px solid #e6c200; padding: 6px 10px; margin: 8px 0; font-size: 9.5pt; }
+  .pagebreak { page-break-before: always; }
+  .flow { background: var(--code-bg); border: 1px solid var(--line); border-radius: 6px; padding: 8px 12px; font: 9pt/1.6 "Cascadia Code", Consolas, monospace; white-space: pre-wrap; margin: 8px 0; }
+</style>
+</head>
+<body>
+
+<h1>HTF — Function &amp; UI/UX Walkthrough</h1>
+<div class="sub">How every server-side function works, and how the UI/UX shell drives the frontend · generated from the live codebase</div>
+
+<h2>Part 1 — How each function works</h2>
+
+<h3>1. Request entry &amp; auth <span class="path">src/worker/index.ts · auth.ts</span></h3>
+<ul>
+  <li>The Worker's <code>fetch</code> handler wraps the whole HONO app once per isolate with <code>getAuth(env, request)</code> — Freebuff OIDC sessions when a client ID is configured, otherwise a loopback development user. No per-route auth code exists.</li>
+  <li>Public routes: <code>GET /api/auth/status</code> (mode + database/files presence) and <code>GET /api/health</code>. Everything under <code>/api</code> passes <code>requireUser</code> then <code>requireDb</code>.</li>
+  <li>Mounted routers: <code>workspace</code> (root), <code>/bots</code>, <code>/strategies</code>, <code>/backtests</code>, <code>/connections</code>, <code>/portfolio</code>, <code>/market</code>. <code>app.onError</code> returns a JSON 500; unknown <code>/api/*</code> paths 404, everything else falls through to <code>env.ASSETS</code> (the built SPA).</li>
+  <li><code>privateJson(c, body, status)</code> stamps <code>Cache-Control: private, no-store</code> on every authenticated payload.</li>
+</ul>
+
+<h3>2. Workspace, seeding &amp; fast-forward <span class="path">src/worker/routes/workspace.ts · seed.ts</span></h3>
+<ul>
+  <li><code>ensureWorkspace</code> creates the operator row on first call; <code>seedWorkspace</code> fills it with the demo fleet (<code>insertDemoBots</code>: five live-mode paused bots, launch equity points, demo venues) when the data set is empty; <code>clearWorkspace</code> backs the Settings reset, and <code>POST /bots/demo</code> replaces the fleet with those five without touching connections or backtests.</li>
+  <li><code>loadBots</code> is the read path every list endpoint uses: it loads the fleet and calls <code>advanceRunning</code>, which fast-forwards up to 12 running bots per request so a paused page still shows fresh equity. The engine tick itself is <code>advanceBot</code> (below).</li>
+  <li><code>buildEquitySeries(bots, rows, windowStart, t)</code> buckets equity history into the dashboard's chart points.</li>
+  <li>Endpoints: <code>GET /me</code>, <code>PATCH /workspace</code> (rename/prefs), <code>POST /workspace/reset</code>, <code>DELETE /workspace/data</code>, <code>GET /overview</code> (equity curve, stage totals, fleet counts, attention list, event feed), <code>GET /search</code> (command-palette results).</li>
+</ul>
+
+<h3>3. Bot creation — one function for launch, import, backtest and train <span class="path">src/worker/routes/bots.ts</span></h3>
+<div class="flow">POST /bots  ─────────────┐
+POST /bots/import ───────┼─► validateSpec ─► createBot ─► INSERT + logEvent('Launched…')
+  intent: live ──────────┤        │
+  intent: backtest ──────┤        └─ (import only, dry-run first: ready/problem rows)
+  intent: train ─────────┘               │
+                                    intent ≠ live ⇒ park as mode:'paper', status:'paused'
+                                    then queueRunForBot ─► scheduleBacktest / runTraining</div>
+<ul>
+  <li><span class="fn">validateSpec(db, owner, body)</span> — resolves the strategy (catalog key, or inline <code>rules</code> → the custom strategy); folds the singular <code>symbol</code> spelling into <code>symbols</code>; runs every symbol through <code>normalizeSymbol</code> (unknown symbols are named in the rejection — they never reach the synthetic feed); checks the timeframe against the strategy's list; sanitizes params (<code>sanitizeParams</code>, or <code>parseRules</code> for uploaded rules); clamps capital and risk; derives <code>status</code>/<code>stage</code>. Returns a typed spec or an error reason.</li>
+  <li><span class="fn">createBot(db, owner, body)</span> — the single live-launch function. validate → <code>INSERT INTO bots</code> → <code>logEvent</code> launch line → reload. Single launch, bulk import, and the import dry-run all call it, so an uploaded config gets exactly the validation a hand-launched bot gets.</li>
+  <li><span class="fn">POST /bots/import</span> — accepts <code>{ items, intent: 'live' | 'backtest' | 'train' }</code> (max <code>MAX_IMPORT</code>). It validates <em>every</em> row first (the dialog's review screen), then creates each bot through <code>createBot</code>. Non-live intents park the row as paper/paused and call <code>queueRunForBot</code>, which reuses <code>scheduleBacktest</code> or <code>runTraining</code> (auto-sweep, slim payload) with the bot's stored params or rules. Returns <code>{ intent, launched, failed, runs: { queued, training, backtests, errors } }</code>.</li>
+  <li><span class="fn">GET /bots</span> fast-forwards then lists; <span class="fn">GET /bots/:id</span> fast-forwards one bot, its trades, positions, events.</li>
+  <li><span class="fn">PATCH /bots/:id</span> — trading-settings edits (symbols/timeframe/risk/params/connection/mode) are refused with <code>409 bot_active</code> while the bot is running (pause/ground first), re-normalize symbols with the same ingress filter, and write a <code>bot_events</code> row listing every changed field — config changes show up in the event stream.</li>
+  <li><span class="fn">POST /bots/:id/control</span> — ground / resume / pause / start / stop, each logged as an event. <span class="fn">POST /bots/:id/cashflow</span> records a deposit or withdrawal (the input to portfolio reconciliation). <span class="fn">DELETE /bots/:id</span> removes the bot.</li>
+  <li><span class="fn">GET /bots/accuracy</span> &amp; <span class="fn">GET /bots/:id/accuracy</span> — score every bot (or one) with <code>measureAccuracy</code> over a fixed bar window; the fleet version feeds the Edge ranking tab.</li>
+</ul>
+
+<h3>4. The engine tick <span class="path">src/worker/engine.ts · broker.ts</span></h3>
+<ul>
+  <li><code>advanceBot</code> takes a per-bot mutex (<code>advanceLocked</code>) so concurrent reads can't double-fill a position. Each tick: pull bars for the bot's symbol/timeframe, evaluate the strategy's <code>signal(ctx)</code>, size the order from <code>riskPct</code>, route it through the execution seam — <code>PaperBroker</code> fills against the simulated wallet, while a live bot resolves its venue connections in <code>venues.ts</code> into real adapters and fills on whichever venue quotes the best price — then persist trades, positions, cash/equity, and <code>logEvent</code> every fill and failure.</li>
+  <li><code>fail()</code> converts engine errors into <code>bot_events</code> rows instead of crashing the read path; <code>write()</code> persists the bot's new state in one statement.</li>
+</ul>
+
+<h3>5. Backtest &amp; training core <span class="path">src/worker/routes/backtests.ts · backtest.ts</span></h3>
+<ul>
+  <li><code>backtestWindow(timeframe, from, to, clock)</code> clamps any requested range to the platform's <strong>5-year history bound</strong> (<code>HISTORY_YEARS</code> in <code>market.ts</code>) — user-entered custom dates are clamped here, not just the defaults.</li>
+  <li><code>runBacktest(input)</code> simulates candle-by-candle with fees and slippage, producing equity curve, trades, drawdown and summary stats; <code>toCandles()</code> adapts stored/synthetic bars for the data the platform actually has.</li>
+  <li><span class="fn">scheduleBacktest(db, owner, spec)</span> — resolves symbol/timeframe/params or rules, checks the simulation budget (<code>simBudget</code>), inserts a <code>backtests</code> row as <code>queued</code>. Used by <code>POST /backtests</code> <em>and</em> by bot import's backtest intent, so both paths share one scheduler.</li>
+  <li><span class="fn">runTraining(db, owner, spec)</span> — the grid trainer. Catalog strategies sweep their own param schema (<code>defaultSweep</code> picks ≤ 2 numeric knobs from the strategy's <code>min</code>/<code>max</code> bounds); uploaded-rules strategies expose their thresholds as knobs (<code>customKnobDefs</code> → <code>applyCustomKnobs</code>), letting custom bots join the same training. Every combo runs on the train window, then on a held-out test window; results come back as <code>{ knobs, runs, bestIndex, summary }</code> and a <code>bot_events</code> training line is logged.</li>
+  <li>Endpoints: <code>GET /backtests</code>, <code>GET /backtests/:id</code>, <code>GET /backtests/:id/market</code> (the candles used by the run — stored bars first, synthetic fallback), <code>POST /backtests</code>, <code>POST /backtests/optimize</code> (same trainer, exposed for the Training page), <code>DELETE /backtests/:id</code>.</li>
+</ul>
+
+<h3>6. Strategy catalog &amp; uploaded rules <span class="path">src/worker/strategies.ts · routes/strategies.ts</span></h3>
+<ul>
+  <li>Catalog strategies (DCA, EMA Momentum, Mean Reversion, Grid, Range Breakout, Market Making, + the <code>custom</code> strategy) each carry a param schema and a <code>signal(ctx)</code> function over bars.</li>
+  <li><code>parseRules(raw)</code> validates an uploaded rules DSL — entry groups and exit groups (<code>all</code>/<code>any</code> logic), metrics <code>rsi | ema | zscore | donchian-high/low | momentum</code> with window + threshold, plus stop/target. <code>rulesToParams</code> stores it as bot params; <code>applyCustomKnobs</code> substitutes swept values during training.</li>
+  <li><code>measureAccuracy(strategyKey, params, bars, tfMs)</code> replays signals over a window and scores how often the predicted direction materializes — the "market edge" number used by the Edge ranking and each bot's accuracy card.</li>
+  <li><code>sanitizeParams</code> clamps any inbound params to the schema (bounds, types, defaults) so a bad upload can't poison the engine.</li>
+  <li><code>routes/strategies.ts</code> serves the catalog, plus durable versioned uploads: <code>POST /strategies/custom</code> stores a new version row (rules are also kept on the bot itself), <code>GET /strategies/custom/:id/versions</code> lists the history, <code>DELETE</code> removes it.</li>
+</ul>
+
+<h3>7. Market data — normalization, screening, 5-year store <span class="path">src/worker/market.ts · marketstore.ts · routes/market.ts</span></h3>
+<ul>
+  <li><code>normalizeSymbol(raw)</code> folds operator dialect ("btcusdt", "Btc/Usd", trailing spaces) onto catalog entries; unknown symbols return <code>null</code> and are rejected at every ingress instead of minting a plausible fake series.</li>
+  <li>The feed itself is a deterministic seeded series (<code>priceAt</code>, <code>barsBetween</code>, capped at <code>MAX_BARS = 6000</code>) spanning <code>HISTORY_YEARS = 5</code> — the same bound the backtester clamps to (<code>historyStart(at)</code>).</li>
+  <li><code>screenRow</code> / <code>screenPayload</code> — initial payload filtering for bulk imports: dedupe, timestamp sanity, OHLC consistency, unknown-symbol and stale-row rejection, each row returned with a status + reason; <code>upsertBars</code> writes accepted rows idempotently.</li>
+  <li><code>barsForRun</code> prefers stored history for a backtest/training window and falls back to the synthetic series only where the store has no coverage — so a backtest reports on the data the platform actually stored.</li>
+  <li>Endpoints: <code>GET /market/history</code> (stored-backed candles for charts), <code>POST /market/import</code> (bulk ingest through the screener), <code>GET /market/stored</code> (coverage summary).</li>
+</ul>
+
+<h3>8. Portfolio — two books that never mix <span class="path">src/worker/routes/portfolio.ts</span></h3>
+<ul>
+  <li>One <code>GET /portfolio</code> builds both books from a single batch query: cash flows and P&amp;L are partitioned by bot mode (<code>b.mode = 'live'</code> vs <code>'paper'</code>), so paper metrics can never blend into real capital totals.</li>
+  <li><strong>Money book</strong>: summary KPIs (starting capital, current equity, net/realized/unrealized P&amp;L, fees), fleet equity curve, per-bot audit rows, open positions, transaction ledger (CSV-exportable), allocation &amp; liquidity (invested vs idle cash, per-holding equity), funding &amp; reconciliation.</li>
+  <li><strong>Reconciliation identity</strong>: <code>launch funding + net funding (deposits − withdrawals) + trading P&amp;L = current equity</code> — equity reconciles against real cash flows, not just P&amp;L, with a "Reconciled ✓" badge.</li>
+  <li><strong>Weekly funding vs P&amp;L</strong>: ISO-week buckets of net funding and realized P&amp;L (<code>mergeWeekly</code>), plus a daily net-funding bar chart and the raw flow log.</li>
+  <li><strong>Live book only</strong>: the money book, KPIs, ledger and audit rows are live-routed bots; paper bots are reported by <code>GET /portfolio/paper</code> and shown under Training → Paper portfolio, never in these numbers.</li>
+</ul>
+
+<h3>9. Connections <span class="path">src/worker/routes/connections.ts</span></h3>
+<ul>
+  <li>Exchange API credentials for bots to route through: <code>GET</code> list (secrets never returned), <code>POST /demo</code> (two demo venues for testing), <code>POST /bulk</code> (multi-row JSON upload), <code>POST /</code>, <code>PATCH /:id</code>, <code>DELETE /:id</code> (strips the venue from every bot's routing set), and <code>POST /:id/test</code> (read-only credential probe where the venue offers one).</li>
+  <li>Each connection carries an <code>environment</code> (sandbox / production). BSE is wired live through Upstox: it has no public retail order API, so the adapter signs orders through a broker API, prices them from the venue in production and from the reference feed in the orders-only sandbox.</li>
+  <li><strong>Instrument master</strong> (<code>src/worker/instruments.ts</code>): BSE keys every derivative by expiry and strike, so hardcoding tickers cannot work. The adapter downloads the exchange's BOD instrument file (<code>BSE.json.gz</code> — public, no credentials), stores the <code>BSE_FO</code> futures and options in <code>bse_contracts</code>, and resolves a catalog ticker to a live contract: futures to the nearest expiry, options to the nearest strike (catalog strikes are app units, scaled by <code>INR_PER_APP_UNIT</code> to match rupee strikes) on the nearest expiry. Orders are rounded down to the contract's lot size, so a too-small bot fails with the lot and notional in the message instead of sending an invalid quantity.</li>
+  <li><code>GET /instruments/bse</code> (cached contract count, sync time), <code>POST /instruments/bse/refresh</code> (re-download), <code>GET /instruments/bse/resolve?symbol=SENSEX-FUT</code> (the exact <code>instrument_key</code>, lot size and expiry an order would use). The cache is trusted for six hours and refreshed lazily on the next order after that; a venue outage keeps serving the last good copy.</li>
+  <li>Catalog contracts: <code>SENSEX-FUT</code>, <code>BANKEX-FUT</code>, <code>SENSEX50-FUT</code>, <code>FOCIT-FUT</code> and index options such as <code>SENSEX-940-CE</code> / <code>SENSEX-900-PE</code> (asset class <em>Futures</em> / <em>Options</em>). They trade on the synthetic feed for paper and backtests and route to real dated contracts when live.</li>
+</ul>
+
+<h3>10. Cross-cutting: events &amp; schema <span class="path">src/worker/db.ts</span></h3>
+<ul>
+  <li><code>ensureSchema</code> applies idempotent migrations on boot (bots, trades, positions, events, cashflows, backtests, connections, strategies + versions, market bars).</li>
+  <li><code>logEvent(db, owner, botId, level, message)</code> is the single funnel into <code>bot_events</code>: launches, config edits, ground/resume, fills, training summaries, failures. Every screen reads the same stream.</li>
+  <li>Row mappers (<code>mapBot</code>, <code>mapTrade</code>, <code>mapEvent</code>, <code>mapBacktest</code>, …) are the only place SQL rows become API shapes.</li>
+</ul>
+
+<div class="pagebreak"></div>
+<h2>Part 2 — How the UI/UX shell interacts with the frontend</h2>
+
+<h3>1. Shell &amp; chrome <span class="path">src/app/components/Shell.tsx</span></h3>
+<ul>
+  <li>Every authenticated page renders inside <code>Shell</code>: left sidebar (Dashboard, Bots, Strategies, Training, Portfolio, Connections — plus Settings in the footer), brand block, a Search button bound to <kbd>⌘/Ctrl K</kbd>, and currency (USD/EUR/GBP/INR) + theme toggles.</li>
+  <li><code>CommandPalette</code> queries <code>GET /search</code> and deep-links to bots/pages. <code>prefs.ts</code> persists currency and theme in localStorage; currency conversion happens centrally in <code>lib/format.ts</code> (<code>money()</code>, <code>moneyExact()</code>, …) so every figure on every page converts together.</li>
+  <li>Mobile: the sidebar collapses behind an "Open menu" button; route changes close it automatically.</li>
+</ul>
+
+<h3>2. Routing &amp; the auth gate <span class="path">src/app/App.tsx</span></h3>
+<div class="flow">QueryClientProvider (staleTime 15 s, retry 1)
+ └─ ToastProvider
+     └─ Pageviews → PostHog pageview on every SPA navigation
+         └─ Gate → useMe()
+              401 → &lt;SignIn/&gt;      503 → &lt;SetupNeeded/&gt;
+              ok  → Routes under &lt;Shell/&gt;
+                     /                Dashboard
+                     /bots            Bots (list · lifecycle board · edge ranking)
+                     /bots/:id        BotDetail (uptime, event stream, panels)
+                     /strategies      Strategies (catalog · uploads)
+                     /training        Training (train &amp; optimize · backtests · paper portfolio)
+                     /backtests       → redirects to /training?tab=backtests
+                     /portfolio       Portfolio (live money book)
+                     /connections     Connections
+                     /settings        Settings</div>
+<ul>
+  <li><code>Gate</code> decides the whole app shell from one <code>useMe()</code> query; a 401 drops to the sign-in screen, a 503 (no D1 binding) to the setup screen — pages never handle auth themselves.</li>
+</ul>
+
+<h3>3. Data layer <span class="path">src/app/lib/api.ts</span></h3>
+<ul>
+  <li><code>api&lt;T&gt;(path, init)</code> — one fetch wrapper; non-2xx throws <code>ApiError</code> carrying <code>status</code> + server <code>message</code>, which dialogs and toasts surface verbatim.</li>
+  <li>React Query hooks are the only read path: <code>useMe, useDashboard, useBots, useBot, usePortfolio, useBacktests, useBacktestDetail, useBacktestMarket, useStrategies, useCustomStrategies, useConnections, useSearch, useBotAccuracy, useBotEdge</code> — each with a stable query key.</li>
+  <li><code>useApiMutation(fn, invalidateKeys, { onSuccess })</code> wraps every write: it runs the API call and invalidates exactly the owning keys (e.g. an import invalidates <code>bots</code>, <code>dashboard</code>, <code>portfolio</code>, <code>search</code>), so one mutation refreshes every screen that shows the data.</li>
+  <li>Typed action clients: <code>launchBot</code>, <code>importBots(items, intent)</code>, <code>controlBot</code> (ground/resume/…), <code>adjustFunding</code>, <code>patchBot</code>, <code>deleteBot</code>, <code>runBacktest</code>, <code>optimizeTraining</code>, <code>uploadCustomStrategy</code>, <code>createConnection/uploadConnections/addDemoConnections</code>, <code>fetchMarketHistory</code>.</li>
+</ul>
+
+<h3>4. Component vocabulary <span class="path">src/app/components/ui.tsx · charts.tsx · forms.tsx</span></h3>
+<table>
+  <tr><th>Layer</th><th>Components</th><th>Role</th></tr>
+  <tr><td>Structure</td><td><code>PageHeader</code>, <code>Card</code>, <code>DataTable</code>, <code>EmptyState</code>, <code>Skeleton</code>, <code>Spinner</code></td><td>Every page composes the same header → cards → tables rhythm; <code>DataTable</code> gives sortable columns and a totals row in one place.</td></tr>
+  <tr><td>Overlays</td><td><code>Dialog</code>, <code>Drawer</code>, <code>ConfirmDialog</code>, <code>Menu</code>, <code>ToastProvider</code>/<code>useToast</code></td><td>Modals for forms, side-drawers for detail (backtest viewer), toasts for mutation feedback ("Imported 3 bots · queued 3 backtests").</td></tr>
+  <tr><td>Forms</td><td><code>Field</code>, <code>Input</code>, <code>Select</code>, <code>Checkbox</code>, <code>ParamFields</code>, <code>SymbolPicker</code></td><td>Label/hint wiring and strategy-param forms generated from the server's param schema — the same schema the trainer sweeps.</td></tr>
+  <tr><td>Charts</td><td><code>Sparkline</code>, <code>AreaChart</code>, <code>BarChart</code>, <code>PairedBarChart</code>, <code>CompareBars</code>, <code>DrawdownChart</code>, <code>CandleChart</code></td><td>Hand-rolled SVG primitives fed directly by API payloads; period selectors swap the query parameter, not the component.</td></tr>
+</table>
+
+<h3>5. Dialogs — where the flows live <span class="path">src/app/components/form-dialogs/</span></h3>
+<ul>
+  <li><span class="fn">LaunchWizard</span> (<code>launch.tsx</code>) — multi-step launch: strategy → symbols &amp; timeframe (market/forex/crypto/option pickers) → risk &amp; params → review; posts to <code>launchBot</code>.</li>
+  <li><span class="fn">BotImportDialog</span> (<code>botimport.tsx</code>) — the three-destination upload: paste or drop a JSON array (or a .json file), see per-row <em>ready / problem</em> validation with reasons, choose destination <strong>Live / Backtest / Train</strong>, then submit through <code>importBots(rows, intent)</code>. The description adapts to the destination; on success it toasts the counts and navigates to where the result lives (Backtest → <code>/training?tab=backtests</code>, Train → <code>/training</code>). "Download sample" emits a valid starter payload.</li>
+  <li><span class="fn">BacktestDialog</span> — New backtest (works for uploaded-rules bots too), <span class="fn">UploadStrategyDialog</span> — rules-DSL upload, <span class="fn">ConnectionForm</span> + <span class="fn">BulkConnectionsDialog</span> — single and multi API-key upload.</li>
+</ul>
+
+<h3>6. Page-by-page interaction map</h3>
+<table>
+  <tr><th>Page</th><th>Reads</th><th>Interactions</th></tr>
+  <tr><td><strong>Dashboard</strong></td><td><code>useDashboard</code></td><td>Equity chart with period selector, stage totals, fleet status strip (running/paused/grounded/paper/live), attention list, live event feed.</td></tr>
+  <tr><td><strong>Bots</strong></td><td><code>useBots</code></td><td>Three tabs: bot list (charts + stage filters), lifecycle board (drag between stages), edge ranking (<code>useBotEdge</code> — accuracy-ranked fleet). Launch wizard, import dialog, per-row control.</td></tr>
+  <tr><td><strong>Bot detail</strong> <span class="path">/bots/:id</span></td><td><code>useBot</code>, <code>useBotAccuracy</code></td><td>Header controls (ground/resume, pause, edit), <strong>uptime + event stream</strong> with a state note for training/hangar bots, market panel, position/trade tables, accuracy card (strategy edge vs live results), performance &amp; funding panels.</td></tr>
+  <tr><td><strong>Strategies</strong></td><td><code>useStrategies</code>, <code>useCustomStrategies</code></td><td>Catalog cards → launch wizard; upload dialog for custom rules with version history; each card exposes backtest + train shortcuts.</td></tr>
+  <tr><td><strong>Training</strong></td><td><code>useBacktests</code>, <code>optimizeTraining</code></td><td>Three tabs: <em>Train &amp; optimize</em> (source picker incl. uploaded strategies, parameter picker with bounds, run sweep, results table + Apply-to-bot), <em>Backtests</em> (list, detail drawer showing the candles actually used, New backtest dialog), <em>Paper portfolio</em> (paper book lab view).</td></tr>
+  <tr><td><strong>Portfolio</strong></td><td><code>usePortfolio</code></td><td>Live money book only: KPIs, equity curve, allocation &amp; liquidity, per-holding equity, reconciliation identity, weekly funding-vs-P&amp;L, daily funding bars, ledger + CSV export, per-bot drill-in (performance / funding / settings, including a starting-capital edit that posts as funding so P&amp;L is preserved). Paper bots are absent from every figure and row; they live on <code>GET /portfolio/paper</code> and the Training tab.</td></tr>
+  <tr><td><strong>Connections</strong></td><td><code>useConnections</code></td><td>Seeded demo venues, single form, bulk JSON upload, edit/delete; secrets are write-only from the client's perspective.</td></tr>
+  <tr><td><strong>Settings</strong></td><td><code>useMe</code></td><td>Workspace rename/reset, currency/theme defaults, analytics consent, data wipe.</td></tr>
+</table>
+
+<h3>7. One end-to-end example: importing a bot for training</h3>
+<div class="flow">operator drops JSON ─► BotImportDialog parses → reviewImport() dry-run (ready/problem rows)
+  → picks destination "Train" → importBots(rows, 'train')
+  → POST /bots/import { intent: 'train' }
+      validateSpec → createBot (same function as live launch) → row parked paper/paused
+      queueRunForBot → runTraining (grid over the bot's knobs, train + hold-out windows)
+  ← { launched: [...], runs.training: [{ bestTrain, bestTest, combos, swept }] }
+  → toast "Imported 1 bot · trained 1" → navigate /training
+  → Training page shows the sweep; Apply-to-bot PATCHes the baked params (logged as a bot_events config change)</div>
+
+<div class="note">Read path in one line: <strong>page → hook (react-query) → <code>api()</code> → Worker router → row mappers → <code>privateJson</code></strong>. Write path: <strong>dialog → <code>useApiMutation</code> → typed client → route → shared core function → <code>logEvent</code> → key invalidation refreshes every owning screen</strong>.</div>
+
+</body>
+</html>
