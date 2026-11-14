@@ -1,7 +1,8 @@
 // Display preferences, shared app-wide. Both stores persist to localStorage
 // and expose tiny external stores so any component can read them through
-// hooks; changing them re-renders everything mounted under <Shell> because
-// Shell itself subscribes.
+// hooks. Amounts are formatted during render, so a changed preference only
+// reaches the page if it re-renders: Shell keys its routed outlet on the
+// currency for exactly that reason.
 
 import { useSyncExternalStore } from 'react'
 
@@ -30,6 +31,11 @@ export const CURRENCY_RATES: Record<Currency, number> = {
 
 export function convert(value: number, currency: Currency): number {
   return value * CURRENCY_RATES[currency]
+}
+
+/** The inverse, for inputs that show a converted amount but submit USD. */
+export function unconvert(value: number, currency: Currency): number {
+  return value / CURRENCY_RATES[currency]
 }
 
 const listeners = new Set<() => void>()

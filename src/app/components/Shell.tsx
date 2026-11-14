@@ -205,7 +205,10 @@ export function Shell() {
 
       <main id="main" tabIndex={-1} className="min-w-0 flex-1 pt-12 focus:outline-none lg:p-2 lg:pl-0 lg:pt-2">
         <div className="scrollbar-thin h-full overflow-y-auto bg-surface lg:rounded-card lg:border lg:border-line">
-          <Outlet />
+          {/* Money is formatted during render, so a currency switch has to
+              remount the page: keying the outlet on the currency is what makes
+              every page under it re-read the new rate. */}
+          <Outlet key={currency} />
         </div>
       </main>
 
