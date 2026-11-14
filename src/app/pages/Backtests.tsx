@@ -14,11 +14,13 @@ import type { Backtest } from '../../shared/types'
 
 /** Period label that keeps the year when the window crosses one. */
 function periodSpan(from: number, to: number): string {
+  const fromYear = new Date(from).getFullYear()
+  const crossesYear = fromYear !== new Date(to).getFullYear()
   const stamp = (ts: number) =>
     new Date(ts).toLocaleDateString('en-US', {
       month: 'short',
       day: 'numeric',
-      ...(new Date(ts).getFullYear() !== new Date(to).getFullYear() ? { year: 'numeric' } : {}),
+      ...(crossesYear ? { year: 'numeric' } : {}),
     })
   return `${stamp(from)} – ${stamp(to)}`
 }
