@@ -9,7 +9,8 @@ import { RangeBar, riskTier } from '../components/controls'
 import { Badge, Button, Card, ConfirmDialog, DataTable, EmptyState, Input, Live, Skeleton, useToast, type DataColumn } from '../components/ui'
 import { adjustFunding, ApiError, controlBot, deleteBot, fetchMarketHistory, patchBot, useApiMutation, useBot, useBotAccuracy } from '../lib/api'
 import { cx } from '../lib/cx'
-import { money, elapsed, relativeTime, shortDate } from '../lib/format'
+import { money, elapsed, plural, relativeTime, shortDate } from '../lib/format'
+import { convert, unconvert, useCurrency } from '../lib/prefs'
 import { BOT_STAGES, TIMEFRAMES, activityOf, type AccuracyStat, type Bot, type BotStage, type BotEvent, type Position, type Timeframe, type Trade } from '../../shared/types'
 
 /* Increment labels for the timeframe scroller (TIMEFRAMES labels read in words). */
@@ -17,6 +18,9 @@ const TF_SHORT: Record<Timeframe, string> = { '1m': '1m', '5m': '5m', '15m': '15
 /** Bars-per-chart budget: shorter candles sweep fewer days, longer ones sweep
  * years — the server clamps to its MAX_BARS either way. */
 const TF_DAYS: Record<Timeframe, number> = { '1m': 3, '5m': 5, '15m': 10, '1h': 45, '4h': 120, '1d': 365 }
+
+/** Floor for a bot's starting capital, in USD — the unit PATCH /bots/:id takes. */
+const MIN_CAPITAL_USD = 100
 
 export function BotDetail() {
   const { id } = useParams()
@@ -39,7 +43,8 @@ export function BotDetail() {
         ),
     },
   )
-  const remove = useApiMutation(() => deleteBot(id!), ['bots', 'bot', 'dashboard'], {
+  // No 'bot' key here: the row is gone, so refetching it can only 404.
+  const remove = useApiMutation(() => deleteBot(id!), ['bots', 'dashboard'], {
     onSuccess: () => {
       toast('Bot deleted')
       navigate('/bots')
@@ -195,7 +200,7 @@ export function BotDetail() {
             <h2 className="text-[14px] font-semibold">Equity curve</h2>
             <Live
               active={bot.status === 'running'}
-              label={bot.status === 'running' ? 'live · 2s updates' : `${equity.length} points`}
+              label={bot.status === 'running' ? 'live · 2s updates' : plural(equity.length, 'point')}
             />
           </div>
           <div className="mt-4">
@@ -282,7 +287,7 @@ export function BotDetail() {
       <Card className="mt-3 overflow-hidden">
         <div className="flex items-center justify-between px-5 pt-5">
           <h2 className="text-[14px] font-semibold">Trade log</h2>
-          <span className="text-[12.5px] t-num text-faint">{trades.length} fills</span>
+          <span className="text-[12.5px] t-num text-faint">{plural(trades.length, 'fill')}</span>
         </div>
         <div className="mt-3 px-5 pb-5">
           <TradeTable trades={trades} />
@@ -376,10 +381,17 @@ function OperatorControls({ botId, bot }: { botId: string; bot: Bot }) {
 
   // Starting capital: an operator edit is funding, so the server moves cash
   // and equity by the same delta and trading P&L stays exactly as recorded.
-  const [capitalInput, setCapitalInput] = useState(String(Math.round(bot.capital)))
-  useEffect(() => setCapitalInput(String(Math.round(bot.capital))), [bot.capital])
+  // The field reads in the display currency; the API only takes USD, so the
+  // value is converted back on submit.
+  const currency = useCurrency()
+  const capitalShown = Math.round(convert(bot.capital, currency))
+  const minCapitalShown = Math.round(convert(MIN_CAPITAL_USD, currency))
+  const [capitalInput, setCapitalInput] = useState(String(capitalShown))
+  useEffect(() => setCapitalInput(String(capitalShown)), [capitalShown])
   const capitalValue = Number(capitalInput)
-  const capitalDirty = Number.isFinite(capitalValue) && capitalValue >= 100 && Math.abs(capitalValue - bot.capital) >= 0.01
+  const capitalUsd = Math.round(unconvert(capitalValue, currency) * 100) / 100
+  const capitalDirty = Number.isFinite(capitalValue) && capitalValue >= minCapitalShown && Math.abs(capitalUsd - bot.capital) >= 0.01
+  const capitalRejected = capitalInput.trim() !== '' && (!Number.isFinite(capitalValue) || capitalValue < minCapitalShown)
   const saveCapital = useApiMutation((next: number) => patchBot(botId, { capital: next }), ['bot', 'bots', 'portfolio', 'dashboard'], {
     onSuccess: (_result, next) => toast(`Starting capital set to ${money(next)} — funding only, P&L unchanged`),
     onError: (error) => toast(error instanceof ApiError ? error.message : 'Capital change failed', 'danger'),
@@ -477,17 +489,18 @@ function OperatorControls({ botId, bot }: { botId: string; bot: Bot }) {
             <div className="mt-2 flex items-center gap-2">
               <Input
                 type="number"
-                min={100}
+                min={minCapitalShown}
                 step={100}
                 value={capitalInput}
-                aria-label="Starting capital"
+                aria-label={`Starting capital (${currency})`}
                 onChange={(e) => setCapitalInput(e.target.value)}
                 className="h-8 w-[150px] text-[13px]"
               />
-              <Button size="sm" variant="primary" disabled={!capitalDirty} loading={saveCapital.isPending} onClick={() => saveCapital.mutate(capitalValue)}>
+              <span className="text-[11.5px] font-medium text-faint">{currency}</span>
+              <Button size="sm" variant="primary" disabled={!capitalDirty} loading={saveCapital.isPending} onClick={() => saveCapital.mutate(capitalUsd)}>
                 Set capital
               </Button>
-              {capitalDirty && !Number.isFinite(capitalValue) && <span className="text-[12px] text-warning">Minimum $100.</span>}
+              {capitalRejected && <span className="text-[12px] text-warning">Minimum {money(MIN_CAPITAL_USD)}.</span>}
             </div>
             <p className="mt-1.5 text-[11.5px] leading-relaxed text-faint">
               An edit is funding: cash and equity move by the same amount, so trading P&amp;L (equity − capital) is preserved and the change lands in the ledger.

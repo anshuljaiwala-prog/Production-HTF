@@ -22,6 +22,10 @@ export const money = (value: number) => formatters(getCurrency()).whole.format(c
 export const moneyCompact = (value: number) => formatters(getCurrency()).compact.format(convert(value, getCurrency()))
 /** Two-decimal money for audit rows where small numbers matter. */
 export const moneyExact = (value: number) => formatters(getCurrency()).cents.format(convert(value, getCurrency()))
+/** `1 fill`, `2 fills` — a count and its noun, so readouts never say "1 fills". */
+export const plural = (count: number, word: string, pluralWord = `${word}s`) =>
+  `${count} ${count === 1 ? word : pluralWord}`
+
 /** Same, with the symbol and grouping stripped for dense table cells. */
 export function moneyExactPlain(value: number): string {
   const formatted = moneyExact(value)
