@@ -1,9 +1,9 @@
 import { Hono } from 'hono'
 
 import { privateJson } from '../auth'
-import { mapTrade, now } from '../db'
+import { buildEquitySeries, mapTrade, now } from '../db'
 import type { AppContext } from '../env'
-import { advanceBot } from '../engine'
+import { fastForwardFleet } from '../engine'
 import { quote } from '../market'
 import { strategyBy } from '../strategies'
 import type {
@@ -13,7 +13,6 @@ import type {
   PortfolioPosition,
   PortfolioTransaction,
 } from '../../shared/types'
-import { buildEquitySeries, loadBots } from './workspace'
 
 type Row = Record<string, unknown>
 
@@ -55,10 +54,7 @@ portfolio.get('/', async (c) => {
 
   // Fast-forward the fleet first so every number below reflects the latest
   // closed bar, then mark open positions against the current clock.
-  let bots = await loadBots(db, owner)
-  const running = bots.filter((b) => b.status === 'running').slice(0, 12)
-  for (const bot of running) await advanceBot(db, owner, bot, { secretsKey: c.env.SECRETS_KEY })
-  if (running.length) bots = await loadBots(db, owner)
+  const bots = await fastForwardFleet(db, owner, c.env.SECRETS_KEY)
 
   const [perBotTrades, positions, ledger, points, fundingTotals, fundingRows, weeklyFunding, weeklyPnl] = await db.batch([
     db
@@ -282,10 +278,7 @@ portfolio.get('/paper', async (c) => {
   const t = now()
   const windowStart = t - (EQUITY_WINDOW_DAYS - 1) * DAY
 
-  let items = await loadBots(db, owner)
-  const running = items.filter((b) => b.mode === 'paper' && b.status === 'running').slice(0, 12)
-  for (const bot of running) await advanceBot(db, owner, bot, { secretsKey: c.env.SECRETS_KEY })
-  if (running.length) items = await loadBots(db, owner)
+  const items = await fastForwardFleet(db, owner, c.env.SECRETS_KEY, 'paper')
 
   const paperBots = items.filter((b) => b.mode === 'paper')
   const ids = paperBots.map((bot) => bot.id)

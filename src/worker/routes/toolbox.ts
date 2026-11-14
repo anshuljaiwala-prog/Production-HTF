@@ -1,14 +1,12 @@
 import { Hono } from 'hono'
 
 import { privateJson } from '../auth'
-import { id, logEvent, now } from '../db'
+import { createBot, id, loadBots, logEvent, now } from '../db'
 import type { AppContext } from '../env'
 import { barsBetween, normalizeSymbol } from '../market'
 import { analyseBotPatterns } from '../patterns'
 import { BUILTIN_PLAYBOOK_MAP, BUILTIN_PLAYBOOKS, BOOK_REGIMES, DEFAULT_BOOK, isBookRegime, validatePlanDraft } from '../plans'
 import { strategyBy } from '../strategies'
-import { createBot } from './bots'
-import { loadBots } from './workspace'
 import type { BookEntry, BookSignal, ParamValue, PatternRegime, Playbook, ToolBox } from '../../shared/types'
 
 type Row = Record<string, unknown>

@@ -1,7 +1,7 @@
 import { Hono } from 'hono'
 
 import { privateJson } from '../auth'
-import { BOT_SELECT, mapBot, now } from '../db'
+import { BOT_SELECT, loadBots, mapBot, now } from '../db'
 import type { AppContext } from '../env'
 import { analyseBotPatterns, rankFleetPatterns } from '../patterns'
 import { evaluateGate, readEnvironment } from '../agents/environment'
@@ -11,7 +11,6 @@ import { readCalibration, readDecisionTraces } from '../agents/trace'
 import { TIMEFRAME_MS, barsBetween, normalizeSymbol } from '../market'
 import { barsForRun } from '../marketstore'
 import type { BotPatterns, EnvironmentTrace, FleetPatternRanking } from '../../shared/types'
-import { loadBots } from './workspace'
 
 type Row = Record<string, unknown>
 

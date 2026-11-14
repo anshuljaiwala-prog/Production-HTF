@@ -1,13 +1,13 @@
 import { Hono } from 'hono'
 
 import { authMode, privateJson } from '../auth'
-import { BOT_SELECT, mapBot, mapEvent, now } from '../db'
+import { buildEquitySeries, mapEvent, now } from '../db'
 import type { AppContext } from '../env'
-import { advanceBot } from '../engine'
+import { fastForwardFleet } from '../engine'
 import { quote } from '../market'
 import { STRATEGIES, strategyBy } from '../strategies'
 import { clearWorkspace, seedWorkspace } from '../seed'
-import { activityOf, type Bot, type Dashboard, type Me, type SearchResults } from '../../shared/types'
+import { activityOf, type Dashboard, type Me, type SearchResults } from '../../shared/types'
 
 type Row = Record<string, unknown>
 
@@ -62,14 +62,6 @@ workspace.delete('/workspace/data', async (c) => {
   return privateJson(c, { ok: true })
 })
 
-export async function loadBots(db: D1Database, owner: string): Promise<Bot[]> {
-  const result = await db
-    .prepare(`${BOT_SELECT} WHERE b.owner_sub = ? ORDER BY b.position DESC, b.created_at DESC`)
-    .bind(owner)
-    .all<Row>()
-  return (result.results ?? []).map(mapBot)
-}
-
 workspace.get('/overview', async (c) => {
   const db = c.get('db')
   const owner = c.get('user').sub
@@ -82,10 +74,7 @@ workspace.get('/overview', async (c) => {
   const requested = Number(c.req.query('days') ?? EQUITY_WINDOW_DAYS)
   const windowDays = Math.min(730, Math.max(7, Math.round(Number.isFinite(requested) && requested > 0 ? requested : EQUITY_WINDOW_DAYS)))
 
-  let bots = await loadBots(db, owner)
-  const running = bots.filter((b) => b.status === 'running').slice(0, 12)
-  for (const bot of running) await advanceBot(db, owner, bot, { secretsKey: c.env.SECRETS_KEY })
-  if (running.length) bots = await loadBots(db, owner)
+  const bots = await fastForwardFleet(db, owner, c.env.SECRETS_KEY)
 
   const windowStart = startOfDay.getTime() - (windowDays - 1) * DAY
   const [today, positions, stages, events, points] = await db.batch([
@@ -162,37 +151,6 @@ workspace.get('/overview', async (c) => {
   }
   return privateJson(c, body)
 })
-
-/** Daily closing equity per bot, carried forward, summed across the fleet. */
-export function buildEquitySeries(bots: Bot[], rows: Row[], windowStart: number, t: number): { label: string; value: number }[] {
-  const days = Math.max(1, Math.floor((t - windowStart) / DAY) + 1)
-  const byBot = new Map<string, { at: number; value: number }[]>()
-  for (const row of rows) {
-    const key = String(row.bot_id)
-    const list = byBot.get(key) ?? []
-    list.push({ at: Number(row.at), value: Number(row.value) })
-    byBot.set(key, list)
-  }
-
-  const series: { label: string; value: number }[] = []
-  for (let d = 0; d < days; d++) {
-    const dayEnd = windowStart + (d + 1) * DAY
-    let total = 0
-    for (const bot of bots) {
-      const points = byBot.get(bot.id) ?? []
-      let value: number | undefined
-      for (const point of points) {
-        if (point.at >= dayEnd) break
-        value = point.value
-      }
-      total += value ?? (bot.createdAt < dayEnd ? bot.equity : bot.initialEquity)
-    }
-    if (total === 0 && bots.length === 0) continue
-    const date = new Date(dayEnd - DAY)
-    series.push({ label: date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' }), value: total })
-  }
-  return series
-}
 
 workspace.get('/search', async (c) => {
   const q = (c.req.query('q') ?? '').trim()

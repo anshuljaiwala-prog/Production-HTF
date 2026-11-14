@@ -4,10 +4,9 @@ import { privateJson } from '../auth'
 import { backtestWindow } from '../backtest'
 import { now } from '../db'
 import type { AppContext } from '../env'
-import { HISTORY_YEARS, TIMEFRAME_MS, barsBetween, historyStart } from '../market'
+import { HISTORY_YEARS, TIMEFRAME_MS, barsBetween, historyStart, toCandles } from '../market'
 import { barsForRun, screenPayload, storedSummary, upsertBars } from '../marketstore'
 import type { MarketImportResult, StoredBarsSummary, Timeframe } from '../../shared/types'
-import { toCandles } from './backtests'
 
 export const market = new Hono<AppContext>()
 

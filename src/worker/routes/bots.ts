@@ -1,22 +1,21 @@
 import { Hono } from 'hono'
 
 import { privateJson } from '../auth'
-import { BOT_SELECT, id, logEvent, mapBot, mapEvent, mapPosition, mapTrade, now } from '../db'
+import { createBot, id, loadBot, loadBots, logEvent, mapEvent, mapPosition, mapTrade, now, validateSpec } from '../db'
+import type { CreateBody } from '../db'
 import type { AppContext } from '../env'
-import { advanceBot } from '../engine'
+import { advanceBot, fastForwardFleet } from '../engine'
 import { TIMEFRAME_MS, barsBetween, normalizeSymbol, quote } from '../market'
-import { scheduleBacktest, runTraining } from './backtests'
+import { runTraining, scheduleBacktest } from '../backtest'
 import { insertDemoBots } from '../seed'
 import { STRATEGIES, measureAccuracy, parseRules, rulesToParams, sanitizeParams, strategyBy } from '../strategies'
 import { MAX_BOT_VENUES, MAX_TRACKED_SYMBOLS } from '../../shared/types'
-import type { Bot, BotStage, BotStatus, BotVenue, CustomRules, ParamValue, Timeframe } from '../../shared/types'
+import type { Bot, BotStage, BotStatus, BotVenue, CustomRules, Timeframe } from '../../shared/types'
 
 type Row = Record<string, unknown>
 
 export const bots = new Hono<AppContext>()
 
-/** Running bots are fast-forwarded on read; cap the work per request. */
-const MAX_ADVANCE_PER_REQUEST = 12
 const MAX_SYMBOLS = MAX_TRACKED_SYMBOLS
 
 type VenueMap = Map<string, BotVenue>
@@ -59,239 +58,14 @@ function withStrategy(bot: Bot): Bot {
   return { ...bot, strategyName: strategyBy(bot.strategyKey)?.name ?? bot.strategyKey }
 }
 
-async function loadBots(db: D1Database, owner: string): Promise<Bot[]> {
-  const result = await db
-    .prepare(`${BOT_SELECT} WHERE b.owner_sub = ? ORDER BY b.position DESC, b.created_at DESC`)
-    .bind(owner)
-    .all<Row>()
-  return (result.results ?? []).map(mapBot)
-}
-
-async function loadBot(db: D1Database, owner: string, botId: string): Promise<Bot | null> {
-  const row = await db.prepare(`${BOT_SELECT} WHERE b.id = ? AND b.owner_sub = ?`).bind(botId, owner).first<Row>()
-  return row ? mapBot(row) : null
-}
-
-async function advanceRunning(db: D1Database, owner: string, items: Bot[], secretsKey?: string): Promise<boolean> {
-  const running = items.filter((b) => b.status === 'running').slice(0, MAX_ADVANCE_PER_REQUEST)
-  for (const bot of running) await advanceBot(db, owner, bot, { secretsKey })
-  return running.length > 0
-}
-
 bots.get('/', async (c) => {
   const db = c.get('db')
   const owner = c.get('user').sub
-  let items = await loadBots(db, owner)
-  if (await advanceRunning(db, owner, items, c.env.SECRETS_KEY)) items = await loadBots(db, owner)
+  const items = await fastForwardFleet(db, owner, c.env.SECRETS_KEY)
   const venues = await loadVenueMap(db, owner)
   return privateJson(c, { items: items.map((bot) => withStrategy(withVenues(bot, venues))), strategies: STRATEGIES })
 })
 
-interface CreateBody {
-  strategyKey?: string
-  name?: string
-  symbols?: string[]
-  /** Singular synonym accepted for operator convenience, folded into `symbols`. */
-  symbol?: string
-  timeframe?: Timeframe
-  params?: Record<string, unknown>
-  capital?: number
-  riskPct?: number
-  mode?: 'paper' | 'live'
-  /** Exchange-API binding: bots route through a saved connection. */
-  connectionId?: string | null
-  /** Multi-venue routing (best price wins); first id is the primary venue. */
-  venueIds?: string[]
-  /** Inline uploaded strategy: validated rules routed through `custom`. */
-  rules?: unknown
-  stage?: BotStage
-  status?: BotStatus
-}
-
-interface ValidatedSpec {
-  strategyKey: string
-  strategyName: string
-  symbols: string[]
-  timeframe: Timeframe
-  params: Record<string, ParamValue> | null
-  capital: number
-  riskPct: number
-  mode: 'paper' | 'live'
-  connectionId: string | null
-  venueIds: string[]
-  status: BotStatus
-  stage: BotStage
-  name: string
-}
-
-/** Everything createBot needs as already-validated typed values — or the
- * reason the spec was rejected. Shared by single launch, bulk import, and
- * the import review (dry-run) mode. */
-async function validateSpec(db: D1Database, owner: string, body: CreateBody): Promise<ValidatedSpec | { error: string; message: string }> {
-  // Inline rules create a custom-strategy bot; the rules payload is
-  // validated the same way the standalone upload path validates it.
-  let isCustom = false
-  let rulesForParams: Record<string, ParamValue> | null = null
-  let displayName = body.strategyKey ? (strategyBy(String(body.strategyKey))?.name ?? String(body.strategyKey)) : ''
-  if (body.rules !== undefined) {
-    try {
-      const parsed = parseRules(body.rules)
-      isCustom = true
-      rulesForParams = rulesToParams(parsed.rules)
-      displayName = parsed.rules.name
-    } catch (error) {
-      const message = error instanceof Error ? error.message : 'Invalid rules.'
-      return { error: 'invalid_rules', message }
-    }
-  }
-
-  const strategy = strategyBy(isCustom ? 'custom' : String(body.strategyKey ?? ''))
-  if (!strategy) return { error: 'unknown_strategy', message: 'Pick a strategy from the catalog.' }
-
-  // Ingress filtering: every candidate symbol is normalized (btcusdt →
-  // BTC-USD) and must resolve to a catalog entry. Unknown inputs are pulled
-  // out and named in the rejection — they never reach the synthetic feed,
-  // where an unknown symbol would silently mint a plausible-looking series.
-  const rejected = new Set<string>()
-  const seen = new Set<string>()
-  const symbols: string[] = []
-  // Rows sometimes carry the backtest-API spelling — a single `symbol` —
-  // treat it as a one-element list instead of rejecting the row outright.
-  const symbolList = body.symbols ?? (body.symbol ? [String(body.symbol)] : undefined)
-  for (const entry of symbolList ?? []) {
-    const normalized = normalizeSymbol(String(entry))
-    if (!normalized) {
-      const text = String(entry).trim()
-      if (text) rejected.add(text)
-      continue
-    }
-    if (!seen.has(normalized)) {
-      seen.add(normalized)
-      symbols.push(normalized)
-    }
-  }
-  if (symbols.length === 0) {
-    return rejected.size > 0
-      ? { error: 'unknown_symbols', message: `No tradeable symbols in this row: ${[...rejected].slice(0, 4).join(', ')} — try catalog entries like BTC-USD or EUR-USD.` }
-      : { error: 'symbols_required', message: 'Choose at least one symbol.' }
-  }
-  // The cap is a hard limit, not a silent trim: a bot that tracked fewer
-  // markets than its operator selected would scan and trade a different book
-  // than the one on screen.
-  if (symbols.length > MAX_SYMBOLS) {
-    return {
-      error: 'too_many_symbols',
-      message: `A bot tracks up to ${MAX_SYMBOLS} markets at once (this row has ${symbols.length}) — split the list across bots.`,
-    }
-  }
-
-  const timeframe = (body.timeframe ?? strategy.timeframes[Math.floor(strategy.timeframes.length / 2)]) as Timeframe
-  if (!strategy.timeframes.includes(timeframe)) {
-    return { error: 'timeframe_unsupported', message: `${strategy.name} does not run on the ${timeframe} timeframe.` }
-  }
-
-  const capital = Number(body.capital)
-  if (!Number.isFinite(capital) || capital < 100) {
-    return { error: 'invalid_capital', message: 'Starting capital must be at least $100.' }
-  }
-  const riskPct = Math.min(100, Math.max(1, Number(body.riskPct) || 25))
-  const mode: 'paper' | 'live' = body.mode === 'live' ? 'live' : 'paper'
-
-  // Venue set: an explicit multi-venue list wins, otherwise the single
-  // connection id (legacy callers) becomes the one-element list.
-  const requestedVenues = body.venueIds !== undefined ? body.venueIds : body.connectionId ? [String(body.connectionId)] : []
-  const venueIds: string[] = []
-  for (const entry of requestedVenues) {
-    const venueId = String(entry ?? '').trim()
-    if (!venueId || venueIds.includes(venueId)) continue
-    const connection = await db
-      .prepare(`SELECT id FROM connections WHERE id = ? AND owner_sub = ?`)
-      .bind(venueId, owner)
-      .first<{ id: string }>()
-    if (!connection) return { error: 'connection_not_found', message: 'That connection no longer exists in this workspace.' }
-    venueIds.push(connection.id)
-  }
-  if (venueIds.length > MAX_BOT_VENUES) {
-    return { error: 'too_many_venues', message: `A bot routes across up to ${MAX_BOT_VENUES} exchanges — remove ${venueIds.length - MAX_BOT_VENUES}.` }
-  }
-  if (mode === 'live' && venueIds.length === 0) {
-    return { error: 'connection_required', message: 'A live bot needs at least one exchange connection to route orders through.' }
-  }
-  const connectionId = venueIds[0] ?? null
-
-  const status: BotStatus = body.status === 'stopped' || body.status === 'paused' ? body.status : 'running'
-  const stage: BotStage = body.stage ?? (status === 'running' ? (mode === 'live' ? 'live' : 'paper') : 'draft')
-  const name = (body.name?.trim() || `${displayName || strategy.name} · ${symbols.join(' / ')}`).slice(0, 90)
-
-  return {
-    strategyKey: strategy.key,
-    strategyName: displayName || strategy.name,
-    symbols,
-    timeframe,
-    params: isCustom ? rulesForParams : sanitizeParams(strategy.key, body.params),
-    capital,
-    riskPct,
-    mode,
-    connectionId,
-    venueIds,
-    status,
-    stage,
-    name,
-  }
-}
-
-/** One bot creation, shared by single launch, bulk import and strategy-book
- * execution: validates and inserts, returning either the bot or a rejection
- * reason. */
-export async function createBot(db: D1Database, owner: string, body: CreateBody): Promise<{ bot?: Bot; error?: string; message?: string }> {
-  const spec = await validateSpec(db, owner, body)
-  if ('error' in spec) return spec
-
-  const t = now()
-  const botId = id()
-
-  await db
-    .prepare(
-      `INSERT INTO bots (id, owner_sub, name, strategy_key, symbols, timeframe, params, capital, risk_pct, mode, stage, status,
-        position, connection_id, venue_ids, cash, equity, initial_equity, realized_pnl, round_trips, wins, created_at, started_at, last_tick_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, 0, 0, 0, ?, ?, ?, ?)`,
-    )
-    .bind(
-      botId,
-      owner,
-      spec.name,
-      spec.strategyKey,
-      JSON.stringify(spec.symbols),
-      spec.timeframe,
-      JSON.stringify(spec.params ?? {}),
-      spec.capital,
-      spec.riskPct,
-      spec.mode,
-      spec.stage,
-      spec.status,
-      spec.connectionId,
-      JSON.stringify(spec.venueIds),
-      spec.capital,
-      spec.capital,
-      spec.capital,
-      t,
-      spec.status === 'running' ? t : null,
-      t,
-      t,
-    )
-    .run()
-
-  await logEvent(
-    db,
-    owner,
-    botId,
-    'info',
-    `Launched in ${spec.mode} mode with ${spec.capital.toLocaleString('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 })} on ${spec.symbols.join(', ')} (${spec.timeframe}).`,
-  )
-
-  const bot = await loadBot(db, owner, botId)
-  return bot ? { bot } : { error: 'create_failed', message: 'Bot could not be created.' }
-}
 
 bots.post('/', async (c) => {
   const db = c.get('db')
@@ -433,7 +207,9 @@ bots.post('/import', async (c) => {
     if (intent !== 'live') await queueRunForBot(db, owner, intent, result.bot, runs)
   }
   return privateJson(c, { launched, failed, intent, runs })
+  return privateJson(c, { launched, failed, intent, runs })
 })
+
 
 /** Replace the workspace's fleet with the five demo bots (live-mode, paused).
  * Bots and their books are deleted; connections, backtests and strategies are

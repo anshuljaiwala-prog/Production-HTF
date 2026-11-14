@@ -1,4 +1,4 @@
-import type { Bot, TraceDecision, TraceRejectReason } from '../shared/types'
+import type { Bot, BotMode, TraceDecision, TraceRejectReason } from '../shared/types'
 import { environmentControlsFor } from './agents/environment-do'
 import { evaluateGate, readEnvironment } from './agents/environment'
 import { pinStatements, prunePinStatements, readRecentPins } from './agents/pins'
@@ -7,7 +7,7 @@ import { moveDirection } from './agents/specialists'
 import { scorePrediction } from './agents/trace'
 import { LiveBrokerError, PaperBroker, type Broker } from './broker'
 import { createVenueBroker } from './venues'
-import { BOT_SELECT, id, mapBot } from './db'
+import { BOT_SELECT, id, loadBots, mapBot } from './db'
 import { TIMEFRAME_MS, barIndexAt, barsBetween, lastClosedIndex, type Bar } from './market'
 import { barsForRun } from './marketstore'
 import { strategyBy } from './strategies'
@@ -62,6 +62,30 @@ export interface AdvanceOptions {
   broker?: Broker
   /** Deployment secrets key, so live venues can decrypt stored credentials. */
   secretsKey?: string
+}
+
+/** Running bots advanced per read. Every route that fast-forwards the fleet
+ * shares this budget, so the work one request can do lives in one place. */
+export const ADVANCE_BUDGET = 12
+
+/**
+ * Fast-forwards the running bots and returns the fleet as it stands after the
+ * advance, so a route's numbers reflect the latest closed bar. `mode` narrows
+ * the fleet to one book (the paper wallet advances separately from the book).
+ */
+export async function fastForwardFleet(
+  db: D1Database,
+  owner: string,
+  secretsKey: string | undefined,
+  mode?: BotMode,
+): Promise<Bot[]> {
+  const bots = await loadBots(db, owner)
+  const running = bots
+    .filter((bot) => bot.status === 'running' && (mode === undefined || bot.mode === mode))
+    .slice(0, ADVANCE_BUDGET)
+  if (!running.length) return bots
+  for (const bot of running) await advanceBot(db, owner, bot, { secretsKey })
+  return loadBots(db, owner)
 }
 
 /**

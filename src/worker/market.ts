@@ -1,4 +1,4 @@
-import { type AssetKind, type SymbolMeta, type Timeframe } from '../shared/types'
+import { type AssetKind, type Candle, type SymbolMeta, type Timeframe } from '../shared/types'
 
 // Deterministic synthetic market data. Every price comes from a layered value
 // noise over the symbol's seed, so the same (symbol, timeframe, timestamp)
@@ -424,4 +424,26 @@ export function barsBetween(symbol: string, tf: Timeframe, from: number, to: num
   const bars: Bar[] = []
   for (let i = start; i <= last; i++) bars.push(barAt(symbol, tf, i))
   return bars
+}
+
+/** Bounded candle count for the market chart: raw bars are bucketed into
+ * display candles so a 5,000-bar replay still draws legibly. */
+const MAX_CANDLES = 160
+
+export function toCandles(bars: { t: number; o: number; h: number; l: number; c: number; v: number }[]): Candle[] {
+  if (bars.length <= MAX_CANDLES) return bars
+  const per = Math.ceil(bars.length / MAX_CANDLES)
+  const candles: Candle[] = []
+  for (let start = 0; start < bars.length; start += per) {
+    const slice = bars.slice(start, start + per)
+    candles.push({
+      t: slice[0].t,
+      o: slice[0].o,
+      h: Math.max(...slice.map((b) => b.h)),
+      l: Math.min(...slice.map((b) => b.l)),
+      c: slice[slice.length - 1].c,
+      v: slice.reduce((sum, b) => sum + b.v, 0),
+    })
+  }
+  return candles
 }
