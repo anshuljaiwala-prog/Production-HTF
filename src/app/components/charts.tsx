@@ -2,7 +2,8 @@ import { motion } from 'motion/react'
 import { useId, useState } from 'react'
 
 import { cx } from '../lib/cx'
-import { moneyCompact } from '../lib/format'
+import { moneyCompact, moneyExact } from '../lib/format'
+import { useCurrency } from '../lib/prefs'
 
 // Small SVG charts: no dependency, crisp at any size, easy to restyle.
 
@@ -289,13 +290,15 @@ export function BarChart({
   data,
   height = 150,
   className,
-  format = (v) => `${v >= 0 ? '+' : '−'}$${Math.abs(v).toFixed(2)}`,
+  format,
 }: {
   data: { label: string; value: number; note?: string }[]
   height?: number
   className?: string
   format?: ChartFormatter
 }) {
+  useCurrency() // subscribe so this rerenders when the display currency changes
+  const fmt = format ?? ((v: number) => `${v >= 0 ? '+' : '−'}${moneyExact(Math.abs(v))}`)
   const [hover, setHover] = useState<number | null>(null)
   const w = 600
   const h = height
@@ -320,14 +323,14 @@ export function BarChart({
         className="h-auto w-full"
         preserveAspectRatio="none"
         role="img"
-        aria-label={`Bar chart, ${data.length} bars from ${format(Math.min(...data.map((d) => d.value), 0))} to ${format(Math.max(...data.map((d) => d.value), 0))}`}
+        aria-label={`Bar chart, ${data.length} bars from ${fmt(Math.min(...data.map((d) => d.value), 0))} to ${fmt(Math.max(...data.map((d) => d.value), 0))}`}
         onMouseLeave={() => setHover(null)}
       >
         {ticks.map((t) => (
           <g key={t}>
             <line x1={padLeft} x2={w - padRight} y1={y(t)} y2={y(t)} stroke={t === 0 ? 'var(--color-line-strong)' : 'var(--color-line)'} strokeDasharray={t === 0 ? undefined : '2 4'} />
             <text x={padLeft - 6} y={y(t)} textAnchor="end" dominantBaseline="central" fontSize="10.5" fill="var(--color-faint)">
-              {format(t)}
+              {fmt(t)}
             </text>
           </g>
         ))}
@@ -358,7 +361,7 @@ export function BarChart({
           className="pointer-events-none absolute -top-1 z-10 -translate-x-1/2 rounded-tile bg-fg px-2.5 py-1.5 text-[12px] font-medium text-bg shadow-pop"
           style={{ left: `${((padLeft + hover * slot + slot / 2) / w) * 100}%` }}
         >
-          trade {hover + 1}{data[hover].label ? ` · ${data[hover].label}` : ''} · {format(data[hover].value)}
+          trade {hover + 1}{data[hover].label ? ` · ${data[hover].label}` : ''} · {fmt(data[hover].value)}
           {data[hover].note ? ` · ${data[hover].note}` : ''}
         </div>
       )}
