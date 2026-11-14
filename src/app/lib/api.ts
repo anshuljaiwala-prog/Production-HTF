@@ -300,9 +300,12 @@ export function useApiMutation<TInput, TResult>(
   const invalidate = useInvalidate()
   return useMutation({
     mutationFn: run,
-    onSuccess: async (result, input) => {
-      await invalidate(...invalidates)
+    onSuccess: (result, input) => {
+      // The mutation already succeeded, so its follow-up (toast, navigation)
+      // runs first and unconditionally; the refetch is best-effort — a delete
+      // can invalidate a query whose resource no longer exists.
       options?.onSuccess?.(result, input)
+      void invalidate(...invalidates)
     },
     onError: options?.onError,
   })
