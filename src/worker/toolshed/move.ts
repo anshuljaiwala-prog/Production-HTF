@@ -1,26 +1,7 @@
 import type { CompanyMoveCandidate, CompanyMovePrediction } from '../../shared/types'
 
-// The shell's analytical tools. Numeric reads (change, RSI, dislocation) come
-// from the bars themselves; the dislocation z-scores are the pattern scan's own
-// (priceZ / volZ in patterns.ts), so there is exactly one implementation of that
-// measure in the codebase and the shell can never disagree with the pattern
-// board about what is stretched.
-
-/** Average-gain/average-loss RSI over the last `period` changes. */
-export function calculateRsi(prices: number[], period = 14): number {
-  if (prices.length < period + 1) return 50
-  const window = prices.slice(-period - 1)
-  let gain = 0
-  let loss = 0
-  for (let i = 1; i < window.length; i++) {
-    const change = window[i] - window[i - 1]
-    if (change > 0) gain += change
-    else loss += -change
-  }
-  const avgLoss = loss / period
-  if (avgLoss === 0) return 100
-  return 100 - 100 / (1 + gain / period / avgLoss)
-}
+// CompanyMovePredictor, ported from market_agent_env's tools.py: the probable
+// next strategic move given ownership concentration, sentiment and volatility.
 
 /** The facts the corporate-move predictor reads. */
 export interface MoveContext {
@@ -37,9 +18,6 @@ export interface MoveContext {
 }
 
 /**
- * CompanyMovePredictor, ported from market_agent_env's tools.py: the probable
- * next strategic move given ownership concentration, sentiment and volatility.
- *
  * The Python version's M&A rule read "peer sentiment", which was a hardcoded
  * 0.35 at every call site — a constant pretending to be a measurement. There is
  * no peer-sentiment series here, so that rule is absent rather than fed a

@@ -1,6 +1,7 @@
 import type { Bot, TraceDecision, TraceRejectReason } from '../shared/types'
 import { environmentControlsFor } from './agents/environment-do'
 import { evaluateGate, readEnvironment } from './agents/environment'
+import { pinStatements, prunePinStatements, readRecentPins } from './agents/pins'
 import { MACRO_BARS, macroBarsAt } from './agents/harvester'
 import { moveDirection } from './agents/specialists'
 import { scorePrediction } from './agents/trace'
@@ -154,9 +155,14 @@ async function advanceLocked(db: D1Database, owner: string, bot: Bot, options: A
   const agentAt = (lastBar + 1) * tfMs
   const focusSymbol = bot.symbols[0] ?? ''
   const focusFrom = agentAt - MACRO_BARS * tfMs
+  // The persisted pins for this bot's symbol, once per pass. Every bar this
+  // pass replays sees the same set, so the read costs one query per pass and a
+  // pin harvested on an earlier pass keeps counting until it expires.
+  const priorPins = focusSymbol ? await readRecentPins(db, owner, focusSymbol, agentAt) : []
   const agent = readEnvironment({
     at: agentAt,
     macroBars: macroBarsAt(agentAt),
+    priorPins,
     ...(focusSymbol
       ? { focus: { symbol: focusSymbol, bars: (await barsForRun(db, focusSymbol, bot.timeframe, focusFrom, agentAt)) ?? barsBetween(focusSymbol, bot.timeframe, focusFrom, agentAt) } }
       : {}),
@@ -538,6 +544,10 @@ async function advanceLocked(db: D1Database, owner: string, bot: Bot, options: A
       ],
     })
   }
+
+  // Persist what this pass screened, in the same batch as everything else it
+  // wrote, and bound the table the way the curve and traces are bounded.
+  statements.push(...pinStatements(agent.pins, owner), prunePinStatements(owner, agentAt))
 
   const kept = events.slice(0, MAX_EVENTS_PER_RUN)
   if (events.length > MAX_EVENTS_PER_RUN) {

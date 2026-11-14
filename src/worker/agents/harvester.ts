@@ -1,7 +1,7 @@
 import { TIMEFRAME_MS, barsBetween, type Bar } from '../market'
 import { analyseSeries } from '../patterns'
 import type { AgentMarketRead, AnomalySignal, NewsPin, SymbolPattern } from '../../shared/types'
-import { calculateRsi } from './tools'
+import { rsi } from '../toolshed/indicators'
 
 // Harvester, ported from market_agent_env's harvester.py and wired to the
 // market this platform actually holds. The Python app seeded six world indices
@@ -125,7 +125,7 @@ export function harvestMarket(
     market: {
       symbol,
       changePct: round(dayAgo > 0 ? ((last - dayAgo) / dayAgo) * 100 : 0, 2),
-      rsi: round(calculateRsi(closes), 1),
+      rsi: round(rsi(closes), 1),
       anomaly: anomalyOf(pattern),
     },
   }

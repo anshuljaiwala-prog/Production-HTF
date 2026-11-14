@@ -1,6 +1,7 @@
 import type { AccuracyStat, CustomRule, CustomRules, ParamValue, Strategy, Timeframe } from '../shared/types'
 import { METRIC_BOUNDS } from '../shared/types'
 import type { Bar } from './market'
+import { ema, highestHigh, lowestLow, momentum, rsi, volumeZ, zscore } from './toolshed/indicators'
 
 // Strategy templates. Each returns a signal for the current closed bar; the
 // engine and the backtester both decide position sizing, so the same function
@@ -34,44 +35,6 @@ export interface StrategyDef extends Strategy {
 }
 
 const num = (v: ParamValue | undefined, fallback: number) => (typeof v === 'number' && Number.isFinite(v) ? v : fallback)
-
-function sma(values: number[], n: number): number {
-  if (values.length === 0) return 0
-  const slice = values.slice(-n)
-  return slice.reduce((s, v) => s + v, 0) / slice.length
-}
-
-function stdev(values: number[]): number {
-  if (values.length < 2) return 0
-  const mean = values.reduce((s, v) => s + v, 0) / values.length
-  const variance = values.reduce((s, v) => s + (v - mean) ** 2, 0) / (values.length - 1)
-  return Math.sqrt(variance)
-}
-
-function ema(values: number[], n: number): number {
-  if (values.length === 0) return 0
-  const k = 2 / (n + 1)
-  let out = values[0]
-  for (let i = 1; i < values.length; i++) out = values[i] * k + out * (1 - k)
-  return out
-}
-
-function highest(bars: Bar[], n: number): number {
-  return Math.max(...bars.slice(-n).map((b) => b.h))
-}
-
-function lowest(bars: Bar[], n: number): number {
-  return Math.min(...bars.slice(-n).map((b) => b.l))
-}
-
-/** Volume's distance from its own mean in standard deviations over `n` bars. */
-function volumeZ(volumes: number[], n: number): number {
-  const window = volumes.slice(-n)
-  if (window.length < 2) return 0
-  const mean = window.reduce((s, v) => s + v, 0) / window.length
-  const sd = stdev(window)
-  return sd > 0 ? (window.at(-1)! - mean) / sd : 0
-}
 
 /** Gain/loss of the current mark against the average entry, in percent. */
 function gainPct(ctx: SignalContext): number | null {
@@ -205,10 +168,8 @@ export const STRATEGIES: StrategyDef[] = [
       const stop = stopExit(ctx, num(ctx.params.stopLossPct, 9))
       if (stop) return stop
       const closes = bars.map((b) => b.c)
-      const mean = sma(closes, n)
-      const sd = stdev(closes.slice(-n))
-      if (sd <= 0) return { action: 'hold' }
-      const z = (closes.at(-1)! - mean) / sd
+      const z = zscore(closes.slice(-n))
+      if (z === null) return { action: 'hold' }
       const entry = num(ctx.params.entryZ, 1.5)
       const exit = num(ctx.params.exitZ, 0.2)
       if (!ctx.position) return z <= -entry ? { action: 'buy', reason: `oversold at z ${z.toFixed(2)}` } : { action: 'hold' }
@@ -239,8 +200,8 @@ export const STRATEGIES: StrategyDef[] = [
       if (stop) return stop
       const last = bars.at(-1)!
       const prior = bars.slice(0, -1)
-      const upper = highest(prior, highN)
-      const lower = lowest(prior, lowN)
+      const upper = highestHigh(prior, highN)
+      const lower = lowestLow(prior, lowN)
       if (!ctx.position) return last.c > upper ? { action: 'buy', reason: `break of ${upper.toFixed(2)}` } : { action: 'hold' }
       return last.c < lower ? { action: 'sell', reason: `support broke at ${lower.toFixed(2)}` } : { action: 'hold' }
     },
@@ -298,11 +259,8 @@ export const STRATEGIES: StrategyDef[] = [
       if (bars.length < n + 2) return { action: 'hold' }
       const closes = bars.map((b) => b.c)
       const volumes = bars.map((b) => b.v)
-      const window = closes.slice(-n)
-      const mean = sma(closes, n)
-      const sd = stdev(window)
-      if (sd <= 0) return { action: 'hold' }
-      const z = (closes.at(-1)! - mean) / sd
+      const z = zscore(closes.slice(-n))
+      if (z === null) return { action: 'hold' }
       const stop = num(ctx.params.stopLossPct, 6)
 
       // A short is open: measure its loss against the entry, not against price.
@@ -341,17 +299,9 @@ function metricValue(metric: CustomRule['metric'], bars: Bar[], rule: CustomRule
   const n = Math.max(2, Math.round(rule.n))
   if (closes.length < n) return null
   switch (metric) {
-    case 'rsi': {
-      let gain = 0
-      let loss = 0
-      for (let i = closes.length - n; i < closes.length; i++) {
-        const change = closes[i] - closes[i - 1]
-        if (change >= 0) gain += change
-        else loss -= change
-      }
-      if (gain + loss === 0) return 50
-      return (100 * gain) / (gain + loss)
-    }
+    case 'rsi':
+      if (closes.length < n + 1) return null
+      return rsi(closes, n)
     case 'ema': {
       const fast = ema(closes, n)
       if (rule.n2) {
@@ -362,22 +312,18 @@ function metricValue(metric: CustomRule['metric'], bars: Bar[], rule: CustomRule
       }
       return ((last - fast) / fast) * 100
     }
-    case 'zscore': {
-      const window = closes.slice(-n)
-      const sd = stdev(window)
-      if (sd <= 0) return null
-      const mean = window.reduce((s, v) => s + v, 0) / window.length
-      return (last - mean) / sd
+    case 'zscore':
+      return zscore(closes.slice(-n))
+    case 'donchianHigh': {
+      const high = highestHigh(bars, n)
+      return ((last - high) / high) * 100
     }
-    case 'donchianHigh':
-      return ((last - highest(bars, n)) / highest(bars, n)) * 100
-    case 'donchianLow':
-      return ((last - lowest(bars, n)) / lowest(bars, n)) * 100
-    case 'momentum': {
-      const prior = closes.at(-1 - n)
-      if (prior === undefined) return null
-      return ((last - prior) / prior) * 100
+    case 'donchianLow': {
+      const low = lowestLow(bars, n)
+      return ((last - low) / low) * 100
     }
+    case 'momentum':
+      return momentum(closes, n)
   }
 }
 

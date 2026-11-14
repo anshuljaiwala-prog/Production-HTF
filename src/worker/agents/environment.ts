@@ -4,7 +4,7 @@ import type { CompanyProfile } from './models'
 import { harvestMarket, pinFromPattern, screenPin } from './harvester'
 import { computeMacroRegime, runForwardChaining } from './inference'
 import { runSpecialists } from './specialists'
-import { predictNextMove } from './tools'
+import { predictNextMove } from '../toolshed/move'
 
 // The environment hub, ported from market_agent_env's environment.py. The
 // Python app held one long-lived object with companies, world positions, news
@@ -78,12 +78,29 @@ export function companyFactsFor(symbol: string): AgentCompanyFacts {
  * should not gate a bot. */
 export const RISK_OFF_HOLD = 3
 
+/** One pin per id, newest wins. A pin re-derived on a later bar supersedes the
+ * earlier row with the same id; an expired one never arrives here (the read
+ * filters it), so a stale headline cannot keep a gate shut. */
+function mergePins(prior: NewsPin[], fresh: NewsPin[]): NewsPin[] {
+  const byId = new Map<string, NewsPin>()
+  for (const pin of prior) byId.set(pin.id, pin)
+  for (const pin of fresh) {
+    const seen = byId.get(pin.id)
+    if (!seen || pin.timestamp >= seen.timestamp) byId.set(pin.id, pin)
+  }
+  return [...byId.values()]
+}
+
 export interface EnvironmentInput {
   at: number
   /** Every tracked market's bars ending at `at`, oldest first. */
   macroBars: { symbol: string; bars: Bar[] }[]
   /** The bot's own market, from the same merged bars the bot trades. */
   focus?: { symbol: string; bars: Bar[] }
+  /** Pins an earlier pass screened and persisted and that have not expired.
+   * A headline counts until its expiry, not only on the bar it was harvested
+   * on, so sentiment and the critical-news read survive across passes. */
+  priorPins?: NewsPin[]
 }
 
 /**
@@ -114,6 +131,10 @@ export function readEnvironment(input: EnvironmentInput): AgentRead {
     } else pins.push(pin)
   }
 
+  // The tape's pins plus the ones still live from earlier passes: one by id,
+  // newest wins. This is the read the rules, the specialists and the gate see.
+  const livePins = mergePins(input.priorPins ?? [], pins)
+
   const focusEntry = input.focus ? harvestMarket(input.focus.symbol, input.focus.bars) : harvested[0]
   if (input.focus) addReasons(barReasons, focusEntry?.reasons ?? {})
   const focus = focusEntry?.market.symbol ?? 'BTC-USD'
@@ -121,7 +142,7 @@ export function readEnvironment(input: EnvironmentInput): AgentRead {
 
   // Sentiment: pins on this ticker move the baseline (the Python app's
   // pin_news blend); with no news it is the profile's own score.
-  const tickerPins = pins.filter((pin) => pin.ticker === focus)
+  const tickerPins = livePins.filter((pin) => pin.ticker === focus)
   const sentiment = tickerPins.length
     ? tickerPins.reduce((sum, pin) => sum + pin.sentiment, 0) / tickerPins.length
     : company.sentimentScore
@@ -138,7 +159,7 @@ export function readEnvironment(input: EnvironmentInput): AgentRead {
     rsi: focusEntry?.market.rsi ?? 50,
     affiliationsCount: company.affiliations.length,
     anomalySignal: focusEntry?.market.anomaly.signal ?? 'NORMAL_VARIATION',
-    criticalNegativeNews: pins.some((pin) => pin.impactLevel === 'CRITICAL' && pin.sentiment < -0.5),
+    criticalNegativeNews: livePins.some((pin) => pin.impactLevel === 'CRITICAL' && pin.sentiment < -0.5),
     globalNegativeCount: macro.negCount,
   }
 
@@ -159,8 +180,8 @@ export function readEnvironment(input: EnvironmentInput): AgentRead {
     markets,
     // Which markets are dislocated badly enough for their own bots to stand
     // down; empty when nothing is.
-    criticalMarkets: pins.filter((pin) => pin.impactLevel === 'CRITICAL').map((pin) => pin.ticker),
-    pins,
+    criticalMarkets: livePins.filter((pin) => pin.impactLevel === 'CRITICAL').map((pin) => pin.ticker),
+    pins: livePins,
     inferences: runForwardChaining(memory),
     workingMemory: memory,
     company: facts,

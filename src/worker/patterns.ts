@@ -14,6 +14,7 @@ import type {
 import type { Bot } from '../shared/types'
 import { DAY, TIMEFRAME_MS, barsBetween, historyStart, symbolMeta } from './market'
 import { barsForRun } from './marketstore'
+import { stdev, zscore } from './toolshed/indicators'
 
 // Pattern scan: every tracked symbol is described by what its tape did — not
 // by a guess about what a chart "looks like". A crash is a deep drawdown with
@@ -42,13 +43,6 @@ const round = (value: number, decimals = 2) => {
 }
 const clamp = (value: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, value))
 const signed = (value: number, decimals = 2) => `${value >= 0 ? '+' : '−'}${Math.abs(value).toFixed(decimals)}%`
-
-function stdev(values: number[]): number {
-  if (values.length < 2) return 0
-  const mean = values.reduce((sum, v) => sum + v, 0) / values.length
-  const variance = values.reduce((sum, v) => sum + (v - mean) ** 2, 0) / (values.length - 1)
-  return Math.sqrt(variance)
-}
 
 function returns(bars: { c: number }[]): number[] {
   const out: number[] = []
@@ -95,17 +89,6 @@ const DISLOCATION_PRICE_Z = 2.5
 const CONFIRMING_VOLUME_Z = 0.5
 const HEAVY_VOLUME_Z = 1.5
 
-/** How far the last value sits from the window mean, in standard deviations.
- * Null when the series is flat or too short — a z-score against zero
- * dispersion would be infinite rather than informative. */
-function zScore(values: number[]): number | null {
-  if (values.length < 3) return null
-  const sd = stdev(values)
-  if (!(sd > 0)) return null
-  const mean = values.reduce((sum, v) => sum + v, 0) / values.length
-  return (values[values.length - 1] - mean) / sd
-}
-
 /** Sample a series down to a sparkline-sized window. */
 function sampleSeries(values: number[]): number[] {
   if (values.length <= MAX_SPARK) return values
@@ -148,8 +131,8 @@ export function analyseSeries(symbol: string, bars: { t: number; h: number; l: n
   // are needed — a price z-score alone cannot tell a real break from a move
   // nobody traded through.
   const recentBars = window.slice(-RECENT_BARS)
-  const priceZ = zScore(recentBars.map((bar) => bar.c))
-  const volZ = zScore(recentBars.map((bar) => bar.v ?? 0))
+  const priceZ = zscore(recentBars.map((bar) => bar.c))
+  const volZ = zscore(recentBars.map((bar) => bar.v ?? 0))
   const liquidityVacuum =
     priceZ !== null && volZ !== null && Math.abs(priceZ) >= DISLOCATION_PRICE_Z && volZ < CONFIRMING_VOLUME_Z
 

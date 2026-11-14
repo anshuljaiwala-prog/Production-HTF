@@ -267,6 +267,26 @@ const SCHEMA = [
     PRIMARY KEY (owner_sub, symbol, timeframe, at)
   )`,
   `CREATE INDEX IF NOT EXISTS move_predictions_owner ON move_predictions(owner_sub, at DESC)`,
+  // Screened news pins, written once per engine pass. The environment DO keeps
+  // the panel's copy in its own storage; this table is the engine's, readable
+  // with a D1 handle and nothing else, so a bot's later pass sees (and a later
+  // reader audits) what an earlier pass harvested. `expires_at` is what stops
+  // an old pin moving sentiment forever.
+  `CREATE TABLE IF NOT EXISTS news_pins (
+    owner_sub TEXT NOT NULL,
+    id TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    at INTEGER NOT NULL,
+    impact_level TEXT NOT NULL,
+    sentiment REAL NOT NULL,
+    title TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    source TEXT NOT NULL,
+    expires_at INTEGER NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (owner_sub, id, at)
+  )`,
+  `CREATE INDEX IF NOT EXISTS news_pins_symbol ON news_pins(owner_sub, symbol, at DESC)`,
 ]
 
 let ready: Promise<void> | undefined
