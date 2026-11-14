@@ -1,9 +1,9 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { lazy, Suspense, useEffect } from 'react'
+import { Component, lazy, Suspense, useEffect, type ReactNode } from 'react'
 import { BrowserRouter, Navigate, Route, Routes, useLocation } from 'react-router'
 
 import { Shell } from './components/Shell'
-import { Spinner, ToastProvider } from './components/ui'
+import { Button, Spinner, ToastProvider } from './components/ui'
 import { capturePageview, identifyUser } from './lib/analytics'
 import { ApiError, useMe } from './lib/api'
 
@@ -51,6 +51,32 @@ function BacktestsRedirect() {
   return <Navigate to={`/training?${params.toString()}`} replace />
 }
 
+/** A failed page — a stale lazily-loaded chunk after a deploy, or a render
+ * bug — must not blank the whole document. The boundary keeps the shell and
+ * offers a reload instead of an empty screen. */
+class AppErrorBoundary extends Component<{ children: ReactNode }, { error: Error | null }> {
+  state = { error: null as Error | null }
+
+  static getDerivedStateFromError(error: Error) {
+    return { error }
+  }
+
+  render() {
+    if (!this.state.error) return this.props.children
+    return (
+      <div className="grid min-h-screen place-items-center p-6">
+        <div className="max-w-md text-center">
+          <h1 className="text-[16px] font-semibold">This page failed to load</h1>
+          <p className="mt-2 text-[13px] leading-relaxed text-muted">{this.state.error.message}</p>
+          <Button variant="primary" className="mt-4" onClick={() => window.location.reload()}>
+            Reload
+          </Button>
+        </div>
+      </div>
+    )
+  }
+}
+
 function Gate() {
   const me = useMe()
   // Once the Worker says who this is, bind every event to that person.
@@ -94,7 +120,9 @@ export function App() {
       <ToastProvider>
         <BrowserRouter>
           <Pageviews />
-          <Gate />
+          <AppErrorBoundary>
+            <Gate />
+          </AppErrorBoundary>
         </BrowserRouter>
       </ToastProvider>
     </QueryClientProvider>
