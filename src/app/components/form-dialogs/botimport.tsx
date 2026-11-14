@@ -3,7 +3,7 @@ import { useEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router'
 
 import { TIMEFRAMES, type ParamValue, type Strategy, type Timeframe } from '../../../shared/types'
-import { importBots, useApiMutation, useStrategies, type ImportIntent, type LaunchInput } from '../../lib/api'
+import { importBots, importBotsFromGithub, useApiMutation, useStrategies, type ImportIntent, type LaunchInput } from '../../lib/api'
 import { Badge, Button, Dialog, useToast } from '../ui'
 import { paramDefaults } from '../form-fields'
 
@@ -115,6 +115,7 @@ export function BotImportDialog({ open, onClose }: { open: boolean; onClose: () 
   const [rows, setRows] = useState<ImportedRow[] | null>(null)
   const [parseError, setParseError] = useState('')
   const [dragging, setDragging] = useState(false)
+  const [repoUrl, setRepoUrl] = useState('')
 
   useEffect(() => {
     if (open) {
@@ -123,6 +124,7 @@ export function BotImportDialog({ open, onClose }: { open: boolean; onClose: () 
       setIntent('live')
       setParseError('')
       setDragging(false)
+      setRepoUrl('')
     }
   }, [open])
 
@@ -199,6 +201,22 @@ export function BotImportDialog({ open, onClose }: { open: boolean; onClose: () 
     },
   })
 
+  // The repo path creates server-side from the fetched file, so there is no
+  // preview step here: the toast is the receipt and the fleet refetch follows.
+  const repoRun = useApiMutation(
+    (input: { url: string; intent: ImportIntent }) => importBotsFromGithub(input.url, input.intent),
+    ['bots', 'bot', 'dashboard', 'search', 'portfolio'],
+    {
+      onSuccess: (result) => {
+        const skipped = result.failed.length
+        toast(
+          `Imported ${result.launched.length} bot${result.launched.length === 1 ? '' : 's'} from GitHub (paused)${skipped ? ` · ${skipped} skipped` : ''}`,
+          skipped ? 'danger' : undefined,
+        )
+        onClose()
+      },
+    },
+  )
   const asLaunchInput = (row: ImportedRow): LaunchInput => ({
     strategyKey: row.strategyKey,
     name: row.name,
@@ -316,6 +334,35 @@ const dialog = INTENTS.find((entry) => entry.key === intent) ?? INTENTS[0]
                 </li>
               ))}
             </ul>
+          </div>
+        )}
+        {rows === null && (
+          <div className="rounded-card border border-line p-3">
+            <span className="text-[12.5px] font-medium text-muted">…or import straight from a public repo</span>
+            <div className="mt-1.5 flex items-center gap-1.5">
+              <input
+                className="min-w-0 flex-1 rounded-control border border-control bg-surface px-3 py-1.5 text-[13px] outline-none focus:border-accent"
+                placeholder="https://github.com/owner/repo/blob/main/bots.json"
+                aria-label="GitHub bot config URL"
+                value={repoUrl}
+                onChange={(e) => setRepoUrl(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' && repoUrl.trim() && !repoRun.isPending) repoRun.mutate({ url: repoUrl.trim(), intent })
+                }}
+              />
+              <Button
+                type="button"
+                disabled={!repoUrl.trim() || repoRun.isPending}
+                loading={repoRun.isPending}
+                onClick={() => repoRun.mutate({ url: repoUrl.trim(), intent })}
+              >
+                Load
+              </Button>
+            </div>
+            <p className="mt-1.5 text-[11.5px] text-faint">
+              Public repos only · bot configs or inline rules · imported once, never re-synced.
+            </p>
+            {repoRun.error && <p className="mt-1 text-[13px] text-danger">{repoRun.error.message}</p>}
           </div>
         )}
         <input

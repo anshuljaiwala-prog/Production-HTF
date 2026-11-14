@@ -244,6 +244,21 @@ let importedBotId
   check('POST /bots/import rejects empty payload', empty.status === 400, `got ${empty.status}`)
 }
 
+// 8b2. Repo import: the URL is reduced to raw.githubusercontent.com and only
+// that host is fetched, so a wrong link is refused before any request is made.
+{
+  const offsite = await call('POST', '/bots/import/github', { url: 'https://example.com/bots.json' })
+  check(
+    'POST /bots/import/github refuses a non-GitHub host',
+    offsite.status === 400 && offsite.payload?.error === 'bad_source' && offsite.payload?.launched === undefined,
+    `got ${offsite.status} ${JSON.stringify(offsite.payload?.error)}`,
+  )
+  const notFile = await call('POST', '/bots/import/github', { url: 'https://github.com/owner/repo' })
+  check('POST /bots/import/github refuses a repo link with no file', notFile.status === 400, `got ${notFile.status}`)
+  const missing = await call('POST', '/bots/import/github', {})
+  check('POST /bots/import/github refuses a missing url', missing.status === 400 && missing.payload?.error === 'bad_source', `got ${missing.status}`)
+}
+
 // 8c. Bot PATCH: trading settings only change while the bot is not active
 {
   const activePatch = await call('PATCH', `/bots/${botId}`, { riskPct: 55 })

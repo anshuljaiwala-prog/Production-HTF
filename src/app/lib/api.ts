@@ -376,6 +376,10 @@ export interface BotImportResult {
 }
 export const importBots = (items: LaunchInput[], intent: ImportIntent = 'live') =>
   api<BotImportResult>('/bots/import', { method: 'POST', json: { items, intent } })
+/** One-shot import from a public repo file. No token, no re-sync: the bots
+ * this creates are ordinary bots from then on. */
+export const importBotsFromGithub = (url: string, intent: ImportIntent = 'live') =>
+  api<BotImportResult & { source: string }>('/bots/import/github', { method: 'POST', json: { url, intent } })
 
 /** Bulk exchange-API upload: create many connections from one pasted JSON
  * payload. Each row is validated exactly like a single create; good rows are

@@ -91,6 +91,8 @@ bots.post('/', async (c) => {
  * back for a preview. */
 export type ImportIntent = 'live' | 'backtest' | 'train'
 const MAX_IMPORT = 25
+/** A repo file is a bot config, not a data dump; refuse the obvious mistake. */
+const MAX_REPO_BYTES = 256 * 1024
 
 interface QueueSummary {
   queued: number
@@ -164,30 +166,21 @@ async function queueRunForBot(db: D1Database, owner: string, intent: 'backtest' 
   )
 }
 
-bots.post('/import', async (c) => {
-  const db = c.get('db')
-  const owner = c.get('user').sub
-  const validateOnly = c.req.query('validate') === '1'
-  const body = await c.req.json<{ items?: CreateBody[]; bots?: CreateBody[]; intent?: ImportIntent }>()
-  const intent = body.intent === 'backtest' || body.intent === 'train' ? body.intent : 'live'
-  const rawItems = Array.isArray(body.items) ? body.items : Array.isArray(body.bots) ? body.bots : []
-  const items = rawItems.slice(0, MAX_IMPORT)
-  if (items.length === 0) {
-    return c.json({ error: 'nothing_to_import', message: 'No bot configs found in the upload — expected an array under "items".' }, 400)
+/** The rows an uploaded payload carries: a bare array, or `items`/`bots` on an object. */
+function botRowsFrom(payload: unknown): CreateBody[] {
+  if (Array.isArray(payload)) return payload as CreateBody[]
+  if (payload && typeof payload === 'object') {
+    const rows = payload as { items?: unknown; bots?: unknown }
+    if (Array.isArray(rows.items)) return rows.items as CreateBody[]
+    if (Array.isArray(rows.bots)) return rows.bots as CreateBody[]
   }
+  return []
+}
 
-  const ready: ValidateRowResult[] = []
-  for (const [index, item] of items.entries()) {
-    const label = item.name?.trim() || item.symbols?.filter(Boolean).join(', ') || `Import ${index + 1}`
-    const spec = await validateSpec(db, owner, { ...item, status: 'paused' })
-    if ('error' in spec) ready.push({ label, problem: spec.message })
-    else ready.push({ label, problem: null })
-  }
-
-  if (validateOnly) {
-    return privateJson(c, { ready: ready.filter((r) => r.problem === null).length, rows: ready })
-  }
-
+/** Create one bot per config, parked the way its intent asks, and queue the
+ * runs that intent wants. The file upload and the repo import both land here
+ * so the two entry points validate and behave alike. */
+async function importRows(db: D1Database, owner: string, items: CreateBody[], intent: ImportIntent) {
   const launched: Bot[] = []
   const failed: { name: string; error: string }[] = []
   const venues = await loadVenueMap(db, owner)
@@ -206,11 +199,106 @@ bots.post('/import', async (c) => {
     }
     if (intent !== 'live') await queueRunForBot(db, owner, intent, result.bot, runs)
   }
-  return privateJson(c, { launched, failed, intent, runs })
+  return { launched, failed, runs }
+}
+bots.post('/import', async (c) => {
+  const db = c.get('db')
+  const owner = c.get('user').sub
+  const validateOnly = c.req.query('validate') === '1'
+  const body = await c.req.json<{ items?: CreateBody[]; bots?: CreateBody[]; intent?: ImportIntent }>()
+  const intent = body.intent === 'backtest' || body.intent === 'train' ? body.intent : 'live'
+  const rawItems = botRowsFrom(body)
+  const items = rawItems.slice(0, MAX_IMPORT)
+  if (items.length === 0) {
+    return c.json({ error: 'nothing_to_import', message: 'No bot configs found in the upload — expected an array under "items".' }, 400)
+  }
+
+  const ready: ValidateRowResult[] = []
+  for (const [index, item] of items.entries()) {
+    const label = item.name?.trim() || item.symbols?.filter(Boolean).join(', ') || `Import ${index + 1}`
+    const spec = await validateSpec(db, owner, { ...item, status: 'paused' })
+    if ('error' in spec) ready.push({ label, problem: spec.message })
+    else ready.push({ label, problem: null })
+  }
+
+  if (validateOnly) {
+    return privateJson(c, { ready: ready.filter((r) => r.problem === null).length, rows: ready })
+  }
+
+  const { launched, failed, runs } = await importRows(db, owner, items, intent)
   return privateJson(c, { launched, failed, intent, runs })
 })
 
 
+/** A pasted repo link, reduced to the raw file behind it. Only github.com and
+ * raw.githubusercontent.com are fetched: the operator supplies this URL, so
+ * the worker must never be pointed at an arbitrary host. */
+function repoFileUrl(input: string): URL | null {
+  let url: URL
+  try {
+    url = new URL(input.trim())
+  } catch {
+    return null
+  }
+  if (url.protocol !== 'https:') return null
+  if (url.hostname === 'raw.githubusercontent.com') return url
+  if (url.hostname !== 'github.com' && url.hostname !== 'www.github.com') return null
+  // What the browser address bar shows is the blob page; the raw host serves
+  // the same file without the HTML wrapper.
+  const match = /^\/([^/]+)\/([^/]+)\/(?:blob|raw)\/(.+?)\/?$/.exec(url.pathname)
+  if (!match) return null
+  return new URL(`https://raw.githubusercontent.com/${match[1]}/${match[2]}/${match[3]}`)
+}
+
+/** Import one file from a public repo — bot configs, or a row carrying inline
+ * rules. One-shot by design: the source is not recorded and nothing re-syncs,
+ * so a repo change never silently reconfigures a running bot. */
+bots.post('/import/github', async (c) => {
+  const db = c.get('db')
+  const owner = c.get('user').sub
+  const body = await c.req
+    .json<{ url?: string; intent?: ImportIntent }>()
+    .catch(() => ({}) as { url?: string; intent?: ImportIntent })
+  const intent = body.intent === 'backtest' || body.intent === 'train' ? body.intent : 'live'
+  const source = repoFileUrl(body.url ?? '')
+  if (!source) {
+    return c.json(
+      { error: 'bad_source', message: 'Paste a github.com blob link or a raw.githubusercontent.com link to a bot config file.' },
+      400,
+    )
+  }
+  let response: Response
+  try {
+    response = await fetch(source.toString(), { signal: AbortSignal.timeout(10_000) })
+  } catch {
+    return c.json({ error: 'source_unreachable', message: `Could not reach ${source.hostname}.` }, 502)
+  }
+  if (!response.ok) {
+    return c.json(
+      { error: 'source_error', message: `That link returned ${response.status} — check the file exists and the repo is public.` },
+      502,
+    )
+  }
+  const text = await response.text()
+  if (text.length > MAX_REPO_BYTES) {
+    return c.json({ error: 'source_too_large', message: 'That file is larger than a bot config should be (256 KB).' }, 413)
+  }
+  let payload: unknown
+  try {
+    payload = JSON.parse(text)
+  } catch {
+    return c.json({ error: 'not_json', message: 'That file is not JSON.' }, 400)
+  }
+  const items = botRowsFrom(payload).slice(0, MAX_IMPORT)
+  if (items.length === 0) {
+    return c.json(
+      { error: 'nothing_to_import', message: 'No bot configs found — expected an array, or an object with an "items" array.' },
+      400,
+    )
+  }
+  const { launched, failed, runs } = await importRows(db, owner, items, intent)
+  return privateJson(c, { launched, failed, intent, runs, source: source.toString() })
+})
 /** Replace the workspace's fleet with the five demo bots (live-mode, paused).
  * Bots and their books are deleted; connections, backtests and strategies are
  * left alone. Seeding never advances a bot, so nothing is ordered. */
