@@ -6,6 +6,14 @@ const ORIGIN = { Origin: BASE, accept: 'application/json', 'content-type': 'appl
 
 let failures = 0
 
+// Fixtures the check creates are registered here and deleted at the end, so a
+// run leaves the dev workspace exactly as it found it. Failures are counted,
+// not thrown, so the cleanup below runs on a passing and a failing run alike.
+const fixtures = []
+const track = (kind, id) => {
+  if (id) fixtures.push({ kind, id })
+}
+
 async function call(method, path, body) {
   const response = await fetch(`${BASE}/api${path}`, {
     method,
@@ -18,7 +26,7 @@ async function call(method, path, body) {
   } catch {
     /* no body */
   }
-  return { status: response.status, payload }
+  return { status: response.status, payload, headers: response.headers }
 }
 
 function check(label, ok, detail = '') {
@@ -311,6 +319,7 @@ let customStrategyId
 
   const upload = await call('POST', '/strategies/custom', { rules })
   customStrategyId = upload.payload?.strategy?.id
+  track('strategy', customStrategyId)
   check(
     'POST /strategies/custom uploads rules',
     upload.status === 201 && Boolean(customStrategyId) && upload.payload.strategy?.rules === 2 && upload.payload.strategy?.lookback > 0 && upload.payload.durable === true && upload.payload.strategy?.version >= 1 && upload.payload.strategy?.versions === upload.payload.strategy?.version,
@@ -802,6 +811,11 @@ let modeBotId
   check('GET /search', search.status === 200 && Array.isArray(search.payload.bots))
   const me = await call('GET', '/me')
   check('GET /me', me.status === 200 && typeof me.payload.workspace?.name === 'string')
+  check(
+    'private API responses set Cache-Control: private, no-store',
+    me.headers?.get('cache-control') === 'private, no-store',
+    me.headers?.get('cache-control') ?? 'missing',
+  )
 
   const cross = await fetch(`${BASE}/api/bots`, {
     method: 'POST',
@@ -974,9 +988,21 @@ let modeBotId
     JSON.stringify((flows.payload?.funding ?? []).find((flow) => flow.botId === id)).slice(0, 160),
   )
   const tooLow = await call('PATCH', `/bots/${id}`, { capital: 50 })
-  check('PATCH capital rejects a value under $100', tooLow.status === 400, `got ${tooLow.status}`)
+  check(
+    'PATCH capital rejects a value under $100',
+    tooLow.status === 400 && tooLow.payload?.error === 'invalid_capital',
+    `status=${tooLow.status} error=${tooLow.payload?.error}`,
+  )
   const rejected = await call('GET', `/bots/${id}`)
   check('a rejected capital edit changes nothing', rejected.payload?.bot?.capital === 8_000, `capital=${rejected.payload?.bot?.capital}`)
+  const tooHigh = await call('PATCH', `/bots/${id}`, { capital: 10_000_001 })
+  check(
+    'PATCH capital rejects a value above $10,000,000',
+    tooHigh.status === 400 && tooHigh.payload?.error === 'invalid_capital',
+    `status=${tooHigh.status} error=${tooHigh.payload?.error}`,
+  )
+  const afterCeilingReject = await call('GET', `/bots/${id}`)
+  check('a rejected over-ceiling capital edit changes nothing', afterCeilingReject.payload?.bot?.capital === 8_000, `capital=${afterCeilingReject.payload?.bot?.capital}`)
   await call('DELETE', `/bots/${id}`)
 }
 
@@ -1192,6 +1218,8 @@ let modeBotId
 {
   const removed = await call('DELETE', `/bots/${botId}`)
   check('DELETE /bots/:id', removed.status === 200, `got ${removed.status}`)
+  const gone = await call('GET', `/bots/${botId}`)
+  check('GET deleted bot returns 404', gone.status === 404, `got ${gone.status}`)
   if (importedBotId) {
     const removedImport = await call('DELETE', `/bots/${importedBotId}`)
     check('DELETE imported bot', removedImport.status === 200, `got ${removedImport.status}`)
@@ -1360,12 +1388,21 @@ let modeBotId
     await new Promise((resolve) => setTimeout(resolve, 400))
     shortDetail = (await call('GET', `/backtests/${shortRun.payload?.backtest?.id}`)).payload?.backtest
   }
+  track('backtest', shortRun.payload?.backtest?.id)
   const shortSides = new Set((shortDetail?.trades ?? []).map((t) => t.side))
   check(
     'the crash-short strategy opens and covers a short book',
     shortDetail?.status === 'done' && shortSides.has('short') && shortSides.has('cover'),
     `${shortDetail?.status} sides=${[...shortSides].join(',')} trades=${shortDetail?.trades?.length}`,
   )
+}
+
+// Cleanup: discard every fixture this run registered — newest first, so a
+// strategy goes after the bots and backtests that referenced it.
+for (const fixture of fixtures.reverse()) {
+  const path = fixture.kind === 'strategy' ? `/strategies/custom/${fixture.id}` : `/backtests/${fixture.id}`
+  const removed = await call('DELETE', path)
+  check(`cleanup: DELETE ${fixture.kind} fixture`, removed.status === 200, `got ${removed.status}`)
 }
 
 console.log(failures === 0 ? '\nAll API checks passed.' : `\n${failures} check(s) failed.`)
