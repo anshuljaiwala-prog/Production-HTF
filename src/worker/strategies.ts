@@ -26,6 +26,11 @@ export interface Signal {
   /** `short` opens a negative book, `cover` closes it. */
   action: 'buy' | 'sell' | 'short' | 'cover' | 'hold'
   reason?: string
+  /** How strongly this bar justifies the action, 0–100. An entry carries the
+   * read's own strength; an exit carries EXIT_CONFIDENCE. A strategy that
+   * cannot say — the uploaded rules DSL — omits it, and the engine falls back
+   * to the agent verdict's conviction. */
+  confidence?: number
 }
 
 export interface StrategyDef extends Strategy {
@@ -35,6 +40,20 @@ export interface StrategyDef extends Strategy {
 }
 
 const num = (v: ParamValue | undefined, fallback: number) => (typeof v === 'number' && Number.isFinite(v) ? v : fallback)
+
+/** A stop or a target is a decision the template never doubts, so exits carry
+ * this rather than a read — and exits are never gated on it. */
+const EXIT_CONFIDENCE = 100
+
+/** An entry fired by rule rather than by a read — a schedule, a seed, a filled
+ * quote — has nothing to be sure about, so it sits below any scored entry. */
+const NO_READ_CONFIDENCE = 50
+
+/** Entry confidence, 0–100: the template's floor when the signal only just
+ * qualifies, rising to 95 as it clears its trigger by a full width. `excess`
+ * is how far past the trigger the tape sits, relative to that trigger's own
+ * scale, so every template's number means the same thing. */
+const beyond = (excess: number) => Math.round(55 + Math.min(1, Math.max(0, excess)) * 40)
 
 /** Gain/loss of the current mark against the average entry, in percent. */
 function gainPct(ctx: SignalContext): number | null {
@@ -47,7 +66,7 @@ function gainPct(ctx: SignalContext): number | null {
 /** Shared exit: a stop loss checked before any strategy-specific entry logic. */
 function stopExit(ctx: SignalContext, stopPct: number): Signal | null {
   const gain = gainPct(ctx)
-  if (gain !== null && stopPct > 0 && gain <= -stopPct) return { action: 'sell', reason: `stop loss at ${gain.toFixed(1)}%` }
+  if (gain !== null && stopPct > 0 && gain <= -stopPct) return { action: 'sell', reason: `stop loss at ${gain.toFixed(1)}%`, confidence: EXIT_CONFIDENCE }
   return null
 }
 
@@ -73,11 +92,12 @@ export const STRATEGIES: StrategyDef[] = [
       const stop = stopExit(ctx, num(ctx.params.stopLossPct, 10))
       if (stop) return stop
       const gain = gainPct(ctx)
-      if (gain !== null && gain >= num(ctx.params.takeProfitPct, 6)) return { action: 'sell', reason: `target hit at +${gain.toFixed(1)}%` }
+      if (gain !== null && gain >= num(ctx.params.takeProfitPct, 6)) return { action: 'sell', reason: `target hit at +${gain.toFixed(1)}%`, confidence: EXIT_CONFIDENCE }
       if (ctx.position) return { action: 'hold' }
       const interval = Math.max(1, Math.round(num(ctx.params.intervalBars, 6)))
       const slot = Math.floor(bar.t / ctx.tfMs) % interval
-      if (slot === 0) return { action: 'buy', reason: 'scheduled entry' }
+      // A schedule is a rule, not a read: it carries the template's floor.
+      if (slot === 0) return { action: 'buy', reason: 'scheduled entry', confidence: NO_READ_CONFIDENCE }
       return { action: 'hold' }
     },
   },
@@ -101,9 +121,10 @@ export const STRATEGIES: StrategyDef[] = [
       if (stop) return stop
       const step = num(ctx.params.gridStepPct, 1.5)
       const gain = gainPct(ctx)
-      if (gain === null) return { action: 'buy', reason: 'seed grid at market' }
-      if (gain >= step) return { action: 'sell', reason: `grid ceiling +${gain.toFixed(1)}%` }
-      if (gain <= -step) return { action: 'buy', reason: `grid step down ${gain.toFixed(1)}%` }
+      if (gain === null) return { action: 'buy', reason: 'seed grid at market', confidence: NO_READ_CONFIDENCE }
+      if (gain >= step) return { action: 'sell', reason: `grid ceiling +${gain.toFixed(1)}%`, confidence: EXIT_CONFIDENCE }
+      // Deeper under the step is a stronger fill: the overshoot is the read.
+      if (gain <= -step) return { action: 'buy', reason: `grid step down ${gain.toFixed(1)}%`, confidence: beyond((-gain - step) / step) }
       return { action: 'hold' }
     },
   },
@@ -140,8 +161,10 @@ export const STRATEGIES: StrategyDef[] = [
       const edge = (fast - slow) / slow
       const crossUp = prevFast <= prevSlow && fast > slow && edge >= 0.0005
       const crossDown = prevFast >= prevSlow && fast < slow
-      if (!ctx.position) return crossUp ? { action: 'buy', reason: 'fast EMA crossed above slow EMA' } : { action: 'hold' }
-      if (crossDown) return { action: 'sell', reason: 'trend reversal' }
+      // A 0.5% separation between the averages is full headroom; the 0.05%
+      // filter floor is a marginal cross.
+      if (!ctx.position) return crossUp ? { action: 'buy', reason: 'fast EMA crossed above slow EMA', confidence: beyond(edge / 0.005) } : { action: 'hold' }
+      if (crossDown) return { action: 'sell', reason: 'trend reversal', confidence: EXIT_CONFIDENCE }
       return { action: 'hold' }
     },
   },
@@ -172,8 +195,8 @@ export const STRATEGIES: StrategyDef[] = [
       if (z === null) return { action: 'hold' }
       const entry = num(ctx.params.entryZ, 1.5)
       const exit = num(ctx.params.exitZ, 0.2)
-      if (!ctx.position) return z <= -entry ? { action: 'buy', reason: `oversold at z ${z.toFixed(2)}` } : { action: 'hold' }
-      return z >= exit ? { action: 'sell', reason: `re-centred at z ${z.toFixed(2)}` } : { action: 'hold' }
+      if (!ctx.position) return z <= -entry ? { action: 'buy', reason: `oversold at z ${z.toFixed(2)}`, confidence: beyond((-z - entry) / entry) } : { action: 'hold' }
+      return z >= exit ? { action: 'sell', reason: `re-centred at z ${z.toFixed(2)}`, confidence: EXIT_CONFIDENCE } : { action: 'hold' }
     },
   },
   {
@@ -202,8 +225,10 @@ export const STRATEGIES: StrategyDef[] = [
       const prior = bars.slice(0, -1)
       const upper = highestHigh(prior, highN)
       const lower = lowestLow(prior, lowN)
-      if (!ctx.position) return last.c > upper ? { action: 'buy', reason: `break of ${upper.toFixed(2)}` } : { action: 'hold' }
-      return last.c < lower ? { action: 'sell', reason: `support broke at ${lower.toFixed(2)}` } : { action: 'hold' }
+      // A break that barely clears the range is a weak break; 1% past the level
+      // is full headroom.
+      if (!ctx.position) return last.c > upper ? { action: 'buy', reason: `break of ${upper.toFixed(2)}`, confidence: beyond((last.c / upper - 1) / 0.01) } : { action: 'hold' }
+      return last.c < lower ? { action: 'sell', reason: `support broke at ${lower.toFixed(2)}`, confidence: EXIT_CONFIDENCE } : { action: 'hold' }
     },
   },
   {
@@ -228,11 +253,11 @@ export const STRATEGIES: StrategyDef[] = [
       if (stop) return stop
       const spread = num(ctx.params.spreadPct, 0.4)
       const gain = gainPct(ctx)
-      if (gain === null) return { action: 'buy', reason: 'quote filled' }
-      if (gain >= spread) return { action: 'sell', reason: `spread captured +${gain.toFixed(2)}%` }
+      if (gain === null) return { action: 'buy', reason: 'quote filled', confidence: NO_READ_CONFIDENCE }
+      if (gain >= spread) return { action: 'sell', reason: `spread captured +${gain.toFixed(2)}%`, confidence: EXIT_CONFIDENCE }
       const steps = Math.max(1, Math.round(num(ctx.params.inventorySteps, 3)))
       const slot = Math.floor(bars.at(-1)!.t / ctx.tfMs) % steps
-      if (gain <= -spread && slot === 0) return { action: 'buy', reason: `restock at ${gain.toFixed(2)}%` }
+      if (gain <= -spread && slot === 0) return { action: 'buy', reason: `restock at ${gain.toFixed(2)}%`, confidence: beyond((-gain - spread) / spread) }
       return { action: 'hold' }
     },
   },
@@ -266,9 +291,9 @@ export const STRATEGIES: StrategyDef[] = [
       // A short is open: measure its loss against the entry, not against price.
       if (ctx.position && ctx.position.qty < 0) {
         const rise = ((closes.at(-1)! - ctx.position.avgPrice) / ctx.position.avgPrice) * 100
-        if (stop > 0 && rise >= stop) return { action: 'cover', reason: `stop loss at +${rise.toFixed(1)}%` }
+        if (stop > 0 && rise >= stop) return { action: 'cover', reason: `stop loss at +${rise.toFixed(1)}%`, confidence: EXIT_CONFIDENCE }
         const coverAt = num(ctx.params.exitZ, -0.5)
-        return z >= coverAt ? { action: 'cover', reason: `re-centred at z ${z.toFixed(2)}` } : { action: 'hold' }
+        return z >= coverAt ? { action: 'cover', reason: `re-centred at z ${z.toFixed(2)}`, confidence: EXIT_CONFIDENCE } : { action: 'hold' }
       }
       if (ctx.position) return { action: 'hold' }
 
@@ -276,7 +301,9 @@ export const STRATEGIES: StrategyDef[] = [
       const entry = num(ctx.params.entryZ, 2)
       const needsVolume = num(ctx.params.volumeZ, 1.5)
       if (z <= -entry && volZ >= needsVolume) {
-        return { action: 'short', reason: `downside dislocation z ${z.toFixed(2)} on volume z ${volZ.toFixed(2)}` }
+        // Volume is already a hard entry condition above; the score is the price
+        // dislocation, so it stays in one unit.
+        return { action: 'short', reason: `downside dislocation z ${z.toFixed(2)} on volume z ${volZ.toFixed(2)}`, confidence: beyond((-z - entry) / entry) }
       }
       return { action: 'hold' }
     },
@@ -358,7 +385,7 @@ export const CUSTOM_STRATEGY: StrategyDef = {
     if (stop) return stop
     const gain = gainPct(ctx)
     const target = num(ctx.params.takeProfitPct, 0)
-    if (gain !== null && target > 0 && gain >= target) return { action: 'sell', reason: `target hit at +${gain.toFixed(1)}%` }
+    if (gain !== null && target > 0 && gain >= target) return { action: 'sell', reason: `target hit at +${gain.toFixed(1)}%`, confidence: EXIT_CONFIDENCE }
     let rules: CustomRules | null = null
     try {
       rules = typeof ctx.params.rules === 'string' ? (JSON.parse(ctx.params.rules) as CustomRules) : null
